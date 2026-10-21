@@ -53,4 +53,4 @@ build.bat test "C:\...\steamapps\common\Total War Attila\empire.retail.dll"
 ## License
 
 See [LICENSE](LICENSE). mimalloc is (c) Microsoft Corporation and Daan Leijen, MIT license
-([third_party/mimalloc-LICENSE.txt](third_party/mimalloc-LICENSE.txt)).
+([third_party/mimalloc-LICENSE.txt](third_party/mimalloc-LICENSE.txt)). 
