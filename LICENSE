@@ -1,0 +1,22 @@
+Attila CPU Performance Fix
+Copyright (c) 2026 JGdaCaesar. All rights reserved.
+
+The source code in this repository is published so that people can check what the mod does and
+build it themselves. It is NOT open source.
+
+You MAY:
+- read and review the source code;
+- compile it and run the result on your own computer, for your own use;
+- link to this repository or to the official download pages.
+
+You may NOT, without written permission from the author:
+- redistribute this source code or any compiled version of it (modified or not), including
+  re-uploading it to Nexus Mods, the Steam Workshop or any other site;
+- publish modified versions, or use any part of this code in another project.
+
+This software is provided "as is", without warranty of any kind. The author is not liable for any
+damage or data loss arising from its use.
+
+Files from third parties keep their own licenses: mimalloc is (c) Microsoft Corporation and Daan
+Leijen, under the MIT license (see third_party/mimalloc-LICENSE.txt). Total War: ATTILA and its code belong to
+their owners; this repository contains none of the game's files.

@@ -1,0 +1,7 @@
+LIBRARY dinput8
+EXPORTS
+DirectInput8Create=stub_DirectInput8Create@20
+DllCanUnloadNow=stub_DllCanUnloadNow@0 PRIVATE
+DllGetClassObject=stub_DllGetClassObject@12 PRIVATE
+DllRegisterServer=stub_DllRegisterServer@0 PRIVATE
+DllUnregisterServer=stub_DllUnregisterServer@0 PRIVATE
