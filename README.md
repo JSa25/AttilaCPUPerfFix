@@ -3,7 +3,9 @@
 Source code for the Total War: ATTILA CPU performance mod: a `dinput8.dll` that the game loads at
 startup and that patches the engine in memory. No game files are changed.
 
-Download the ready-made DLL from Nexus Mods: https://www.nexusmods.com/totalwarattila/mods/168
+Download the ready-made DLL:
+- Nexus Mods: https://www.nexusmods.com/totalwarattila/mods/168
+- Steam Workshop: https://steamcommunity.com/sharedfiles/filedetails/?id=3824249154 (after subscribing, run `install.bat` in the mod's folder)
 
 Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 
