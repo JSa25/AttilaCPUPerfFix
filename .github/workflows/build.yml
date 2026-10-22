@@ -14,6 +14,7 @@ permissions:
   contents: write      # attach the DLL to a release
   id-token: write      # signed build provenance (attestation)
   attestations: write
+  artifact-metadata: write
 
 jobs:
   build:
@@ -59,7 +60,7 @@ jobs:
 
       - name: Attest build provenance
         if: github.event_name != 'pull_request'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest@v4
         with:
           subject-path: build/dinput8.dll
 
