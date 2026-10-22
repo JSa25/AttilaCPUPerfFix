@@ -41,6 +41,15 @@ The DLL lands in `build\dinput8.dll`. The build is reproducible: with the same l
 mimalloc versions you should get exactly the same file as the one on Nexus. Compare the SHA-256
 (`certutil -hashfile build\dinput8.dll SHA256`) with the one given for each release.
 
+### Automated builds
+
+Every commit is also built on GitHub's own machines by
+[.github/workflows/build.yml](.github/workflows/build.yml), with the compiler and mimalloc
+downloaded from their official releases (checksums pinned). Open the latest run under **Actions**:
+its summary shows the SHA-256 of the DLL, which matches the Nexus download for the same version,
+and the DLL itself can be downloaded there. Builds also carry a signed build attestation
+(`gh attestation verify dinput8.dll -R JSa25/AttilaCPUPerfFix`).
+
 ## Tests
 
 The tests run the game's own code next to the replacements on millions of inputs and check the
@@ -53,4 +62,4 @@ build.bat test "C:\...\steamapps\common\Total War Attila\empire.retail.dll"
 ## License
 
 See [LICENSE](LICENSE). mimalloc is (c) Microsoft Corporation and Daan Leijen, MIT license
-([third_party/mimalloc-LICENSE.txt](third_party/mimalloc-LICENSE.txt)). 
+([third_party/mimalloc-LICENSE.txt](third_party/mimalloc-LICENSE.txt)).
