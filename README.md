@@ -15,13 +15,14 @@ Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 |---|---|
 | `heapfix.c` | Entry point (`DllMain`), dinput8 forwarding, `heapfix.log`, and the main fix: replaces the game's single-lock dlmalloc heap with mimalloc (blocks up to 16 KB) plus a private Windows heap (larger blocks) |
 | `pool.c` | Faster free lookup for the engine's small-object pools |
-| `sortfix.c` | Battle draw-list sort: key extraction plus radix sort, same order as the game's sort |
+| `sortfix.c` | The two render-list sorts (by +0x6C/+0x68 and +0x4C/+0x48): key extraction plus radix sort, same order as the game's sorts |
 | `batchfix.c` | Battle draw batching: items with the same material and equal variant values share a batch |
 | `campfix.c` | Campaign map: four x87 rounding-mode blocks (fog of war, terrain height, curve table) |
 | `x87fix.c` | The same x87 rounding idiom at the ~1,280 other sites in the engine (`fisttp` / SSE4.1 `roundss`) |
 | `heightcache.c` | Cache for repeated terrain height queries on the main thread |
 | `memfast.c` | Fast path for the engine's memcpy on copies of 64 bytes or less |
 | `fps.c` | Hook on the per-frame function that runs the rounding-mode safety checks of `campfix.c` and `x87fix.c` |
+| `diag.c` | Diagnostics in `heapfix.log`: mod version, game build, system, settings, other hook DLLs, and crash records (a vectored exception handler that only logs and never handles the exception) |
 | `dinput8.def` | The exports a `dinput8.dll` must have |
 
 Every patch first compares the game's bytes at its address with what it expects, and skips itself
@@ -55,7 +56,8 @@ and the DLL itself can be downloaded there. Builds also carry a signed build att
 ## Tests
 
 The tests run the game's own code next to the replacements on millions of inputs and check the
-results are identical. They read your copy of the game's `empire.retail.dll` (it is not included here):
+results are identical (`diag_test` instead checks the crash records on deliberate faults). They read
+your copy of the game's `empire.retail.dll` (it is not included here):
 
 ```
 build.bat test "C:\...\steamapps\common\Total War Attila\empire.retail.dll"

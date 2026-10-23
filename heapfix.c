@@ -230,6 +230,8 @@ int install_x87fix(HMODULE m, void (*log)(const char *fmt, ...));    // x87fix.c
 void x87fix_frame(void);                                             // x87fix.c
 int install_heightcache(HMODULE m, int mode, void (*log)(const char *fmt, ...));  // heightcache.c: 1 verify, 2 cache
 int install_memfast(HMODULE m, void (*log)(const char *fmt, ...));  // memfast.c
+void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...));  // diag.c
+void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
 extern void (*g_frame_check)(void);                                  // fps.c
 
 static int g_campfix_on, g_x87fix_on;
@@ -255,7 +257,9 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     if (reason == DLL_PROCESS_ATTACH) {
         set_log_path(h);  // thread notifications stay on: mimalloc cleans up per-thread state
         HMODULE m = GetModuleHandleW(L"empire.retail.dll");
+        diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
         if (m) {
+            update_check(h, wlog);  // a newer Workshop copy replaces this DLL for the next launch
             install_into(m);
             install_pool(m, wlog);
             // sortfix_off.txt in the game folder skips the draw-list sort fix (for A/B FPS tests).
@@ -307,8 +311,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
                 *slash = 0;
                 install_fps(m, dir, wlog);  // the frame hook also runs the per-frame checks
             }
-        } else
-            wlog("empire.retail.dll is not loaded - nothing patched");
+        }
     }
     return TRUE;
 }
