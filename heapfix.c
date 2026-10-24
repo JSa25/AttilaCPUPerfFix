@@ -230,6 +230,7 @@ int install_x87fix(HMODULE m, void (*log)(const char *fmt, ...));    // x87fix.c
 void x87fix_frame(void);                                             // x87fix.c
 int install_heightcache(HMODULE m, int mode, void (*log)(const char *fmt, ...));  // heightcache.c: 1 verify, 2 cache
 int install_memfast(HMODULE m, void (*log)(const char *fmt, ...));  // memfast.c
+int install_loopfetch(HMODULE m, void (*log)(const char *fmt, ...));  // loopfetch.c
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...));  // diag.c
 void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
 extern void (*g_frame_check)(void);                                  // fps.c
@@ -304,6 +305,12 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
                 wlog("memfast_off.txt found - memcpy fast path not installed");
             else
                 install_memfast(m, wlog);
+            // Battle render loops prefetch the next items' data (loopfetch.c). loopfetch_off.txt disables.
+            if (sl) wcscpy(sl + 1, L"loopfetch_off.txt");
+            if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+                wlog("loopfetch_off.txt found - render loop prefetch not installed");
+            else
+                install_loopfetch(m, wlog);
             wchar_t dir[MAX_PATH];
             wcscpy(dir, g_log_path);
             wchar_t *slash = wcsrchr(dir, L'\\');

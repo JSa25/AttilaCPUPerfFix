@@ -15,7 +15,7 @@ set "LIBS=-lkernel32 -lwinmm -ladvapi32 -lpsapi -lbcrypt"
 
 "%CC%" -O2 -DNDEBUG -I"%MIMALLOC%\include" -c "%MIMALLOC%\src\static.c" -o build\mimalloc.o || exit /b 1
 rem --no-insert-timestamp keeps the build reproducible: the same compiler gives the same file
-"%CC%" -O2 -Wall -Wextra -I"%MIMALLOC%\include" -shared -s -static -Wl,--no-insert-timestamp -o build\dinput8.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c diag.c update.c build\mimalloc.o dinput8.def %LIBS% || exit /b 1
+"%CC%" -O2 -Wall -Wextra -I"%MIMALLOC%\include" -shared -s -static -Wl,--no-insert-timestamp -o build\dinput8.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c build\mimalloc.o dinput8.def %LIBS% || exit /b 1
 echo built build\dinput8.dll
 
 if /i not "%~1"=="test" exit /b 0
@@ -23,11 +23,11 @@ if "%~2"=="" (
     echo usage: build.bat test "path\to\empire.retail.dll"
     exit /b 1
 )
-for %%T in (pool sort batchfix campfix x87fix heightcache memfast diag selfupd) do (
+for %%T in (pool sort batchfix campfix x87fix heightcache memfast loopfetch diag selfupd) do (
     "%CC%" -O2 -Wall -static -o build\%%T_test.exe tests\%%T_test.c %LIBS% || exit /b 1
 )
 "%CC%" -O2 -Wall -I"%MIMALLOC%\include" -static -o build\heapfix_test.exe tests\heapfix_test.c build\mimalloc.o %LIBS% || exit /b 1
-for %%T in (heapfix pool sort batchfix campfix x87fix heightcache memfast diag selfupd) do (
+for %%T in (heapfix pool sort batchfix campfix x87fix heightcache memfast loopfetch diag selfupd) do (
     echo == %%T
     build\%%T_test.exe "%~2" || (echo %%T test FAILED & exit /b 1)
 )

@@ -38,7 +38,11 @@ int main(void) {
     DeleteFileW(old_);
 
     CHECK(file_version(L"no such file") == 0);
-    make(g_self, 4, NULL);
+    // the game folder copy named the way an earlier update saved it; update_check passes a lowercase path
+    wchar_t upper[MAX_PATH];
+    swprintf(upper, MAX_PATH, L"%ls\\DINPUT8.dll", g_dir);
+    DeleteFileW(g_self);
+    make(upper, 4, NULL);
     CHECK(file_version(g_self) == 4);
     // keep it open the way Windows holds a loaded DLL (shared for read and delete, so renaming works)
     HANDLE held = CreateFileW(g_self, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
@@ -59,6 +63,10 @@ int main(void) {
     make(g_ws, 5, NULL);
     CHECK(update_from(g_self, g_ws, 4, say) == 1);   // newer: installed while the old file is in use
     CHECK(file_version(g_self) == 5 && exists(old_) && file_version(old_) == 4);
+    WIN32_FIND_DATAW fd;
+    HANDLE fh = FindFirstFileW(g_self, &fd);
+    CHECK(fh != INVALID_HANDLE_VALUE && wcscmp(fd.cFileName, L"dinput8.dll") == 0);  // saved lowercase
+    FindClose(fh);
     CloseHandle(held);
     CHECK(update_from(g_self, g_ws, 5, say) == 0);   // next start: up to date, .old cleaned up
     CHECK(!exists(old_));

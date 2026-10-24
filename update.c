@@ -70,6 +70,10 @@ void update_check(HMODULE self, void (*log)(const char *fmt, ...)) {
     wchar_t me[MAX_PATH], ws[MAX_PATH];
     DWORD n = GetModuleFileNameW(self, me, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return;
+    // Windows reports the name as the game imports it ("DINPUT8.dll"); the update would be saved under that casing
+    wchar_t *fn = wcsrchr(me, L'\\');
+    if (!fn || fn + 12 >= me + MAX_PATH) return;
+    wcscpy(fn + 1, L"dinput8.dll");
     wcscpy(ws, me);
     for (int up = 0; up < 3; up++) {  // strip dinput8.dll, <game>, common
         wchar_t *s = wcsrchr(ws, L'\\');

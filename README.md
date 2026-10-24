@@ -21,6 +21,7 @@ Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 | `x87fix.c` | The same x87 rounding idiom at the ~1,280 other sites in the engine (`fisttp` / SSE4.1 `roundss`) |
 | `heightcache.c` | Cache for repeated terrain height queries on the main thread |
 | `memfast.c` | Fast path for the engine's memcpy on copies of 64 bytes or less |
+| `loopfetch.c` | Six battle render loops prefetch the field the loop reads next, four items ahead (prefetch only, never a load through an item pointer) |
 | `fps.c` | Hook on the per-frame function that runs the rounding-mode safety checks of `campfix.c` and `x87fix.c` |
 | `diag.c` | Diagnostics in `heapfix.log`: mod version, game build, system, settings, other hook DLLs, and crash records (a vectored exception handler that only logs and never handles the exception) |
 | `dinput8.def` | The exports a `dinput8.dll` must have |
@@ -56,7 +57,7 @@ and the DLL itself can be downloaded there. Builds also carry a signed build att
 ## Tests
 
 The tests run the game's own code next to the replacements on millions of inputs and check the
-results are identical (`diag_test` instead checks the crash records on deliberate faults). They read
+results are identical (`diag_test` instead checks the crash records on deliberate faults; `loopfetch_test` runs each prefetch stub over arrays that end at a no-access page, with stale pointers in the slots a loop never reaches, and checks every register matches the original instructions). They read
 your copy of the game's `empire.retail.dll` (it is not included here):
 
 ```
