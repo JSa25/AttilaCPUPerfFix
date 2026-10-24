@@ -13,7 +13,7 @@ Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 
 | File | Fix |
 |---|---|
-| `heapfix.c` | Entry point (`DllMain`), dinput8 forwarding, `heapfix.log`, and the main fix: replaces the game's single-lock dlmalloc heap with mimalloc (blocks up to 16 KB) plus a private Windows heap (larger blocks) |
+| `heapfix.c` | Entry point (`DllMain`, or a DLL load notification when something loaded `dinput8.dll` before the game DLL), dinput8 forwarding, `heapfix.log`, and the main fix: replaces the game's single-lock dlmalloc heap with mimalloc (blocks up to 16 KB) plus a private Windows heap (larger blocks) |
 | `pool.c` | Faster free lookup for the engine's small-object pools |
 | `sortfix.c` | The two render-list sorts (by +0x6C/+0x68 and +0x4C/+0x48): key extraction plus radix sort, same order as the game's sorts |
 | `batchfix.c` | Battle draw batching: items with the same material and equal variant values share a batch |
@@ -57,7 +57,7 @@ and the DLL itself can be downloaded there. Builds also carry a signed build att
 ## Tests
 
 The tests run the game's own code next to the replacements on millions of inputs and check the
-results are identical (`diag_test` instead checks the crash records on deliberate faults; `loopfetch_test` runs each prefetch stub over arrays that end at a no-access page, with stale pointers in the slots a loop never reaches, and checks every register matches the original instructions). They read
+results are identical (`diag_test` instead checks the crash records on deliberate faults; `lateload_test` loads the built DLL before the game DLL, as an overlay can, and checks every fix still installs from Windows' load notification; `loopfetch_test` runs each prefetch stub over arrays that end at a no-access page, with stale pointers in the slots a loop never reaches, and checks every register matches the original instructions). They read
 your copy of the game's `empire.retail.dll` (it is not included here):
 
 ```

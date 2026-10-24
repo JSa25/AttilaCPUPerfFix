@@ -40,7 +40,7 @@ int main(void) {
     fputs(text, stdout);
     int recs = 0;
     for (char *s = text; (s = strstr(s, "] EXCEPTION ")) != NULL; s++) recs++;
-    CHECK(strstr(text, "this process is not the game"));
+    CHECK(strstr(text, "nothing patched in this process"));
     CHECK(strstr(text, "system: Windows ") && strstr(text, "logical CPUs"));
     CHECK(strstr(text, "game: empire.retail.dll build"));
     CHECK(strstr(text, "other hook DLLs in the game folder:"));

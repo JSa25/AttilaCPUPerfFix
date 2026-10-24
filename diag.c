@@ -11,9 +11,7 @@
 #include <string.h>
 
 #include "version.h"
-#define STRV_(x) #x
-#define STRV(x) STRV_(x)
-#define MOD_VERSION "v" STRV(MOD_VERSION_NUM)
+#define MOD_VERSION "v" MOD_VERSION_STR
 #define MAX_RECORDS 8  // per session: the first ones are what matters, and a loop of faults must not flood the log
 
 static wchar_t g_dlog[MAX_PATH];
@@ -133,8 +131,8 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
     if (sl) *sl = 0;
     log("Attila CPU Performance Fix %s loaded into %ls", MOD_VERSION, exe);
     if (!empire) {
-        log("this process is not the game (empire.retail.dll is not loaded) - nothing patched here. If the game itself "
-            "never writes 'game heap replaced' below, dinput8.dll is not in the folder Steam starts the game from");
+        log("empire.retail.dll is not loaded and Windows could not be asked to report when it loads - nothing "
+            "patched in this process");
         return;
     }
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)empire + ((IMAGE_DOS_HEADER *)empire)->e_lfanew);

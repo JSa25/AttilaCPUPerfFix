@@ -31,4 +31,7 @@ for %%T in (heapfix pool sort batchfix campfix x87fix heightcache memfast loopfe
     echo == %%T
     build\%%T_test.exe "%~2" || (echo %%T test FAILED & exit /b 1)
 )
+"%CC%" -O2 -Wall -static -o build\lateload_test.exe tests\lateload_test.c %LIBS% || exit /b 1
+echo == lateload
+build\lateload_test.exe "%~dp0build\dinput8.dll" "%~2" || (echo lateload test FAILED & exit /b 1)
 echo all tests passed

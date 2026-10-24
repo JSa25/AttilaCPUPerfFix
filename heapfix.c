@@ -253,72 +253,109 @@ static void set_log_path(HINSTANCE h) {
     wcscpy(slash + 1, L"heapfix.log");
 }
 
+static HINSTANCE g_self;
+
+// Everything that patches the game, run once empire.retail.dll is in memory and before its own startup code.
+static void install_all(HMODULE m) {
+    static int done;
+    if (done) return;
+    done = 1;
+    diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
+    update_check(g_self, wlog);  // a newer Workshop copy replaces this DLL for the next launch
+    install_into(m);
+    install_pool(m, wlog);
+    // sortfix_off.txt in the game folder skips the draw-list sort fix (for A/B FPS tests).
+    wchar_t off[MAX_PATH];
+    wcscpy(off, g_log_path);
+    wchar_t *sl = wcsrchr(off, L'\\');
+    if (sl) wcscpy(sl + 1, L"sortfix_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("sortfix_off.txt found - draw-list sort fix not installed");
+    else
+        install_sortfix(m, wlog);
+    // batchfix_off.txt in the game folder skips the battle batch fix (for A/B tests).
+    if (sl) wcscpy(sl + 1, L"batchfix_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("batchfix_off.txt found - batch fix not installed");
+    else
+        install_batchfix(m, wlog);
+    // campfix_off.txt in the game folder skips the campaign x87 rounding fixes (for A/B tests).
+    if (sl) wcscpy(sl + 1, L"campfix_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("campfix_off.txt found - campaign rounding fixes not installed");
+    else {
+        g_campfix_on = install_campfix(m, 0, wlog) > 0;
+    }
+    // x87fix_off.txt skips the remaining x87 rounding-mode blocks (all of empire.retail.dll).
+    if (sl) wcscpy(sl + 1, L"x87fix_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("x87fix_off.txt found - x87 rounding fix not installed");
+    else
+        g_x87fix_on = install_x87fix(m, wlog) > 0;
+    if (g_campfix_on || g_x87fix_on) g_frame_check = frame_checks;
+    // Terrain height cache: counters builds verify it; normal builds cache (verified in game: 7.5 M
+    // queries over map, end turn, save load and battle, 0 mismatches). heightcache_off.txt disables.
+    if (sl) wcscpy(sl + 1, L"heightcache_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("heightcache_off.txt found - height cache not installed");
+    else
+        install_heightcache(m, 2, wlog);
+    // memcpy small-copy fast path (the counters build counts sizes on the same function instead).
+    if (sl) wcscpy(sl + 1, L"memfast_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("memfast_off.txt found - memcpy fast path not installed");
+    else
+        install_memfast(m, wlog);
+    // Battle render loops prefetch the next items' data (loopfetch.c). loopfetch_off.txt disables.
+    if (sl) wcscpy(sl + 1, L"loopfetch_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("loopfetch_off.txt found - render loop prefetch not installed");
+    else
+        install_loopfetch(m, wlog);
+    wchar_t dir[MAX_PATH];
+    wcscpy(dir, g_log_path);
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (slash) {
+        *slash = 0;
+        install_fps(m, dir, wlog);  // the frame hook also runs the per-frame checks
+    }
+}
+
+// Something else in the process (an overlay, another hook DLL) can load dinput8.dll before the game loads
+// empire.retail.dll; Windows then never runs this DllMain again. So wait for the game DLL and install when it is
+// mapped, which is still before its own startup code runs (the same state as the normal path).
+typedef struct { USHORT Length, MaximumLength; PWSTR Buffer; } NOTIF_STR;
+typedef struct { ULONG Flags; const NOTIF_STR *FullDllName, *BaseDllName; PVOID DllBase; ULONG SizeOfImage; } NOTIF_DATA;
+static PVOID g_notif_cookie;
+
+static VOID CALLBACK on_dll_loaded(ULONG reason, const NOTIF_DATA *d, PVOID ctx) {
+    (void)ctx;
+    static const wchar_t want[] = L"empire.retail.dll";
+    if (reason != 1 || !d || !d->BaseDllName || d->BaseDllName->Length != sizeof want - sizeof(wchar_t)) return;
+    if (_wcsnicmp(d->BaseDllName->Buffer, want, d->BaseDllName->Length / sizeof(wchar_t)) != 0) return;
+    wlog("empire.retail.dll is loading now - installing the fixes");
+    install_all((HMODULE)d->DllBase);
+}
+
+static int wait_for_game(void) {
+    typedef LONG(NTAPI * reg_fn)(ULONG, VOID(CALLBACK *)(ULONG, const NOTIF_DATA *, PVOID), PVOID, PVOID *);
+    reg_fn reg = (reg_fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification");
+    return reg && reg(0, on_dll_loaded, NULL, &g_notif_cookie) == 0;
+}
+
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     (void)r;
     if (reason == DLL_PROCESS_ATTACH) {
         set_log_path(h);  // thread notifications stay on: mimalloc cleans up per-thread state
+        g_self = h;
         HMODULE m = GetModuleHandleW(L"empire.retail.dll");
-        diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
-        if (m) {
-            update_check(h, wlog);  // a newer Workshop copy replaces this DLL for the next launch
-            install_into(m);
-            install_pool(m, wlog);
-            // sortfix_off.txt in the game folder skips the draw-list sort fix (for A/B FPS tests).
-            wchar_t off[MAX_PATH];
-            wcscpy(off, g_log_path);
-            wchar_t *sl = wcsrchr(off, L'\\');
-            if (sl) wcscpy(sl + 1, L"sortfix_off.txt");
-            if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
-                wlog("sortfix_off.txt found - draw-list sort fix not installed");
-            else
-                install_sortfix(m, wlog);
-            // batchfix_off.txt in the game folder skips the battle batch fix (for A/B tests).
-            if (sl) wcscpy(sl + 1, L"batchfix_off.txt");
-            if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
-                wlog("batchfix_off.txt found - batch fix not installed");
-            else
-                install_batchfix(m, wlog);
-            // campfix_off.txt in the game folder skips the campaign x87 rounding fixes (for A/B tests).
-            if (sl) wcscpy(sl + 1, L"campfix_off.txt");
-            if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
-                wlog("campfix_off.txt found - campaign rounding fixes not installed");
-            else {
-                g_campfix_on = install_campfix(m, 0, wlog) > 0;
-            }
-            // x87fix_off.txt skips the remaining x87 rounding-mode blocks (all of empire.retail.dll).
-            if (sl) wcscpy(sl + 1, L"x87fix_off.txt");
-            if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
-                wlog("x87fix_off.txt found - x87 rounding fix not installed");
-            else
-                g_x87fix_on = install_x87fix(m, wlog) > 0;
-            if (g_campfix_on || g_x87fix_on) g_frame_check = frame_checks;
-            // Terrain height cache: counters builds verify it; normal builds cache (verified in game: 7.5 M
-            // queries over map, end turn, save load and battle, 0 mismatches). heightcache_off.txt disables.
-            if (sl) wcscpy(sl + 1, L"heightcache_off.txt");
-            if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
-                wlog("heightcache_off.txt found - height cache not installed");
-            else
-                install_heightcache(m, 2, wlog);
-            // memcpy small-copy fast path (the counters build counts sizes on the same function instead).
-            if (sl) wcscpy(sl + 1, L"memfast_off.txt");
-            if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
-                wlog("memfast_off.txt found - memcpy fast path not installed");
-            else
-                install_memfast(m, wlog);
-            // Battle render loops prefetch the next items' data (loopfetch.c). loopfetch_off.txt disables.
-            if (sl) wcscpy(sl + 1, L"loopfetch_off.txt");
-            if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
-                wlog("loopfetch_off.txt found - render loop prefetch not installed");
-            else
-                install_loopfetch(m, wlog);
-            wchar_t dir[MAX_PATH];
-            wcscpy(dir, g_log_path);
-            wchar_t *slash = wcsrchr(dir, L'\\');
-            if (slash) {
-                *slash = 0;
-                install_fps(m, dir, wlog);  // the frame hook also runs the per-frame checks
-            }
-        }
+        if (m)
+            install_all(m);
+        else if (wait_for_game())
+            wlog("dinput8.dll was loaded before empire.retail.dll (by another program or DLL) - the fixes install "
+                 "when the game loads it");
+        else
+            diag_startup(NULL, g_log_path, wlog);
     }
     return TRUE;
 }
