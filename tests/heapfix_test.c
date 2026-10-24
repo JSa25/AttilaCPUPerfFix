@@ -1,5 +1,7 @@
 // Self-test: heap semantics, a multi-thread stress run, and patching a real copy of
-// empire.retail.dll mapped without running it. usage: heapfix_test.exe <path to empire.retail.dll>
+// empire.retail.dll mapped without running it. Blocks over SMALL_MAX go to the game's own dlmalloc, which cannot
+// run in an image mapped this way, so those are tested in lateload_test (a normal load).
+// usage: heapfix_test.exe <path to empire.retail.dll>
 #define HEAPFIX_TEST
 #include "../heapfix.c"
 #include <assert.h>
@@ -109,8 +111,9 @@ int main(int argc, char **argv) {
     CHECK(m != NULL);
     printf("mapped empire.retail.dll at %p\n", (void *)m);
 
-    CHECK(install_into(m) == (int)NPATCH);
+    CHECK(install_into(m) == (int)NPATCH - 1);
     for (size_t i = 0; i < NPATCH; i++) {
+        if (!g_patches[i].to) continue;  // dltrim: checked only
         unsigned char *site = (unsigned char *)m + g_patches[i].rva;
         DWORD rel;
         memcpy(&rel, site + 1, 4);
@@ -122,12 +125,11 @@ int main(int argc, char **argv) {
     void *(__cdecl *g_malloc)(size_t) = (void *)((unsigned char *)m + 0x112D80);
     void (__cdecl *g_free)(void *) = (void *)((unsigned char *)m + 0x112730);
     void *(__cdecl *g_realloc)(void *, size_t) = (void *)((unsigned char *)m + 0x113040);
-    int (__cdecl *g_trim)(void) = (void *)((unsigned char *)m + 0x1126E0);
 
     char *p = g_malloc(100);
     CHECK(p && ((UINT_PTR)p & 7) == 0);
     strcpy(p, "attila");
-    p = g_realloc(p, 100000);
+    p = g_realloc(p, 10000);
     CHECK(p && strcmp(p, "attila") == 0);
     p = g_realloc(p, 0);
     CHECK(p != NULL);
@@ -142,38 +144,6 @@ int main(int argc, char **argv) {
     q = g_realloc(NULL, 50);
     CHECK(q != NULL);
     g_free(q);
-    CHECK(g_trim() == 0);
-    // Hybrid boundary: small blocks growing past the limit move heaps with their contents intact.
-    {
-        unsigned char *s = g_malloc(100);
-        for (int i = 0; i < 100; i++) s[i] = (unsigned char)i;
-        unsigned char *b = g_realloc(s, 50000);  // small -> large
-        CHECK(b != NULL);
-        for (int i = 0; i < 100; i++) CHECK(b[i] == (unsigned char)i);
-        b[49999] = 7;
-        unsigned char *c = g_realloc(b, 64);  // large -> small size: stays a valid block
-        CHECK(c != NULL);
-        for (int i = 0; i < 64; i++) CHECK(c[i] == (unsigned char)i);
-        g_free(c);
-        const int lim = SMALL_MAX ? SMALL_MAX : 2048;  // the Windows-heap build has no split
-        unsigned char *e = g_malloc(lim);        // exactly at the limit
-        unsigned char *f = g_malloc(lim + 1);    // just over
-        CHECK(e && f);
-        memset(e, 1, lim);
-        memset(f, 2, lim + 1);
-        e = g_realloc(e, lim + 4000);
-        CHECK(e && e[lim - 1] == 1);
-        g_free(e);
-        g_free(f);
-        size_t free_total, largest;
-        address_space(&free_total, &largest);
-        void *huge = g_malloc(230608464);  // the ~220 MB block the game asks for on "exit to main menu"
-        CHECK(huge != NULL);
-        memset(huge, 3, 4096);
-        g_free(huge);
-        printf("hybrid boundary ok (SMALL_MAX %d); 220 MB block ok; address space free %u MB, largest %u MB\n",
-               SMALL_MAX, (unsigned)(free_total >> 20), (unsigned)(largest >> 20));
-    }
     printf("semantics ok\n");
 
     enum { T = 32 };
