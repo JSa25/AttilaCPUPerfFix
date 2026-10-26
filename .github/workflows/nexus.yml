@@ -1,0 +1,77 @@
+# Uploads a new version of the Nexus Mods file (mod page 168, API file ID 8207127) from a build made on GitHub's own machine.
+# Run it by hand: Actions -> "Upload to Nexus Mods" -> Run workflow, with a changelog line.
+# It builds dinput8.dll, refuses to continue unless the SHA-256 equals dinput8.dll.sha256 (the released DLL), zips it
+# with the player README and the mimalloc license and adds it to the Nexus file as a new version (the old one goes to
+# Old Files). Needs the repository secret NEXUSMODS_API_KEY (your Nexus API key, Settings -> Secrets and variables -> Actions).
+name: Upload to Nexus Mods
+
+on:
+  workflow_dispatch:
+    inputs:
+      changelog:
+        description: "Changelog for this version (shown on Nexus)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  nexus:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the compiler (llvm-mingw 20261006) and mimalloc 3.5.3
+        shell: pwsh
+        run: |
+          # pinned versions and checksums, the same as build.yml
+          $files = @(
+            @{ url = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip'
+               sha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'; out = 'llvm.zip' },
+            @{ url = 'https://github.com/microsoft/mimalloc/archive/refs/tags/v3.5.3.zip'
+               sha = '97e672db18c36093378e30cc234f4625ad37b95ca9a270336752d3f3011323e9'; out = 'mimalloc.zip' }
+          )
+          foreach ($f in $files) {
+            Invoke-WebRequest $f.url -OutFile $f.out
+            $got = (Get-FileHash $f.out -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $f.sha) { throw "$($f.out): checksum $got does not match $($f.sha)" }
+          }
+          Expand-Archive llvm.zip "$env:RUNNER_TEMP\llvm"
+          Expand-Archive mimalloc.zip "$env:RUNNER_TEMP\mi"
+          Move-Item "$env:RUNNER_TEMP\mi\mimalloc-3.5.3" mimalloc
+          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\llvm\llvm-mingw-20261006-ucrt-x86_64\bin"
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - name: Check against the released DLL, read the version, zip
+        id: pkg
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash build\dinput8.dll -Algorithm SHA256).Hash.ToLower()
+          $want = (Get-Content dinput8.dll.sha256 -Raw).Trim().Split()[0].ToLower()
+          if ($h -ne $want) { throw "the build ($h) does not reproduce the released DLL ($want)" }
+          $ver = [regex]::Match((Get-Content version.h -Raw), 'MOD_VERSION_STR "([^"]+)"').Groups[1].Value
+          if (-not $ver) { throw "no version in version.h" }
+          New-Item -ItemType Directory pkg\AttilaCPUPerfFix | Out-Null
+          Copy-Item build\dinput8.dll, AttilaCPUPerfFix_README.txt pkg\AttilaCPUPerfFix\
+          Copy-Item third_party\mimalloc-LICENSE.txt pkg\AttilaCPUPerfFix\LICENSE-mimalloc.txt
+          Compress-Archive pkg\AttilaCPUPerfFix AttilaCPUPerfFix.zip
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "sha=$h" >> $env:GITHUB_OUTPUT
+          "### Nexus upload`nVersion $ver, dinput8.dll SHA-256 ``$h``" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload to Nexus Mods
+        uses: Nexus-Mods/upload-action@v1.0.0-beta.10
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          mod_id: 14130442404008  # "Unique Mod ID" (game 3290 << 32 | 168); the page number is 168
+          file_id: 8207127  # "API File ID" (the file group of versions 1-6.0), not the 299 in page links
+          filename: AttilaCPUPerfFix.zip
+          version: ${{ steps.pkg.outputs.version }}
+          display_name: AttilaCPUPerfFix
+          description: "dinput8.dll + README. Copy dinput8.dll next to Attila.exe (replace the old one). SHA-256 of dinput8.dll: ${{ steps.pkg.outputs.sha }}"
+          changelog: ${{ inputs.changelog }}
+          archive_existing_version: true
+          update_mod_version: true
