@@ -105,16 +105,17 @@ static DWORD WINAPI memstats(LPVOID a) {
 #define DL_REALLOC dl_realloc
 #endif
 
-// mimalloc gets its own reservations (install_into): 512 MB, grown in 128 MB steps up to 768 MB when full. Past that,
+// mimalloc gets its own reservations (install_into): 512 MB, grown in 32 MB steps up to 768 MB when full. Past that,
 // small blocks go to dlmalloc as well. A full mimalloc searches its whole reservation before failing (~400x slower
 // than a normal allocation, measured), so after a failure it is skipped for 50 ms; frees keep returning space to it.
 #define SMALL_HEAP_MB 512
-#define SMALL_STEP_MB 128
+#define SMALL_STEP_MB 32   // the smallest piece mimalloc can use on 32-bit (page info every 32 MiB)
 #define SMALL_LIMIT_MB 768
 static volatile LONG g_small_mb;  // reserved for mimalloc so far; 0 = no cap (the first reservation failed)
 static volatile DWORD g_mi_full_until;
 static SRWLOCK g_grow_lock = SRWLOCK_INIT;
 static int reserve_small_heap(size_t size);
+static int grow_small_heap_step(void);
 static void wlog(const char *fmt, ...);
 
 // Called after mimalloc returned NULL: 1 if it has more room now (this thread or another one added a step).
@@ -123,7 +124,7 @@ static int grow_small_heap(LONG seen) {
     AcquireSRWLockExclusive(&g_grow_lock);
     int ok = g_small_mb != seen;
     if (!ok && g_small_mb < SMALL_LIMIT_MB) {
-        ok = reserve_small_heap((size_t)SMALL_STEP_MB << 20);
+        ok = grow_small_heap_step();
         g_small_mb = ok ? g_small_mb + SMALL_STEP_MB : SMALL_LIMIT_MB;  // no room for a step: stop trying
         wlog(ok ? "small-block heap full: grown to %ld MB" : "small-block heap full at %ld MB and no room to grow - "
              "small blocks also use the game's heap now", g_small_mb);
@@ -229,6 +230,52 @@ static int reserve_small_heap(size_t size) {
     return 0;
 }
 
+// A growth step comes late in a session, when the address space is already in pieces. A plain reservation takes the
+// lowest gap with room, i.e. it cuts into the big free gaps the game needs for its large blocks (a player's MK1212
+// campaign: grown to 768 MB in 128 MB steps, then a 36 MB allocation failed with 488 MB free in pieces of <= 32 MB).
+// So each 32 MB step goes into the smallest free gap that holds an aligned 32 MB piece, at the end of that gap that
+// leaves the larger part free.
+static unsigned char *best_fit_piece(size_t size) {
+    const UINT_PTR align = 32u << 20;
+    MEMORY_BASIC_INFORMATION m;
+    unsigned char *best = NULL;
+    size_t best_gap = ~(size_t)0, best_left = 0;
+    for (unsigned char *a = (unsigned char *)0x10000; VirtualQuery(a, &m, sizeof m) == sizeof m; a = (unsigned char *)m.BaseAddress + m.RegionSize) {
+        if (m.State == MEM_FREE) {
+            UINT_PTR lo = (UINT_PTR)m.BaseAddress, hi = lo + m.RegionSize;
+            UINT_PTR first = (lo + align - 1) & ~(align - 1), last = (hi - size) & ~(align - 1);
+            if (hi >= size && first >= lo && last >= first && last + size <= hi) {
+                // the larger free part left over: below the first piece or above the last one
+                size_t keep_first = hi - (first + size) > first - lo ? hi - (first + size) : first - lo;
+                size_t keep_last = last - lo > hi - (last + size) ? last - lo : hi - (last + size);
+                UINT_PTR at = keep_last > keep_first ? last : first;
+                size_t left = keep_last > keep_first ? keep_last : keep_first;
+                if (m.RegionSize < best_gap || (m.RegionSize == best_gap && left > best_left)) {
+                    best = (unsigned char *)at;
+                    best_gap = m.RegionSize;
+                    best_left = left;
+                }
+            }
+        }
+        if ((unsigned char *)m.BaseAddress + m.RegionSize < a) break;  // wrapped past the top
+    }
+    return best;
+}
+
+// One growth step for mimalloc: 1 when it got another 32 MB.
+static int grow_small_heap_step(void) {
+    const size_t size = (size_t)SMALL_STEP_MB << 20;
+    for (int tries = 0; tries < 4; tries++) {  // another thread may take the gap between the search and the reservation
+        unsigned char *p = best_fit_piece(size);
+        if (!p) return 0;
+        if (VirtualAlloc(p, size, MEM_RESERVE, PAGE_NOACCESS) != p) continue;
+        if (mi_manage_os_memory(p, size, false, false, true, -1)) return 1;
+        VirtualFree(p, 0, MEM_RELEASE);
+        return 0;
+    }
+    return 0;
+}
+
 // Returns the number of functions patched: all of them, or 0 if anything does not match.
 static int install_into(HMODULE m) {
     unsigned char *base = (unsigned char *)m;
@@ -271,7 +318,7 @@ static int install_into(HMODULE m) {
     // mimalloc only keeps space for small blocks, and after 8 arenas it doubles each new reservation (built for
     // 64-bit): with heavy mods it held 1,088 MB for 557 MB of blocks and the game ran out of address space. So it
     // gets its own reservations instead, the first made now while the address space is empty: 512 MB keeps the big
-    // free block the game needs (~220 MB on "exit to main menu"); heavy mods grow it in 128 MB steps up to 768 MB
+    // free block the game needs (~220 MB on "exit to main menu"); heavy mods grow it in 32 MB steps (best fit, see above) up to 768 MB
     // (Mk1212 at 4K peaked at ~600 MB committed), and only past that do small blocks spill to dlmalloc, which is
     // ~100x slower under contention (measured). A fixed 768 MB left a 142 MB largest free block in that battle.
     mi_option_set(mi_option_retry_on_oom, 0);  // a full cap must fail fast, not wait 400 ms
@@ -286,7 +333,7 @@ static int install_into(HMODULE m) {
         cap_mb = 0;
         mi_option_set(mi_option_arena_reserve, 32 * 1024);  // KiB: no cap, but small arenas at least
     }
-#define HEAP_NAME "mimalloc " MI_STR(MI_MALLOC_VERSION) " (blocks <= 16 KB, %u MB reserved, grows to 768 MB if needed; 0 = no cap); larger blocks stay on the game's heap"
+#define HEAP_NAME "mimalloc " MI_STR(MI_MALLOC_VERSION) " (blocks <= 16 KB, %u MB reserved, grows to 768 MB in 32 MB steps if needed; 0 = no cap); larger blocks stay on the game's heap"
 #define MI_STR(x) MI_STR2(x)
 #define MI_STR2(x) #x
     for (size_t i = 0; i < NPATCH; i++) {
@@ -365,6 +412,9 @@ void x87fix_frame(void);                                             // x87fix.c
 int install_heightcache(HMODULE m, int mode, void (*log)(const char *fmt, ...));  // heightcache.c: 1 verify, 2 cache
 int install_memfast(HMODULE m, void (*log)(const char *fmt, ...));  // memfast.c
 int install_loopfetch(HMODULE m, void (*log)(const char *fmt, ...));  // loopfetch.c
+int install_fileio(HMODULE m, void (*log)(const char *fmt, ...));     // fileio.c
+int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...));  // attrcache.c
+int install_texfix(HMODULE m, int verify, void (*log)(const char *fmt, ...));    // texfix.c
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...));  // diag.c
 void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
 extern void (*g_frame_check)(void);                                  // fps.c
@@ -446,6 +496,28 @@ static void install_all(HMODULE m) {
         wlog("loopfetch_off.txt found - render loop prefetch not installed");
     else
         install_loopfetch(m, wlog);
+    // Loading: packs through the file cache, buffered small reads of the save (fileio.c), then the missing-folder
+    // cache for loose-file checks and opens (attrcache.c), whose open hook calls fileio's. Off switches for each.
+    if (sl) wcscpy(sl + 1, L"fileio_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("fileio_off.txt found - file I/O fix not installed");
+    else
+        install_fileio(m, wlog);
+    if (sl) wcscpy(sl + 1, L"attrcache_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("attrcache_off.txt found - attribute cache not installed");
+    else {
+        int verify = 0;
+        install_attrcache(m, verify, wlog);
+    }
+    // Battle loading: the DXT1 texture compressor with SSE2, same output (texfix.c).
+    if (sl) wcscpy(sl + 1, L"texfix_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES)
+        wlog("texfix_off.txt found - texture compression not replaced");
+    else {
+        int verify = 0;
+        install_texfix(m, verify, wlog);
+    }
     wchar_t dir[MAX_PATH];
     wcscpy(dir, g_log_path);
     wchar_t *slash = wcsrchr(dir, L'\\');

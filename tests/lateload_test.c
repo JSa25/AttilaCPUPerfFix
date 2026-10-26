@@ -107,6 +107,88 @@ static void heap_checks(unsigned char *b) {
     CHECK(free0 - free1 > (100u << 20));    // the blocks really took address space
     CHECK(free2 + (16u << 20) >= free1);    // the second round reused it
 
+    // growth placement: with the address space in pieces (a 224 MB gap at the top, four 32 MB gaps below it, a 16 MB
+    // scrap gap at the bottom for other small reservations, everything else taken), filling mimalloc past its 512 MB
+    // must put its 32 MB growth steps into the small gaps and leave the big one whole
+    {
+        enum { MAXB = 8192, NSMALL = 4, BIGN = 14 };  // pieces of 16 MB
+        static unsigned char *blk[MAXB];
+        static size_t len[MAXB];
+        int nb = 0;
+        const UINT_PTR A = 32u << 20, G = 16u << 20;
+        MEMORY_BASIC_INFORMATION m;
+        for (unsigned char *a = (unsigned char *)0x10000; VirtualQuery(a, &m, sizeof m) == sizeof m;) {
+            unsigned char *next = (unsigned char *)m.BaseAddress + m.RegionSize;
+            if (m.State == MEM_FREE) {  // take it in pieces that end on 16 MB boundaries
+                UINT_PTR lo = (UINT_PTR)m.BaseAddress, hi = lo + m.RegionSize;
+                while (lo < hi && nb < MAXB) {
+                    UINT_PTR e = (lo + G) & ~(G - 1);
+                    if (e > hi || e <= lo) e = hi;
+                    if (VirtualAlloc((void *)lo, e - lo, MEM_RESERVE, PAGE_NOACCESS) == (void *)lo) {
+                        blk[nb] = (unsigned char *)lo;
+                        len[nb++] = e - lo;
+                    }
+                    lo = e;
+                }
+            }
+            if (next <= a) break;
+            a = next;
+        }
+#define WHOLE(i) (len[i] == G && !((UINT_PTR)blk[i] & (G - 1)))
+        int big = -1, small[NSMALL], ns = 0, scrap = -1;
+        for (int i = nb - BIGN; i >= 0 && big < 0; i--) {  // the highest 224 MB run starting on 32 MB
+            int ok = !((UINT_PTR)blk[i] & (A - 1));
+            for (int k = 0; k < BIGN && ok; k++) ok = WHOLE(i + k) && blk[i + k] == blk[i] + k * G;
+            if (ok) big = i;
+        }
+        CHECK(big > 0);
+        for (int i = 0; i < big - 2 && scrap < 0; i++)  // the lowest 16 MB piece that cannot hold an aligned 32 MB
+            if (WHOLE(i) && ((UINT_PTR)blk[i] & (A - 1))) scrap = i;
+        CHECK(scrap >= 0);
+        for (int i = scrap + 2; i + 2 < big - 1 && ns < NSMALL; i++) {
+            if (!WHOLE(i) || !WHOLE(i + 1) || ((UINT_PTR)blk[i] & (A - 1)) || blk[i + 1] != blk[i] + G) continue;
+            if (ns && i <= small[ns - 1] + 2) continue;  // keep a taken piece between gaps
+            small[ns++] = i;
+        }
+        CHECK(ns == NSMALL);
+#undef WHOLE
+        VirtualFree(blk[scrap], 0, MEM_RELEASE);
+        for (int k = 0; k < BIGN; k++) VirtualFree(blk[big + k], 0, MEM_RELEASE);
+        for (int k = 0; k < NSMALL; k++) {
+            VirtualFree(blk[small[k]], 0, MEM_RELEASE);
+            VirtualFree(blk[small[k] + 1], 0, MEM_RELEASE);
+        }
+        unsigned char *big_at = blk[big];
+
+        enum { M = 900000, SZ = 1000 };
+        static unsigned char *sm[M];
+        int n = 0, taken = 0, big_whole = 1;
+        while (n < M) {
+            for (int i = 0; i < 10000 && n < M; i++, n++) {
+                sm[n] = g_malloc(SZ);
+                CHECK(sm[n]);
+                sm[n][0] = (unsigned char)n;
+            }
+            taken = 0;
+            for (int k = 0; k < NSMALL; k++)
+                if (VirtualQuery(blk[small[k]], &m, sizeof m) == sizeof m && m.State != MEM_FREE) taken++;
+            big_whole = VirtualQuery(big_at, &m, sizeof m) == sizeof m && m.State == MEM_FREE && m.RegionSize >= BIGN * G;
+            if (taken == NSMALL || !big_whole) break;
+        }
+        printf("growth placement: %d small blocks, %d of %d 32 MB gaps used, 224 MB gap %s\n", n, taken, NSMALL,
+               big_whole ? "still whole" : "CUT");
+        CHECK(taken == NSMALL && big_whole);
+        for (int i = 0; i < n; i++) {
+            CHECK(sm[i][0] == (unsigned char)i);
+            g_free(sm[i]);
+        }
+        for (int i = 0; i < nb; i++) {
+            int hole = (i >= big && i < big + BIGN) || i == scrap;
+            for (int k = 0; k < NSMALL; k++) hole |= i == small[k] || i == small[k] + 1;
+            if (!hole) VirtualFree(blk[i], 0, MEM_RELEASE);
+        }
+    }
+
     // more small blocks than mimalloc's fixed reservation holds: the rest must spill to dlmalloc, intact
     {
         enum { M = 950000, SZ = 1000 };  // ~950 MB, over the 768 MB cap
@@ -177,7 +259,7 @@ int main(int argc, char **argv) {
     CHECK(has("battle draw-list sort replaced") && has("render-list sort (+0x4C/+0x48) replaced"));
     CHECK(has("batch fix installed") && has("campaign fix: 4 of 4") && has("x87 fix: 1277 of 1277"));
     CHECK(has("height cache installed") && has("memcpy fast path installed"));
-    CHECK(has("loop prefetch: 6 of 6") && has("frame hook ready"));
+    CHECK(has("loop prefetch: 6 of 6") && (has("frame hook ready") || has("FPS logger ready")));  // dev builds: FPS logger
     CHECK(!has("does not match") && !has("differs") && !has("skipped") && !has("not the game"));
 
     // the three heap jumps must point into this DLL; dlmalloc's trim stays the game's own, relocated address intact
@@ -194,6 +276,39 @@ int main(int argc, char **argv) {
     DWORD trim_abs;
     memcpy(&trim_abs, b + 0x1126E0 + 2, 4);
     CHECK(b[0x1126E0] == 0x83 && trim_abs == 0x11F20BBC - 0x10000000 + (DWORD)(UINT_PTR)b);
+    // the loading fixes hook the game's imports: the loader must not have overwritten them after the notification
+    CHECK(has("file I/O fix installed") && has("attribute cache installed") && has("texture compression replaced"));
+    IMAGE_NT_HEADERS *gnt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
+    IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(b + gnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+    int hooked = 0;
+    for (; d->Name; d++) {
+        if (_stricmp((char *)(b + d->Name), "KERNEL32.dll") != 0) continue;
+        IMAGE_THUNK_DATA *nm = (IMAGE_THUNK_DATA *)(b + d->OriginalFirstThunk), *iat = (IMAGE_THUNK_DATA *)(b + d->FirstThunk);
+        for (; nm->u1.AddressOfData; nm++, iat++) {
+            if (IMAGE_SNAP_BY_ORDINAL(nm->u1.Ordinal)) continue;
+            const char *n = (char *)((IMAGE_IMPORT_BY_NAME *)(b + nm->u1.AddressOfData))->Name;
+            if (strcmp(n, "GetFileAttributesW") && strcmp(n, "CreateFileW") && strcmp(n, "ReadFile")) continue;
+            unsigned char *to = (unsigned char *)iat->u1.Function;
+            if (!(to >= lo && to < hi)) printf("import %s points at %p, outside this DLL\n", n, (void *)to);
+            CHECK(to >= lo && to < hi);
+            hooked++;
+        }
+    }
+    CHECK(hooked == 3);
+    // the texture compressor through the game's patched entry (dev builds with texfix_verify.txt: through the
+    // trampoline to the game's own code as well): a 64x64 image, every block written, same result twice
+    {
+        typedef void(__attribute__((thiscall)) * comp_fn)(const DWORD *, const DWORD *, unsigned char **);
+        static unsigned char img[64 * 64 * 4 + 64], o1[256 * 8 + 16], o2[256 * 8 + 16];
+        for (unsigned i = 0; i < sizeof img; i++) img[i] = (unsigned char)(i * 2654435761u >> 13);
+        DWORD src[8] = {(DWORD)(UINT_PTR)img, 0, 64, 0, 256, 0, 4, 0}, rows[2] = {0, 64};
+        memset(o1, 0xCD, sizeof o1);
+        memset(o2, 0xCD, sizeof o2);
+        unsigned char *p1 = o1, *p2 = o2;
+        ((comp_fn)(void *)(b + 0x18E8390))(src, rows, &p1);
+        ((comp_fn)(void *)(b + 0x18E8390))(src, rows, &p2);
+        CHECK(p1 == o1 + 256 * 8 && p2 == o2 + 256 * 8 && !memcmp(o1, o2, sizeof o1) && o1[256 * 8] == 0xCD);
+    }
     printf("late install: game DLL relocated to %p, all fixes installed from the load notification\n", (void *)game);
     heap_checks(b);
     printf("all late-load tests passed\n");
