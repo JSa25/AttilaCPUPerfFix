@@ -15,7 +15,7 @@ set "LIBS=-lkernel32 -lwinmm -ladvapi32 -lpsapi -lbcrypt"
 
 "%CC%" -O2 -DNDEBUG -I"%MIMALLOC%\include" -c "%MIMALLOC%\src\static.c" -o build\mimalloc.o || exit /b 1
 rem --no-insert-timestamp keeps the build reproducible: the same compiler gives the same file
-"%CC%" -O2 -Wall -Wextra -I"%MIMALLOC%\include" -shared -s -static -Wl,--no-insert-timestamp -o build\dinput8.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c build\mimalloc.o dinput8.def %LIBS% || exit /b 1
+"%CC%" -O2 -Wall -Wextra -I"%MIMALLOC%\include" -shared -s -static -Wl,--no-insert-timestamp -o build\dinput8.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c build\mimalloc.o dinput8.def %LIBS% || exit /b 1
 echo built build\dinput8.dll
 
 if /i not "%~1"=="test" exit /b 0
@@ -34,4 +34,10 @@ for %%T in (heapfix pool sort batchfix campfix x87fix heightcache memfast loopfe
 "%CC%" -O2 -Wall -static -o build\lateload_test.exe tests\lateload_test.c %LIBS% || exit /b 1
 echo == lateload
 build\lateload_test.exe "%~dp0build\dinput8.dll" "%~2" || (echo lateload test FAILED & exit /b 1)
+"%CC%" -O2 -Wall -static -o build\logtrim_test.exe tests\logtrim_test.c logtrim.c %LIBS% || exit /b 1
+echo == logtrim
+build\logtrim_test.exe || (echo logtrim test FAILED & exit /b 1)
+"%CC%" -O2 -Wall -static -o build\uikeep_test.exe tests\uikeep_test.c %LIBS% || exit /b 1
+echo == uikeep
+build\uikeep_test.exe || (echo uikeep test FAILED & exit /b 1)
 echo all tests passed

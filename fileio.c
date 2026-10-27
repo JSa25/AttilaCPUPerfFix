@@ -50,7 +50,7 @@ static volatile LONG g_open;  // slots in use (fast path: 0 = nothing buffered)
 static wchar_t g_userdir[MAX_PATH];
 static size_t g_userdir_len;
 volatile LONG g_fio_unbuffered_packs, g_fio_buffered_files, g_fio_reads, g_fio_refills;
-static void (*g_fio_log)(const char *fmt, ...);
+static void (*g_fio_log)(const char *fmt, ...) __attribute__((unused));  // used by the dev builds' stats lines
 
 static struct bh *find(HANDLE h) {
     if (!g_open || h == NULL || h == INVALID_HANDLE_VALUE) return NULL;
@@ -285,10 +285,6 @@ BOOL WINAPI fio_SetEndOfFile(HANDLE h) {
 BOOL WINAPI fio_CloseHandle(HANDLE h) {
     if (find(h)) {
         untrack(h, 0);
-        static volatile LONG logged;
-        if (g_fio_log && InterlockedIncrement(&logged) <= 20)  // a few lines per session, to check it works
-            g_fio_log("file I/O fix: so far %ld .pack opens through the file cache, %ld buffered files, %ld small reads "
-                      "served with %ld file reads", g_fio_unbuffered_packs, g_fio_buffered_files, g_fio_reads, g_fio_refills);
     }
     return r_CloseHandle(h);
 }

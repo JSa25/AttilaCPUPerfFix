@@ -57,15 +57,19 @@ static long run(int queries, int mutate_every) {
             a1 = ac_GetFileAttributesW(p), e1 = GetLastError();
             SetLastError(1234);
             a2 = GetFileAttributesW(p), e2 = GetLastError();
-        } else {  // the game's flag sets: buffered, and unbuffered + overlapped + sequential + read-only attribute
-            static const DWORD fl[3] = {0x08000001, 0x68000001, 0x80};
-            DWORD f = fl[rnd() % 3], sh = rnd() % 2 ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE;
+        } else {  // the game's flag sets: buffered, unbuffered + overlapped + sequential, read-only attribute, and its
+                  // stat (attributes access, backup semantics: also opens folders)
+            static const DWORD fl[4] = {0x08000001, 0x68000001, 0x80, FILE_FLAG_BACKUP_SEMANTICS};
+            int k = rnd() % 4;
+            DWORD f = fl[k], sh = rnd() % 2 ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE;
+            DWORD acc = k == 3 ? FILE_READ_ATTRIBUTES : GENERIC_READ;
+            if (k == 3) sh = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
             SetLastError(1234);
-            HANDLE h1 = ac_CreateFileW(p, GENERIC_READ, sh, NULL, OPEN_EXISTING, f, NULL);
+            HANDLE h1 = ac_CreateFileW(p, acc, sh, NULL, OPEN_EXISTING, f, NULL);
             e1 = GetLastError();
             if (h1 != INVALID_HANDLE_VALUE) CloseHandle(h1);
             SetLastError(1234);
-            HANDLE h2 = CreateFileW(p, GENERIC_READ, sh, NULL, OPEN_EXISTING, f, NULL);
+            HANDLE h2 = CreateFileW(p, acc, sh, NULL, OPEN_EXISTING, f, NULL);
             e2 = GetLastError();
             if (h2 != INVALID_HANDLE_VALUE) CloseHandle(h2);
             a1 = h1 == INVALID_HANDLE_VALUE, a2 = h2 == INVALID_HANDLE_VALUE;  // 1 = failed

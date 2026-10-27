@@ -15,7 +15,8 @@
 #define MAX_RECORDS 8  // per session: the first ones are what matters, and a loop of faults must not flood the log
 
 static wchar_t g_dlog[MAX_PATH];
-static DWORD g_main_tid;
+static DWORD g_main_tid, g_self_base;
+volatile DWORD g_uikeep_tid;  // uikeep.c: the thread that is keeping or deleting a menu picture right now, else 0
 static volatile LONG g_records, g_busy;
 static char g_buf[8192];  // the handler's only buffer: static, so a stack overflow record needs no stack
 
@@ -64,6 +65,20 @@ static const char *code_name(DWORD c) {
     }
 }
 
+// case-insensitive ASCII compare (the handler avoids CRT functions that may touch locale state)
+static int same_ascii(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if ((*a | 0x20) != (*b | 0x20)) return 0;
+    return *a == *b;
+}
+
+// for the log: the game version in plain words, by empire.retail.dll's TimeDateStamp (NULL = unknown build)
+static const char *build_name(DWORD stamp) {
+    return stamp == 0x69CE1786u ? "normal Steam version (1.6.0) - supported"
+         : stamp == 0x698089B0u ? "GOG version - partly supported (some fixes do not fit it and stay off, see STATUS)"
+         : NULL;
+}
+
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     DWORD code = e->ExceptionRecord->ExceptionCode;
     const char *what = code_name(code);
@@ -76,9 +91,19 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     DWORD tid = GetCurrentThreadId();
     p += snprintf(p, end - p, "[%02d:%02d:%02d.%03d] EXCEPTION %d: 0x%08lX %s at ", t.wHour, t.wMinute, t.wSecond,
                   t.wMilliseconds, (int)nrec, code, what);
-    p += where(p, end - p, (DWORD)(UINT_PTR)e->ExceptionRecord->ExceptionAddress);
+    DWORD at = (DWORD)(UINT_PTR)e->ExceptionRecord->ExceptionAddress, at_base = 0;
+    const char *at_name = image_of(at, &at_base);
+    p += where(p, end - p, at);
     p += snprintf(p, end - p, ", %s thread %lu (first chance: the game may still handle it)\n",
                   tid == g_main_tid ? "main" : "worker", tid);
+    // the same in plain words: whose code it happened in
+    int ours = at_base && at_base == g_self_base, game = at_name && same_ascii(at_name, "empire.retail.dll");
+    p += snprintf(p, end - p, "  -> %s%s. If the game closed or froze right now, this is why; if it kept running, it "
+                  "recovered.\n", ours ? "inside this mod (please report it)" : game ? "in the game's own code, not in this mod"
+                  : "not in this mod, in ", ours || game ? "" : at_name ? at_name : "code outside any DLL");
+    if (g_uikeep_tid && g_uikeep_tid == tid)
+        p += snprintf(p, end - p, "  -> it happened while the menu texture fix was keeping or deleting a menu picture. "
+                      "To switch that fix off, create an empty uikeep_off.txt in the game folder, and please report it.\n");
     if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) &&
         e->ExceptionRecord->NumberParameters >= 2) {
         ULONG_PTR k = e->ExceptionRecord->ExceptionInformation[0];
@@ -123,6 +148,8 @@ static void pref(const char *text, const char *name, char *out, int cap) {
 
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...)) {
     g_main_tid = GetCurrentThreadId();
+    MEMORY_BASIC_INFORMATION mb;
+    if (VirtualQuery((void *)diag_startup, &mb, sizeof mb)) g_self_base = (DWORD)(UINT_PTR)mb.AllocationBase;
     wcscpy(g_dlog, log_path);
     wchar_t exe[MAX_PATH], dir[MAX_PATH];
     GetModuleFileNameW(NULL, exe, MAX_PATH);
@@ -141,6 +168,12 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
     log("game: empire.retail.dll build %08lX, image %lu bytes, loaded at %p; Attila.exe large-address-aware: %s",
         nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage, (void *)empire,
         (xnt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) ? "yes" : "NO");
+    const char *bn = build_name(nt->FileHeader.TimeDateStamp);
+    if (bn)
+        log("Game version: %s", bn);
+    else
+        log("Game version: unknown (build %08lX) - NOT supported yet: each fix checks the game's code and switches "
+            "itself off where it does not fit (see STATUS); the game then runs as without it.", nt->FileHeader.TimeDateStamp);
 
     OSVERSIONINFOW ov = {.dwOSVersionInfoSize = sizeof ov};
     LONG(WINAPI * rtl)(OSVERSIONINFOW *) = (void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");

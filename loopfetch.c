@@ -41,7 +41,7 @@ struct site {
     0x8D, 0x51, 0x04,              /* lea edx,[ecx+4] */                                                 \
     0x3B, 0x55, 0x18               /* cmp edx,[ebp+18h]      end */
 
-static const struct site SITES[8] = {
+static const struct site SITES[] = {
     {0x17B1840, 9, {0x8B, 0x45, 0x08, 0x8B, 0x2C, 0x98, 0x8B, 0x7D, 0x00},
      {0x52, 0x8B, 0x45, 0x08, 0x8D, 0x53, 0x04, 0x3B, 0x54, 0x24, 0x2C, 0x73, 0x06, 0x8B, 0x14, 0x90, 0x0F, 0x18, 0x0A, 0x5A},
      20, 0, "render pass FUN_117b17f0"},  // measured slower (AGENT_LOG 47)
@@ -76,7 +76,9 @@ static const struct site SITES[8] = {
 // [cmp byte [flag],0; je orig] <fetch>; orig: <original bytes>; jmp site+len
 static unsigned build(unsigned char *s, const struct site *t, unsigned char *site) {
     unsigned n = 0;
-    s[n++] = 0x80; s[n++] = 0x3D; put32(s + n, (DWORD)(UINT_PTR)&g_loopfetch_on); n += 4; s[n++] = 0x00;
+    s[n++] = 0x80; s[n++] = 0x3D;
+    put32(s + n, (DWORD)(UINT_PTR)&g_loopfetch_on); n += 4;
+    s[n++] = 0x00;
     s[n++] = 0x74; s[n++] = t->fetch_len;
     memcpy(s + n, t->fetch, t->fetch_len); n += t->fetch_len;
     memcpy(s + n, t->orig, t->len); n += t->len;

@@ -31,7 +31,11 @@ int main(void) {
     diag_startup(NULL, g_path, say);                     // not the game: one explanation, no handler
     diag_startup(GetModuleHandleW(NULL), g_path, say);   // "the game": full startup lines + handler
     AddVectoredExceptionHandler(0, recover);             // after diag's, like the game's own handling
-    for (int i = 0; i < 10; i++) fault();
+    for (int i = 0; i < 10; i++) {
+        g_uikeep_tid = i == 3 ? GetCurrentThreadId() : 0;  // one crash during the menu texture fix's work
+        fault();
+    }
+    g_uikeep_tid = 0;
     static char text[65536];
     FILE *f = _wfopen(g_path, L"rb");
     size_t n = fread(text, 1, sizeof text - 1, f);
@@ -49,6 +53,9 @@ int main(void) {
     CHECK(strstr(text, "write to address 00000000"));
     CHECK(strstr(text, "main thread"));
     CHECK(strstr(text, "  stack: "));
+    char *u = strstr(text, "create an empty uikeep_off.txt");  // only in the 4th record
+    CHECK(u && !strstr(u + 1, "create an empty uikeep_off.txt"));
+    CHECK(strstr(text, "] EXCEPTION 4:") < u && (!strstr(text, "] EXCEPTION 5:") || u < strstr(text, "] EXCEPTION 5:")));
     printf("\nall diag tests passed (%d records for 10 faults)\n", recs);
     return 0;
 }

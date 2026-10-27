@@ -52,9 +52,20 @@ What it fixes
   compresses the pictures it uses for distant units on the CPU. That
   compressor is replaced with one that is about 14 times faster and gives
   byte-identical textures.
+- Menus (new in version 6.2): opening a province, army or other panel froze
+  the game for about a tenth of a second, even without any mods. Each time a
+  panel closed, the game threw its pictures away, and the next open loaded the
+  same files from disk again (3,000 loads of only about 600 different files in
+  45 seconds of clicking through provinces with MK1212). The mod now keeps up
+  to 1,024 recently used menu pictures loaded, and also answers the menus'
+  checks for loose files that don't exist. Opening a menu now takes about
+  19 ms instead of about 100 ms. The first time you open each kind of menu
+  after starting the game it still stutters like before, because its
+  pictures have to be loaded once. Every open after that is fast.
 
 Every code patch produces bit-identical results to the original code. They
-were tested against the game's own code on millions of inputs.
+were tested against the game's own code on millions of inputs. (The menu fix
+only keeps pictures in memory longer; what you see is the same.)
 
 
 Measured results (Ryzen 9 9950X3D, RTX 5090, 4K)
@@ -76,6 +87,12 @@ Loading, MK1212 with about 25 submods (stopwatch, same save / same siege):
   Campaign save, first load         17 s     16 s
   Siege battle                      1:17     1:12
 
+Opening a menu, MK1212 campaign (time of the frame the menu opens in,
+median of about 50-70 opens of provinces and armies):
+
+  6.1                               about 100 ms
+  6.2                               about 19 ms
+
 Your numbers will differ, but the gains come from CPU time saved per frame, so
 CPU-bound systems benefit the most. If your battles run at 4K and the graphics
 card is at 95-100% load, the card is the limit and the battle fps gain will be
@@ -90,6 +107,14 @@ Install
    which fixes are active, plus your game build, system and settings.
 
 Uninstall: delete dinput8.dll (and heapfix.log).
+
+
+It doesn't show up in the launcher's mod list
+---------------------------------------------
+That's normal. This mod is a DLL in the game folder, not a .pack mod, so the
+launcher and mod managers don't know about it. It's active as long as
+dinput8.dll is in the game folder. To check, start the game and open
+heapfix.log in the game folder: the STATUS block lists which fixes are on.
 
 
 Recommended settings
@@ -112,6 +137,8 @@ Turning single fixes off
 Create an empty file with one of these names in the game folder to disable that
 fix (useful if you suspect one of them):
 
+  heapfix_off.txt      memory allocator (the game keeps its own heap)
+  pool_off.txt         small-object pool lookup
   sortfix_off.txt      render-list sorts (both)
   batchfix_off.txt     battle draw batching
   campfix_off.txt      campaign map fixes
@@ -122,8 +149,9 @@ fix (useful if you suspect one of them):
   attrcache_off.txt    loading: missing-folder cache
   fileio_off.txt       loading: buffered save reads
   texfix_off.txt       battle loading: texture compressor
+  uikeep_off.txt       menus: keep menu pictures loaded
 
-heapfix.log shows what was installed or skipped.
+The STATUS lines in heapfix.log show which fixes are on, and why one is off.
 
 
 Reporting a problem
@@ -133,7 +161,12 @@ from the game folder (it's a small text file). It shows:
 - whether the game loaded the mod at all, and from which folder
 - your game build, Windows version, CPU, RAM and the settings above
 - other DLLs in the game folder that hook the game (ReShade, DXVK, other mods)
-- for a crash: where it happened (EXCEPTION lines), so it can be traced
+- a STATUS block: which fixes are on, and why one is off
+- for a crash: where it happened (EXCEPTION lines), so it can be traced, with a
+  plain line saying whether it was in the game's own code or in this mod,
+  and another one if it happened while the menu fix was working
+Once the log passes 1 MB, the oldest game sessions are removed at the next
+start, so it stays small enough to post.
 The log only records; it never changes how the game handles a crash. It shows
 your Windows user name in folder paths, so blank that out before posting it
 publicly if you like.
@@ -145,6 +178,7 @@ Compatibility and notes
 - NOT compatible with "Attila 32bit Engine Improver" or any other dinput8.dll
   mod. Only one dinput8.dll can be loaded.
 - Works with UI mods and normal pack mods.
+- Players report it works on Linux with Proton.
 - If you use "Attila 4K UI Scale": on its version 2.0 or newer, keep the
   "Vanilla" preset in its F10 menu (the default). On older versions, use its
   "Basic" file, not "All features on". Its heavier settings turn on bigger
@@ -157,6 +191,22 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.2: no more freeze when opening a menu. Menu pictures stay
+           loaded instead of being thrown away and loaded again on every
+           open, and the menus' checks for missing loose files are answered
+           from the cache. MK1212: opening a province or army 100 -> 19 ms.
+           The first open of each kind of menu per game start still
+           stutters (its pictures load once).
+           Turn it off with uikeep_off.txt.
+           Also a clearer heapfix.log. Each game start begins
+           with a header line, a "Game version" line says whether your game
+           build is supported, and a STATUS block lists every fix as on, part
+           or OFF with the reason. Crash records say in plain words whether the
+           crash was in the game's own code or in this mod. The log no longer
+           fills up with file-reading statistics and keeps itself under about
+           1 MB. New off switches for the two oldest fixes: heapfix_off.txt
+           and pool_off.txt. SHA-256 of dinput8.dll:
+           2be088133543350d5798f137c5c56178fc9f33f7a24ff9bcf6b4a07916a9db47
 Version 6.1: faster loading, mostly for big mod setups. Missing loose-file
            folders are remembered (checked against Windows in game: 0
            differences in over 500,000 checks and opens), the save is read

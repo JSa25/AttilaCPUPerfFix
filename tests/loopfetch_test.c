@@ -25,6 +25,21 @@ __attribute__((naked)) void pad(void) {
                      "popal\n\tret\n\t");
 }
 enum { EAX, ECX, EDX, EBX, ESP_, EBP, ESI, EDI };
+// The emitter site's original instructions push edi and eax: this pad records those two values and drops them.
+unsigned g_pushed[2];
+__attribute__((naked)) void pad_push2(void) {
+    __asm__ volatile("pushal\n\t"
+                     "movl 28(%esp), %eax\n\tmovl %eax, _g_r\n\t"
+                     "movl 24(%esp), %eax\n\tmovl %eax, _g_r+4\n\t"
+                     "movl 20(%esp), %eax\n\tmovl %eax, _g_r+8\n\t"
+                     "movl 16(%esp), %eax\n\tmovl %eax, _g_r+12\n\t"
+                     "movl 8(%esp), %eax\n\tmovl %eax, _g_r+20\n\t"
+                     "movl 4(%esp), %eax\n\tmovl %eax, _g_r+24\n\t"
+                     "movl 0(%esp), %eax\n\tmovl %eax, _g_r+28\n\t"
+                     "movl 32(%esp), %eax\n\tmovl %eax, _g_pushed\n\t"
+                     "movl 36(%esp), %eax\n\tmovl %eax, _g_pushed+4\n\t"
+                     "popal\n\taddl $8, %esp\n\tret\n\t");
+}
 
 static unsigned char *g_stub[NSITES];
 static void say(const char *fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
@@ -59,7 +74,8 @@ int main(int argc, char **argv) {
     for (unsigned k = 0; k < NSITES; k++) {  // fake site k: the stub jumps back to site+len, where a jmp to the pad sits
         unsigned char *site = page + 256 * k;
         site[SITES[k].len] = 0xE9;
-        put32(site + SITES[k].len + 1, (DWORD)((unsigned char *)pad - (site + SITES[k].len + 5)));
+        void *to = SITES[k].rva == 0x18933C0 ? (void *)pad_push2 : (void *)pad;
+        put32(site + SITES[k].len + 1, (DWORD)((unsigned char *)to - (site + SITES[k].len + 5)));
         g_stub[k] = page + 4096 + 256 * k;
         build(g_stub[k], &SITES[k], site);
     }
@@ -73,7 +89,7 @@ int main(int argc, char **argv) {
     unsigned stale = (unsigned)(UINT_PTR)(arr_pages + 4096 + 64);
     static unsigned obj[64];  // the esi object: [esi+0x70]
     obj[0x70 / 4] = 0xABCD1234;
-    static unsigned list[4], frame[16];
+    static unsigned list[4], frame[16], emitters[8];  // emitters+8 = entry array {emitter, ref} (emitter site)
     long runs = 0;
     for (int on = 0; on < 2; on++) {
         g_loopfetch_on = (unsigned char)on;
@@ -88,6 +104,24 @@ int main(int argc, char **argv) {
                 frame[0x0C / 4] = L;
                 frame[0x18 / 4] = count;
                 for (unsigned k = 0; k < NSITES; k++) {
+                    if (SITES[k].rva == 0x18933C0) {  // ebx = struct ([+8] entries), esi = i, count [esp+34h]:
+                        // entries of 8 bytes ending at the no-access page (they share it with arr: set here, arr put
+                        // back after); entries past i hold a stale emitter pointer
+                        unsigned *ent = (unsigned *)(arr_pages + 4096 - 8 * count);
+                        for (unsigned j = 0; j < count; j++) {
+                            ent[2 * j] = j <= i ? (unsigned)(UINT_PTR)items[(j * 5) % 128] : stale;
+                            ent[2 * j + 1] = 0x7EF00000 + j;
+                        }
+                        emitters[2] = (unsigned)(UINT_PTR)ent;
+                        unsigned E = (unsigned)(UINT_PTR)emitters;
+                        run(k, 0xA5A5, 0xCCCC, E, 0xBEEF, i, 0xD1D1, count, 12);  // ecx = entries, edi and eax pushed
+                        CHECK(g_r[ECX] == (unsigned)(UINT_PTR)ent && g_r[EBX] == E && g_r[ESI] == i && g_r[EAX] == 0xA5A5 &&
+                              g_r[EDI] == 0xD1D1 && g_r[EBP] == 0xBEEF && g_pushed[0] == 0xA5A5 && g_pushed[1] == 0xD1D1);
+                        for (unsigned j = 0; j < count; j++) arr[j] = j <= i ? (unsigned)(UINT_PTR)items[(j * 7) % 128] : stale;
+                        CHECK(g_r[EDX] == 0x5EED5EED);
+                        runs++;
+                        continue;
+                    }
                     switch (k) {
                     case 0:  // ebp = list, ebx = i, end [esp+28h]: eax = array, ebp = item, edi = [item]
                         run(k, 0xAAAA, 0xCCCC, i, L, 0xE51E51, 0xD1D1, count, 9);

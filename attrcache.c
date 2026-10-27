@@ -237,14 +237,15 @@ DWORD WINAPI ac_GetFileAttributesW(LPCWSTR p) {
     return a;
 }
 
-// Flags whose open of a missing path fails exactly like the check: attributes (ignored when opening), buffering hints.
-#define AC_OPEN_FLAGS (0x7FFFu | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN |                        FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_WRITE_THROUGH)
+// Flags whose open of a missing path fails exactly like the check: attributes (ignored when opening), buffering hints,
+// backup semantics (the game's stat, FUN_119fd930: FILE_READ_ATTRIBUTES, used per search root when a menu opens).
+#define AC_OPEN_FLAGS (0x7FFFu | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN |                        FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_WRITE_THROUGH)
 
 HANDLE WINAPI ac_CreateFileW(LPCWSTR p, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags,
                              HANDLE tmpl) {
     wchar_t q[MAXPATHC + 2];
     DWORD n = 0;
-    if (disp == OPEN_EXISTING && access == GENERIC_READ && !tmpl && !(flags & ~AC_OPEN_FLAGS)) n = normalize(p, q);
+    if (disp == OPEN_EXISTING && (access == GENERIC_READ || access == FILE_READ_ATTRIBUTES) && !tmpl && !(flags & ~AC_OPEN_FLAGS)) n = normalize(p, q);
     if (!n) return r_open(p, access, share, sa, disp, flags, tmpl);
     DWORD entry_le = GetLastError();
     InterlockedIncrement(&g_open_calls);

@@ -23,10 +23,12 @@ Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 | `memfast.c` | Fast path for the engine's memcpy on copies of 64 bytes or less |
 | `loopfetch.c` | Six battle render loops prefetch the field the loop reads next, four items ahead (prefetch only, never a load through an item pointer) |
 | `fileio.c` | Loading: `.pack` files opened without `FILE_FLAG_NO_BUFFERING`; small reads of read-only files in the game's user folder (the unpacked save) served from a 64 KB buffer, file position kept exactly |
-| `attrcache.c` | Loading: cache of missing loose-file folders behind the game's `GetFileAttributesW` and read-only `CreateFileW` calls. Every folder above a cached name is watched (`FindFirstChangeNotification`); any change clears the cache. Answers and last-error values are the same as Windows' |
+| `attrcache.c` | Loading and menus: cache of missing loose-file folders behind the game's `GetFileAttributesW` and read-only `CreateFileW` calls (including its CRT `stat`: `FILE_READ_ATTRIBUTES` with backup semantics, which the menus use). Every folder above a cached name is watched (`FindFirstChangeNotification`); any change clears the cache. Answers and last-error values are the same as Windows' |
 | `texfix.c` | Battle loading: the DXT1 compressor for unit imposters (FUN_118e8390 / FUN_1192eee0) redone with SSE2, byte-identical output |
+| `uikeep.c` | Menus: the deletion step of the UI picture queue (FUN_1174cca0) keeps a picture loaded instead of deleting it and remembers its name, up to 1,024; the game's own lookup finds it on the next open. Past 1,024 the oldest still-unused one is deleted the game's way. Pictures are found again by name, never by a stored pointer |
 | `fps.c` | Hook on the per-frame function that runs the rounding-mode safety checks of `campfix.c` and `x87fix.c` |
-| `diag.c` | Diagnostics in `heapfix.log`: mod version, game build, system, settings, other hook DLLs, and crash records (a vectored exception handler that only logs and never handles the exception) |
+| `diag.c` | Diagnostics in `heapfix.log`: mod version, game build and whether it is supported, system, settings, other hook DLLs, and crash records with a plain line saying whose code it was (a vectored exception handler that only logs and never handles the exception) |
+| `logtrim.c` | Keeps `heapfix.log` under about 1 MB: at game start, past 1 MB the oldest whole sessions are dropped |
 | `dinput8.def` | The exports a `dinput8.dll` must have |
 
 Every patch first compares the game's bytes at its address with what it expects, and skips itself
@@ -60,7 +62,7 @@ and the DLL itself can be downloaded there. Builds also carry a signed build att
 ## Tests
 
 The tests run the game's own code next to the replacements on millions of inputs and check the
-results are identical (`diag_test` instead checks the crash records on deliberate faults; `lateload_test` loads the built DLL before the game DLL, as an overlay can, and checks every fix still installs from Windows' load notification; `loopfetch_test` runs each prefetch stub over arrays that end at a no-access page, with stale pointers in the slots a loop never reaches, and checks every register matches the original instructions; `fileio_test` and `attrcache_test` compare against plain Windows calls on a temporary folder tree while files and folders are created, renamed and deleted, and `attrcache_test` also runs with the folder watches ignored to show it catches a stale cache). They read
+results are identical (`diag_test` instead checks the crash records on deliberate faults; `lateload_test` loads the built DLL before the game DLL, as an overlay can, and checks every fix still installs from Windows' load notification; `loopfetch_test` runs each prefetch stub over arrays that end at a no-access page, with stale pointers in the slots a loop never reaches, and checks every register matches the original instructions; `fileio_test` and `attrcache_test` compare against plain Windows calls on a temporary folder tree while files and folders are created, renamed and deleted, and `attrcache_test` also runs with the folder watches ignored to show it catches a stale cache; `uikeep_test` runs the menu fix against a stand-in for the game's picture table: kept, reused, in use, deleted meanwhile, oldest deleted). They read
 your copy of the game's `empire.retail.dll` (it is not included here):
 
 ```
