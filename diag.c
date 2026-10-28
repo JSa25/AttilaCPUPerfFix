@@ -156,7 +156,7 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
     wcscpy(dir, log_path);
     wchar_t *sl = wcsrchr(dir, L'\\');
     if (sl) *sl = 0;
-    log("Attila CPU Performance Fix %s loaded into %ls", MOD_VERSION, exe);
+    log("Attila Engine Performance Fix %s loaded into %ls", MOD_VERSION, exe);
     if (!empire) {
         log("empire.retail.dll is not loaded and Windows could not be asked to report when it loads - nothing "
             "patched in this process");

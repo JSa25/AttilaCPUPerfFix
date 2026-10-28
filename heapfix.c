@@ -377,9 +377,15 @@ static FARPROC real_proc(const char *name) {
     return GetProcAddress(g_real, name);
 }
 
+void (*g_dev_di8_created)(void *di);   // the frame bridge panel filters the game's mouse while open (fgpanel.c)
 HRESULT WINAPI stub_DirectInput8Create(HINSTANCE h, DWORD v, REFIID r, LPVOID *o, LPUNKNOWN u) {
     typedef HRESULT(WINAPI * fn)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
     fn f = (fn)real_proc("DirectInput8Create");
+    if (f && g_dev_di8_created) {
+        HRESULT hr = f(h, v, r, o, u);
+        if (SUCCEEDED(hr) && o && *o) g_dev_di8_created(*o);
+        return hr;
+    }
     return f ? f(h, v, r, o, u) : E_FAIL;
 }
 HRESULT WINAPI stub_DllCanUnloadNow(void) {
@@ -422,6 +428,14 @@ int install_uikeep(HMODULE m, void (*log)(const char *fmt, ...));               
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...));  // diag.c
 void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
 extern void (*g_frame_check)(void);                                  // fps.c
+// release (6.3, AGENT_LOG 104): the frame bridge (bridgeprobe.c, fgbridge.c, ...) for the upscaling add-on runs on passtime's
+// stage-driver hook in its lean bridge mode; it starts only when the add-on folder holds the helper
+int install_passtime(HMODULE m, void (*log)(const char *fmt, ...));                        // passtime.c
+void passtime_report(void (*log)(const char *fmt, ...));                                   // passtime.c
+extern void (*g_gt_frame)(void);                                                           // passtime.c
+extern int g_pt_force_bridge;                                                              // passtime.c
+volatile LONG g_geo_frame;
+static int g_passtime_on;
 
 static int g_campfix_on, g_x87fix_on;
 
@@ -429,6 +443,14 @@ static int g_campfix_on, g_x87fix_on;
 static void frame_checks(void) {
     if (g_campfix_on) campfix_frame();
     if (g_x87fix_on) x87fix_frame();
+    if (g_passtime_on) {   // the frame bridge's frame counter and its 30 s report in heapfix.log
+        g_geo_frame++;
+        if (g_gt_frame) g_gt_frame();
+        static DWORD last;
+        DWORD now = GetTickCount();
+        if (!last) last = now;
+        if (now - last >= 30000) { passtime_report(wlog); last = now; }
+    }
 }
 
 static void set_log_path(HINSTANCE h) {
@@ -451,7 +473,7 @@ static void log_header(void) {
     if (!f) return;
     SYSTEMTIME t;
     GetLocalTime(&t);
-    fprintf(f, "\n======== Attila CPU Performance Fix v%s - game started %04d-%02d-%02d %02d:%02d ========\n",
+    fprintf(f, "\n======== Attila Engine Performance Fix v%s - game started %04d-%02d-%02d %02d:%02d ========\n",
             MOD_VERSION_STR, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
     fclose(f);
 }
@@ -603,6 +625,13 @@ static void install_all(HMODULE m) {
     if (slash) {
         *slash = 0;
         install_fps(m, dir, wlog);  // the frame hook also runs the per-frame checks
+    }
+    // the DLSS add-on: <game folder>\FrameBridge\ with the 64-bit helper and NVIDIA's DLLs; without it nothing is installed
+    if (sl) wcscpy(sl + 1, L"FrameBridge\\helper64.exe");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
+        g_pt_force_bridge = 1;
+        g_passtime_on = install_passtime(m, wlog) > 0;
+        if (g_passtime_on) g_frame_check = frame_checks;
     }
     log_status(st);  // last, so the summary closes the startup lines
 }

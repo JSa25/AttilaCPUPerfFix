@@ -1,5 +1,5 @@
-Total War: ATTILA - CPU Performance Fix (dinput8.dll)
-=====================================================
+Total War: ATTILA - Engine Performance Fix (dinput8.dll)
+========================================================
 
 A drop-in DLL that fixes CPU bottlenecks in Attila's engine. It changes no game
 files and no saves, so you can remove it at any time.
@@ -187,10 +187,19 @@ Compatibility and notes
   switches it, the affected patches restore the original code automatically.
 - Not fixed: the short freeze during autosave (save compression) and end-turn
   AI time, which is only slightly faster.
+- Optional add-on (new in 6.3): "Upscaling and Framegen for Attila" adds NVIDIA
+  DLSS upscaling and frame generation on GeForce RTX cards. It is a separate
+  download and needs this mod 6.3 or newer. Without it, nothing of it is
+  active.
 
 
 Changelog
 ---------
+Version 6.3: support for the optional "Upscaling and Framegen for Attila"
+           add-on (NVIDIA DLSS upscaling and frame generation on RTX
+           cards, separate download; AMD FSR support in the works).
+           Without the add-on 6.3 works exactly like 6.2.
+
 Version 6.2: no more freeze when opening a menu. Menu pictures stay
            loaded instead of being thrown away and loaded again on every
            open, and the menus' checks for missing loose files are answered
