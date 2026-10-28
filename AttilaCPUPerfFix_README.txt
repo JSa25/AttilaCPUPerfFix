@@ -195,6 +195,17 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.4: fixes for the Upscaling and Framegen add-on. With it,
+           switching between fullscreen and windowed in game, alt-tabbing
+           while a battle loads and the end of a battle no longer crash
+           (also with the 4K UI mod and the Steam overlay). Changing
+           graphics settings in game turns DLSS off until the next start
+           instead of freezing the picture, and so does a closed DLSS
+           helper. Loading screens and movies show at full resolution.
+           The settings panel opens with F11 (F12 is Steam's screenshot
+           key). addon=off in FrameBridge\settings.txt turns the add-on
+           off. Without the add-on 6.4 works exactly like 6.3.
+
 Version 6.3.1: with the add-on, a game set to fullscreen no longer stays
            frozen at its start screen: it runs as a borderless window
            while the add-on is on. Crash records in heapfix.log show

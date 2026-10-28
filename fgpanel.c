@@ -1,4 +1,4 @@
-// F12 panel for the frame bridge (dev only; AGENT_LOG 101, look AGENT_LOG 104): DLSS Super Resolution mode, frame
+// F11 panel for the frame bridge (dev only; AGENT_LOG 101, look AGENT_LOG 104): DLSS Super Resolution mode, frame
 // generation (off / 2x / 3x / 4x), per-object motion vectors, and a readout of the game's and the shown frame rate.
 // Drawn on the CPU into a bitmap only when something on it changes (anti-aliased rounded shapes computed here, text by
 // GDI), uploaded to a texture, and blended over the back buffer at Present while the panel is open (one small quad; with
@@ -39,6 +39,7 @@ static int p_sr, p_fg, p_motion;   // current choices: SR 0 off / 1 DLAA / 2..5 
 static FgpApply p_apply;
 static volatile int p_block;       // the game's mouse buttons are hidden (panel open, cursor over it)
 static double p_game_fps, p_shown_fps;
+static const wchar_t *p_note;      // shown instead of the frame rates (fgp_set_note): why DLSS is off
 
 typedef struct { RECT r; int row, value, enabled; } Btn;
 static Btn p_btn[16];
@@ -187,7 +188,7 @@ static void redraw(void) {
     float x0 = p_cx0 + 26 * u, x1 = p_cx1 - 26 * u, y = p_cy0 + 16 * u;
     // heading, and how to close it
     text(L"DLSS", p_title, C_TEXT, (int)x0, (int)y, (int)(x0 + 200 * u), (int)(y + 36 * u), DT_LEFT);
-    text(L"F12 to close", p_tiny, C_DIM, (int)(x1 - 200 * u), (int)y, (int)x1, (int)(y + 36 * u), DT_RIGHT);
+    text(L"F11 to close", p_tiny, C_DIM, (int)(x1 - 200 * u), (int)y, (int)x1, (int)(y + 36 * u), DT_RIGHT);
     y += 44 * u;
     fill_rr(x0, y, x1, y + 1 * u, 0, C_RULE, 1);
     y += 18 * u;
@@ -216,8 +217,9 @@ static void redraw(void) {
     // the readout: the game's frame rate and the shown one (with generated frames), and when frame generation runs
     wchar_t v[96];
     _snwprintf(v, 96, L"Game %.0f fps    Shown %.0f fps", p_game_fps, p_shown_fps);
-    text(v, p_small, C_TEXT, (int)x0, (int)y, (int)(x0 + 300 * u), (int)(y + 26 * u), DT_LEFT);
-    if (fgmax) text(L"Frame generation needs the game window in focus", p_tiny, C_DIM, (int)(x0 + 300 * u), (int)y, (int)x1, (int)(y + 26 * u),
+    if (p_note) text(p_note, p_small, C_BRONZE, (int)x0, (int)y, (int)x1, (int)(y + 26 * u), DT_LEFT | DT_END_ELLIPSIS);
+    else text(v, p_small, C_TEXT, (int)x0, (int)y, (int)(x0 + 300 * u), (int)(y + 26 * u), DT_LEFT);
+    if (fgmax && !p_note) text(L"Frame generation needs the game window in focus", p_tiny, C_DIM, (int)(x0 + 300 * u), (int)y, (int)x1, (int)(y + 26 * u),
          DT_RIGHT | DT_END_ELLIPSIS);
     GdiFlush();
     // the colours through the fixed mask: premultiplied by the card's alpha, the edge highlight, the shadow's alpha
@@ -381,6 +383,24 @@ int fgp_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh, DXGI
     return 1;
 }
 
+void fgp_set_note(const wchar_t *note) { p_note = note; p_dirty = 1; }
+
+// The panel's GPU objects made again on another device (a settings change can come with a new D3D11 device; the panel
+// then sits over the frames the mod shows after the bridge, fgbridge.c fallback). bw / bh: that back buffer's size, for
+// the mouse; the panel keeps its size and place.
+int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh) {
+    if (!p_dc) return 0;   // never set up
+#define DROP(x) if (x) { (x)->lpVtbl->Release(x); (x) = NULL; }
+    DROP(p_rtv); DROP(p_srv); DROP(p_tex); DROP(p_vs); DROP(p_ps); DROP(p_blend); DROP(p_rs); DROP(p_dss);
+#undef DROP
+    p_rtv_res = NULL;
+    p_dev = dev; p_ctx = ctx; p_bw = bw; p_bh = bh;
+    D3D11_TEXTURE2D_DESC td = {(UINT)p_w, (UINT)p_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    p_ok = SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &p_tex)) && pipeline();
+    p_dirty = 1;
+    return p_ok;
+}
+
 void fgp_set_fps(double game, double shown) {
     if (game != p_game_fps || shown != p_shown_fps) { p_game_fps = game; p_shown_fps = shown; p_dirty = 1; }
 }
@@ -388,11 +408,11 @@ void fgp_set_fps(double game, double shown) {
 // each Present (main thread), before the frame is handed to the helper: input, then the panel over the back buffer
 void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
     if (!p_ok) return;
-    static SHORT f12_prev, lb_prev;
+    static SHORT f11_prev, lb_prev;
     int focus = GetForegroundWindow() == hwnd;
-    SHORT f12 = focus ? GetAsyncKeyState(VK_F12) : 0, lb = focus ? GetAsyncKeyState(VK_LBUTTON) : 0;
-    if ((f12 & 0x8000) && !(f12_prev & 0x8000)) { p_open = !p_open; p_dirty = 1; }
-    f12_prev = f12;
+    SHORT f11 = focus ? GetAsyncKeyState(VK_F11) : 0, lb = focus ? GetAsyncKeyState(VK_LBUTTON) : 0;
+    if ((f11 & 0x8000) && !(f11_prev & 0x8000)) { p_open = !p_open; p_dirty = 1; }
+    f11_prev = f11;
     int over = 0, mx = 0, my = 0, hover = -1;
     if (p_open) {
         POINT c;

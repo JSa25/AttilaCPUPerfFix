@@ -628,7 +628,18 @@ static void install_all(HMODULE m) {
     }
     // the DLSS add-on: <game folder>\FrameBridge\ with the 64-bit helper and NVIDIA's DLLs; without it nothing is installed
     if (sl) wcscpy(sl + 1, L"FrameBridge\\helper64.exe");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
+    int addon = sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES;
+    if (addon) {   // addon=off in its settings.txt: the add-on does nothing at all (no hooks), as if it were not installed
+        char text[1024] = {0};
+        wcscpy(sl + 1, L"FrameBridge\\settings.txt");
+        FILE *sf = _wfopen(off, L"r");
+        if (sf) { fread(text, 1, sizeof text - 1, sf); fclose(sf); }
+        if (strstr(text, "\naddon=off") || !strncmp(text, "addon=off", 9)) {
+            wlog("DLSS add-on found but switched off (addon=off in FrameBridge\\settings.txt) - the game runs with the performance fix only");
+            addon = 0;
+        }
+    }
+    if (addon) {
         g_pt_force_bridge = 1;
         g_passtime_on = install_passtime(m, wlog) > 0;
         if (g_passtime_on) g_frame_check = frame_checks;

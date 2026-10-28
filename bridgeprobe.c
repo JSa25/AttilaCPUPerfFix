@@ -42,13 +42,22 @@ void fgb_present(ID3D11Resource *backbuffer);
 int fgb_active(void);
 unsigned fgb_frames(void), fgb_pace_timeouts(void);
 void fgb_stop(void);
+IDXGISwapChain *fgb_fallback_frame(ID3D11Resource *src, HRESULT(STDMETHODCALLTYPE *create)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *,
+                                                                                          IDXGISwapChain **));
+void fgb_fallback_close(void);
+void fgp_set_note(const wchar_t *note);   // fgpanel.c
+int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh);
+IDXGISwapChain *fgb_fallback_sc(void);
+HWND fgb_fallback_window(void);
+void *fgb_vt_original(void **vt, size_t slot);
+void *fgb_unhooked(void *fn);
 void fgb_set_sr(int on, UINT render_w, UINT render_h);
 void fgb_jitter(float *jx, float *jy);
 static void jit_frame_start(void), jit_frame_end(void);   // DLAA viewport jitter (below)
 // per-object motion (fgmotion.c, AGENT_LOG 99): fgbridge_on.txt line 4 contains "motion"
-static int g_motion;              // the motion pass is set up (bridge mode); on / off: g_motion_on and the F12 panel
+static int g_motion;              // the motion pass is set up (bridge mode); on / off: g_motion_on and the F11 panel
 static int g_motion_on;
-// the F12 panel (fgpanel.c)
+// the F11 panel (fgpanel.c)
 typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); } FgpApply;
 int fgp_init(ID3D11Device *, ID3D11DeviceContext *, UINT bw, UINT bh, DXGI_FORMAT fmt, int sr, int fg, int motion, FgpApply apply);
 void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd);
@@ -78,8 +87,12 @@ void fgm_dump_next(const wchar_t *path);
 static void mp_capture_start(void), mp_capture_end(FILE *f), mp_hook(const char *where);   // motion probe (below)
 static int g_live, g_live_state;   // state: 0 not started, 1 running, 2 off for good
 static wchar_t g_helper[MAX_PATH], g_sl[MAX_PATH], g_logdir[MAX_PATH];
-static wchar_t g_settings[MAX_PATH];   // the add-on's settings.txt (the F12 panel saves to it); empty in dev runs
-static unsigned g_fg, g_live_w, g_live_h, g_vp_frame = ~0u, g_hud_frame = ~0u, g_br_hud, g_br_novp, g_br_nodepth;
+static wchar_t g_settings[MAX_PATH];   // the add-on's settings.txt (the F11 panel saves to it); empty in dev runs
+static unsigned g_fg, g_live_w, g_live_h, g_vp_frame = ~0u, g_hud_frame = ~0u, g_br_hud, g_br_novp, g_br_nodepth, g_br_native;
+// Loading screens and movies have no 3D scene (no HUD-less point): they must not be shrunk for DLSS, or they show at the
+// render size. A frame is shrunk only when the previous one had a scene; a scene frame that was not shrunk (the first
+// after a loading screen) is shown at native size, without DLSS for that frame.
+static int g_hud_this_frame, g_scene_last, g_frame_scaled;
 static float g_vp[16];
 
 static void (*g_log)(const char *fmt, ...);
@@ -89,6 +102,32 @@ static unsigned g_presents, g_present_other_thread, g_sync[5];
 static struct { unsigned ret, game_ret, n; } g_callers[8];
 static HRESULT(STDMETHODCALLTYPE *r_present)(IDXGISwapChain *, UINT, UINT);
 static HRESULT(STDMETHODCALLTYPE *r_create_sc)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
+static IDXGISwapChain *g_hid_sc;
+// DXGI's own Present / CreateSwapChain (dxgi_own): what the mod calls on. r_present / r_create_sc are what the slots held
+// when we hooked them; that can be another mod's hook (the Steam overlay hooks early), and when that mod later hooks
+// again on top of ours, calling it leads back to us: overlay -> UI mod -> ours -> overlay ... (6.3.2 tests: the
+// alt-tab crash, and the fallback's frames never shown, each Present caught by the nested-Present guard).
+static HRESULT(STDMETHODCALLTYPE *g_present_real)(IDXGISwapChain *, UINT, UINT);
+static HRESULT(STDMETHODCALLTYPE *g_create_real)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
+// Those functions past a jump another mod put over their first bytes (fgb_unhooked; 6.3.2 test: dxgi's Present started
+// with E9 and led through the UI mod back to us, so the fallback's frames were all dropped as nested Presents). Used for
+// the mod's own swapchain and for a Present that comes back to us; checked when needed (a mod may hook later).
+static void *unhooked(void *fn, void **cache, const char *name) {
+    if (*cache && *cache != fn) return *cache;
+    void *u = fgb_unhooked(fn);
+    if (u && u != fn) g_log("frame bridge: DXGI's %s starts with a jump (another mod hooked it there) - the mod's own calls go past it", name);
+    if (!u) g_log("frame bridge: DXGI's %s starts with a jump the mod cannot go past - it calls the hooked function", name);
+    return *cache = u ? u : fn;
+}
+static HRESULT STDMETHODCALLTYPE present_body(IDXGISwapChain *sc, UINT sync, UINT flags) {
+    static void *cache;
+    return ((HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT))unhooked((void *)g_present_real, &cache, "Present"))(sc, sync, flags);
+}
+static HRESULT STDMETHODCALLTYPE create_body(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) {
+    static void *cache;
+    return ((HRESULT(STDMETHODCALLTYPE *)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **))unhooked(
+        (void *)g_create_real, &cache, "CreateSwapChain"))(f, dev, d, out);
+}   // the game's swapchain on the hidden window (w_create_sc), until the game makes another
 
 // capture
 static int g_armed, g_capturing, g_captures, g_camera_left, g_dev_from_sc, g_creates;
@@ -226,7 +265,11 @@ __attribute__((force_align_arg_pointer)) static void bp_enter(unsigned id, const
         if (dsv) { ID3D11DepthStencilView_GetResource(dsv, &depth); ID3D11DepthStencilView_Release(dsv); }
         if (!depth) g_br_nodepth++;
         else if (g_vp_frame != g_frame) g_br_novp++;
-        else if (bb) { fgb_hudless(bb, depth, g_vp); g_br_hud++; }
+        else if (bb) {
+            g_hud_this_frame = 1;
+            if (!g_sr || g_frame_scaled) { fgb_hudless(bb, depth, g_vp); g_br_hud++; }
+            else g_br_native++;
+        }
         if (depth) ID3D11Resource_Release(depth);
         if (bb) ID3D11Resource_Release(bb);
     }
@@ -331,13 +374,86 @@ static void bridge_off(void) {
     fgb_stop();
     g_live_state = 2;
     jit_frame_end();
+    if (g_motion) {   // the motion pass ends too: nothing would end its frames, and its draws hold the game's buffers
+        fgm_set_enabled(0);
+        fgm_frame_end();
+        g_motion = 0;
+    }
 }
 
-static HRESULT STDMETHODCALLTYPE w_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
+// ---- what the fallback does in game (6.3.2 test: the picture froze although the game kept presenting)
+static unsigned g_fb_frames, g_fb_notok, g_nested[3];
+static HRESULT g_fb_last;
+// "module+0x..." for the first n values on the stack above sp that point into a loaded module (likely return addresses)
+static void stack_text(char *out, int cap, const unsigned *sp, int n) {
+    int len = 0;
+    out[0] = 0;
+    for (int i = 0; i < 2048 && n > 0 && len < cap - 80; i++) {
+        MEMORY_BASIC_INFORMATION mb;
+        HMODULE m = NULL;
+        char name[MAX_PATH];
+        if (!VirtualQuery(sp + i, &mb, sizeof mb) || mb.State != MEM_COMMIT) break;
+        if (sp[i] < 0x10000 || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                   (LPCSTR)(UINT_PTR)sp[i], &m) || !GetModuleFileNameA(m, name, MAX_PATH))
+            continue;
+        const char *b = strrchr(name, '\\');
+        len += snprintf(out + len, cap - len, " %s+0x%X", b ? b + 1 : name, sp[i] - (unsigned)(UINT_PTR)m);
+        n--;
+    }
+}
+static const char *module_name(const void *p, char *buf) {
+    HMODULE m = NULL;
+    strcpy(buf, "?");
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)p, &m))
+        GetModuleFileNameA(m, buf, MAX_PATH);
+    const char *b = strrchr(buf, '\\');
+    return b ? b + 1 : buf;
+}
+static void fb_report_start(void) {
+    char a[MAX_PATH], c[MAX_PATH];
+    const unsigned char *p = (const unsigned char *)g_present_real;
+    const void *jump = p[0] == 0xE9 ? (const void *)(p + 5 + *(const int *)(p + 1)) : p[0] == 0xFF && p[1] == 0x25 ? **(const void *const *const *)(p + 2) : NULL;
+    HWND w = fgb_fallback_window();
+    RECT r = {0}, pr = {0};
+    if (w) GetWindowRect(w, &r);
+    GetWindowRect(g_out_hwnd, &pr);
+    g_log("frame bridge fallback: game window thread %lu, Present thread %lu, style %08lX ex %08lX, rect %ld,%ld-%ld,%ld; mod's window %s "
+          "rect %ld,%ld-%ld,%ld; DXGI Present (%s) starts %02X %02X %02X %02X %02X%s%s",
+          GetWindowThreadProcessId(g_out_hwnd, NULL), GetCurrentThreadId(), (unsigned long)GetWindowLongW(g_out_hwnd, GWL_STYLE),
+          (unsigned long)GetWindowLongW(g_out_hwnd, GWL_EXSTYLE), pr.left, pr.top, pr.right, pr.bottom, w && IsWindowVisible(w) ? "visible" : "NOT visible",
+          r.left, r.top, r.right, r.bottom, module_name(p, a), p[0], p[1], p[2], p[3], p[4], jump ? " - a jump to " : "", jump ? module_name(jump, c) : "");
+}
+
+// The F11 panel after the bridge (user: keep DLSS off after a settings change, but F11 still opens the panel, with a
+// note to restart): drawn over the game's frame before the mod shows it, on that frame's device. Choices are saved for
+// the next start.
+static const wchar_t *g_off_note = L"DLSS is off - restart the game to turn it back on. Choices made here are saved.";
+static void fallback_panel(ID3D11Resource *bb) {
+    static ID3D11Device *pdev;
+    static int ok;
+    ID3D11Device *d = NULL;
+    ID3D11Resource_GetDevice(bb, &d);
+    if (!d) return;
+    if (d != pdev) {
+        ID3D11DeviceContext *c = NULL;
+        D3D11_TEXTURE2D_DESC td;
+        ID3D11Device_GetImmediateContext(d, &c);
+        ID3D11Texture2D_GetDesc((ID3D11Texture2D *)bb, &td);
+        ok = c && fgp_move_device(d, c, td.Width, td.Height);   // the panel keeps these references
+        fgp_set_note(g_off_note);
+        if (pdev) ID3D11Device_Release(pdev);
+        pdev = d;   // GetDevice's reference
+        g_log("F11 panel: %s over the frames the mod shows (DLSS off until the game restarts)", ok ? "available" : "NOT available");
+    } else
+        ID3D11Device_Release(d);
+    if (ok) fgp_frame(bb, g_out_hwnd);
+}
+
+static HRESULT present_hooked(IDXGISwapChain *sc, UINT sync, UINT flags, unsigned ret, const unsigned *frame) {
     g_presents++;
     if (GetCurrentThreadId() != g_pt_main) g_present_other_thread++;
     g_sync[sync < 4 ? sync : 4]++;
-    unsigned ret = (unsigned)(UINT_PTR)__builtin_return_address(0), game = game_caller((const unsigned *)__builtin_frame_address(0));
+    unsigned game = game_caller(frame);
     for (int i = 0; i < 8; i++) {
         if (g_callers[i].n && (g_callers[i].ret != ret || g_callers[i].game_ret != game)) continue;
         g_callers[i].ret = ret; g_callers[i].game_ret = game; g_callers[i].n++;
@@ -357,6 +473,8 @@ static HRESULT STDMETHODCALLTYPE w_present(IDXGISwapChain *sc, UINT sync, UINT f
                 // shortcut: a resize (or a helper that died) ends the bridge for the session; restart the game to get it back
                 g_log("frame bridge: back buffer %ux%u (was %ux%u), helper %s - bridge off, game presents again", d.BufferDesc.Width,
                       d.BufferDesc.Height, g_live_w, g_live_h, fgb_active() ? "running" : "gone");
+                g_off_note = fgb_active() ? L"The game's size changed - restart the game to turn DLSS back on. Choices made here are saved."
+                                          : L"DLSS stopped (its helper closed) - restart the game to turn it back on. Choices made here are saved.";
                 bridge_off();
             }
             if (g_live_state == 1) {
@@ -379,13 +497,70 @@ static HRESULT STDMETHODCALLTYPE w_present(IDXGISwapChain *sc, UINT sync, UINT f
                 fgb_present(bb);
                 if (g_motion) { fgm_frame_end(); mp_hook(NULL); }   // hooks back before the next frame's instance copies
                 ID3D11Resource_Release(bb);
+                g_scene_last = g_hud_this_frame;
+                g_hud_this_frame = 0;
                 jit_frame_start();
                 return S_OK;
             }
         }
         if (bb) ID3D11Resource_Release(bb);
     }
-    return r_present(sc, sync, flags);
+    if (sc == g_hid_sc && g_live_state != 1) {   // the bridge ended, the game still presents on the hidden window: its
+        ID3D11Resource *bb = NULL;               // frames go to the real window through the mod's own swapchain
+        IDXGISwapChain *own = NULL;
+        if (SUCCEEDED(IDXGISwapChain_GetBuffer(sc, 0, &iid_resource, (void **)&bb))) {
+            fallback_panel(bb);
+            own = fgb_fallback_frame(bb, create_body);
+        }
+        if (bb) ID3D11Resource_Release(bb);
+        if (own) {
+            HRESULT h = present_body(own, sync, flags);
+            if (!g_fb_frames++) fb_report_start();
+            if (h != S_OK && !g_fb_notok++ && h == DXGI_ERROR_DEVICE_REMOVED) {   // why, once
+                static const GUID iid_d11 = {0xdb6f6ddb, 0xac77, 0x4e88, {0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40}};
+                ID3D11Device *d = NULL;
+                if (SUCCEEDED(IDXGISwapChain_GetDevice(own, &iid_d11, (void **)&d))) {
+                    g_log("frame bridge fallback: the D3D11 device was removed (reason 0x%08lX)", (unsigned long)ID3D11Device_GetDeviceRemovedReason(d));
+                    ID3D11Device_Release(d);
+                }
+            }
+            if (h != S_OK) g_fb_last = h;
+            return h;
+        }
+    }
+    return g_present_real(sc, sync, flags);
+}
+
+// A Present inside a Present on the same thread is skipped. 6.3.2, battle loading + alt-tab: the Steam overlay's Present
+// hook, while running, got a window message to the UI mod, which presented again through ours, which called on into the
+// overlay's hook, and so on until the stack overflowed (heapfix.log stack: GameOverlayRenderer -> dinput8 w_present ->
+// version_v201a -> ... repeating). Nothing needs a nested Present; skipping it ends any such loop that passes through us.
+static HRESULT STDMETHODCALLTYPE w_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
+    static __thread int depth;
+    static LONG nested;
+    unsigned ret = (unsigned)(UINT_PTR)__builtin_return_address(0);
+    if (depth) {
+        int kind = sc == g_hid_sc ? 0 : sc && sc == fgb_fallback_sc() ? 1 : 2;
+        if (!g_nested[kind]++) {   // each kind once, with the stack: who presented inside whose Present
+            char st[1200];
+            stack_text(st, sizeof st, (const unsigned *)__builtin_frame_address(0), 24);
+            g_log("frame bridge: nested Present of %s swapchain, stack:%s", kind == 0 ? "the game's" : kind == 1 ? "the mod's own" : "another", st);
+        }
+        if (InterlockedIncrement(&nested) == 1) {   // presented once, past the hooks that led back here
+            char at[MAX_PATH] = "?";
+            HMODULE m = NULL;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(UINT_PTR)ret, &m))
+                GetModuleFileNameA(m, at, MAX_PATH);
+            const char *b = strrchr(at, '\\');
+            g_log("frame bridge: Present called again while a Present was running (from %s+0x%X) - it goes straight to DXGI (only logged once)",
+                  b ? b + 1 : at, (unsigned)(ret - (unsigned)(UINT_PTR)m));
+        }
+        return present_body(sc, sync, flags);
+    }
+    depth = 1;
+    HRESULT hr = present_hooked(sc, sync, flags, ret, (const unsigned *)__builtin_frame_address(0));
+    depth = 0;
+    return hr;
 }
 
 static void patch_slot(void **slot, void *to, void **old) {
@@ -400,6 +575,21 @@ static void patch_slot(void **slot, void *to, void **old) {
 // swapchain, e.g. switching to fullscreen in game, overflowed the stack). All objects of a class share the vtable.
 static void patch_once(void **slot, void *to, void **old) {
     if (!*old) patch_slot(slot, to, old);
+}
+
+// saved (what the slot held when hooked) if it is DXGI's own function, else DXGI's original from the file
+static void *dxgi_own(void **vt, size_t slot, void *saved, const char *name) {
+    HMODULE m = NULL, sm = NULL;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)vt, &m);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)saved, &sm);
+    if (m && sm == m) return saved;
+    void *orig = fgb_vt_original(vt, slot);
+    char who[MAX_PATH] = "?";
+    if (sm) GetModuleFileNameA(sm, who, MAX_PATH);
+    const char *bn = strrchr(who, '\\');
+    g_log("frame bridge: %s was already hooked by %s when the mod hooked it - the mod calls %s", name, bn ? bn + 1 : who,
+          orig ? "DXGI's own (read from the DLL file)" : "that hook (DXGI's own not found)");
+    return orig ? orig : saved;
 }
 
 // The helper's flip-model swapchain needs the game's window to itself (in game, Streamline's CreateSwapChainForHwnd got
@@ -418,7 +608,7 @@ static HWND hidden_window(UINT w, UINT h) {
 // buffer's size while a depth buffer of that size is bound and depth testing is on, from the frame start to the HUD-less
 // point (depth pre-pass, G-buffer, forward passes: they must line up with each other). Not jittered: shadow maps, half-
 // size passes, full-screen passes without depth test, post-processing, the UI.
-static int g_sr;                         // 0 off, 1 DLAA, 2..5 Quality..Ultra Performance (fgbridge_on.txt line 4, F12 panel)
+static int g_sr;                         // 0 off, 1 DLAA, 2..5 Quality..Ultra Performance (fgbridge_on.txt line 4, F11 panel)
 static int g_jit_on;                     // this frame is jittered and the HUD-less point has not come yet
 static float g_jx, g_jy;
 static D3D11_VIEWPORT g_gvp[16];         // the game's viewports as it set them
@@ -692,12 +882,13 @@ static void jit_install(void) {
 static void jit_frame_start(void) {
     if (!g_sr || g_live_state != 1) return;
     fgb_jitter(&g_jx, &g_jy);
-    g_jit_on = g_jx != 0 || g_jy != 0 || g_rw != g_live_w || g_rh != g_live_h;
+    g_jit_on = g_scene_last && (g_jx != 0 || g_jy != 0 || g_rw != g_live_w || g_rh != g_live_h);
+    g_frame_scaled = g_jit_on;
     g_jit_frames += g_jit_on;
     jit_apply(g_ctx, 1);
 }
 static void jit_frame_end(void) {
-    if (!g_jit_on) return;   // also after DLAA was switched off (F12 panel)
+    if (!g_jit_on) return;   // also after DLAA was switched off (F11 panel)
     g_jit_on = 0;
     jit_apply(g_ctx, 0);
 }
@@ -960,9 +1151,26 @@ static void mp_hook(const char *where) {
         {offsetof(ID3D11DeviceContextVtbl, Map), "Map"}};
     void *const ours[5] = {(void *)w_dii, (void *)w_di, (void *)w_dinst, (void *)w_draw, (void *)w_map};
     void **const orig[5] = {(void **)&r_dii, (void **)&r_di, (void **)&r_dinst, (void **)&r_draw, (void **)&r_map};
+    static HMODULE d3d;
+    static int foreign[5];
+    if (!d3d) d3d = GetModuleHandleW(L"d3d11.dll");
     for (int i = 0; i < 5; i++) {
         void **slot = &vt[slots[i].off / sizeof(void *)];
         if (*slot == ours[i]) continue;
+        HMODULE owner = NULL;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)*slot, &owner);
+        if (*orig[i] && owner != d3d) {
+            // Not d3d11 swapping its own functions (it does, see above): another mod hooked the slot after us and calls
+            // ours as its original. Hooking again would make ours call it back, forever (stack overflow). Left to it.
+            if (!foreign[i]) {
+                wchar_t name[MAX_PATH] = L"?";
+                if (owner) GetModuleFileNameW(owner, name, MAX_PATH);
+                const wchar_t *b = wcsrchr(name, L'\\');
+                g_log("motion pass: %s on the game's D3D11 context is now hooked by %ls - left to it", slots[i].name, b ? b + 1 : name);
+                foreign[i] = 1;
+            }
+            continue;
+        }
         if (where && g_cap) {
             HMODULE mod = NULL;
             char name[MAX_PATH] = "?";
@@ -1015,7 +1223,7 @@ static void mp_capture_end(FILE *f) {
     g_mp_ncopy = 0;
 }
 
-// the F12 panel's switches (take effect from the next frame)
+// the F11 panel's switches (take effect from the next frame)
 // render size per SR mode: off and DLAA native, then NVIDIA's preset scales (Quality 2/3, Balanced 0.58, Performance 1/2,
 // Ultra Performance 1/3), rounded down to even
 static void sr_set(int mode) {
@@ -1026,18 +1234,19 @@ static void sr_set(int mode) {
     g_rh = mode > 1 ? (UINT)(g_live_h * k) & ~1u : g_live_h;
     fgb_set_sr(mode != 0, g_rw, g_rh);
 }
-// the add-on's settings.txt: one key=value per line, written back whenever the F12 panel changes something
+// the add-on's settings.txt: one key=value per line, written back whenever the F11 panel changes something
 static const char *const SR_KEYS[6] = {"off", "dlaa", "quality", "balanced", "performance", "ultra_performance"};
 static const char *const FG_KEYS[4] = {"off", "2x", "3x", "4x"};
 static void settings_save(void) {
     if (!g_settings[0]) return;
     FILE *f = _wfopen(g_settings, L"w");
     if (!f) { g_log("DLSS settings: %ls not writable - choices not saved", g_settings); return; }
-    fprintf(f, "# DLSS add-on settings. The F12 panel in game changes and saves them.\n"
+    fprintf(f, "# DLSS add-on settings. The F11 panel in game changes and saves them.\n"
                "# super_resolution: off, dlaa, quality, balanced, performance, ultra_performance\n"
                "# frame_generation: off, 2x, 3x, 4x (limited to what your GPU allows)\n"
                "# motion_vectors: camera_only, per_object\n"
-               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\n",
+               "# addon: on, off (off: the add-on does nothing at all from the next game start; set on again to use it)\n"
+               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\naddon=on\n",
             SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 1], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only");
     fclose(f);
 }
@@ -1053,19 +1262,19 @@ static int settings_value(const char *text, const char *key, const char *const *
 static void panel_sr(int mode) {
     static const char *const names[6] = {"off", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"};
     sr_set(mode);
-    g_log("F12 panel: super resolution %s, render %ux%u", names[mode >= 0 && mode < 6 ? mode : 0], g_rw, g_rh);
+    g_log("F11 panel: super resolution %s, render %ux%u", names[mode >= 0 && mode < 6 ? mode : 0], g_rw, g_rh);
     settings_save();
 }
 static void panel_fg(int n) {
     g_fg = (unsigned)n;
     fgb_set_fg((unsigned)n);
-    g_log("F12 panel: frame generation %s", n ? (n == 1 ? "2x" : n == 2 ? "3x" : "4x") : "off");
+    g_log("F11 panel: frame generation %s", n ? (n == 1 ? "2x" : n == 2 ? "3x" : "4x") : "off");
     settings_save();
 }
 static void panel_motion(int on) {
     g_motion_on = on;
     if (g_motion) fgm_set_enabled(on);
-    g_log("F12 panel: per-object motion %s", on ? "on" : "off");
+    g_log("F11 panel: per-object motion %s", on ? "on" : "off");
     settings_save();
 }
 
@@ -1078,13 +1287,13 @@ static BOOL g_fs_wanted;
 static HRESULT(STDMETHODCALLTYPE *r_setfs)(IDXGISwapChain *, BOOL, IDXGIOutput *);
 static HRESULT(STDMETHODCALLTYPE *r_getfs)(IDXGISwapChain *, BOOL *, IDXGIOutput **);
 static HRESULT STDMETHODCALLTYPE w_setfs(IDXGISwapChain *sc, BOOL fs, IDXGIOutput *target) {
-    if (sc != g_sc || g_live_state != 1) return r_setfs(sc, fs, target);
+    if (sc != g_hid_sc) return r_setfs(sc, fs, target);   // also after the bridge: still the hidden window
     if (fs != g_fs_wanted) g_log("frame bridge: the game switches to %s - kept as a borderless window", fs ? "fullscreen" : "windowed");
     g_fs_wanted = fs;
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE w_getfs(IDXGISwapChain *sc, BOOL *fs, IDXGIOutput **target) {
-    if (sc != g_sc || g_live_state != 1) return r_getfs(sc, fs, target);
+    if (sc != g_hid_sc) return r_getfs(sc, fs, target);
     if (fs) *fs = g_fs_wanted;
     if (target) {   // the monitor the window is on, as a fullscreen swapchain would report it
         *target = NULL;
@@ -1096,8 +1305,17 @@ static HRESULT STDMETHODCALLTYPE w_getfs(IDXGISwapChain *sc, BOOL *fs, IDXGIOutp
 static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) {
     mp_device(dev);
     DXGI_SWAP_CHAIN_DESC dd = *d;
+    if (g_dev) {   // a settings change may come with a new D3D11 device
+        static const GUID iid_d11 = {0xdb6f6ddb, 0xac77, 0x4e88, {0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40}};
+        ID3D11Device *nd = NULL;
+        if (SUCCEEDED(IUnknown_QueryInterface(dev, &iid_d11, (void **)&nd))) {
+            if (nd != g_dev) g_log("frame bridge: the game's new swapchain is on another D3D11 device than its first");
+            ID3D11Device_Release(nd);
+        }
+    }
     if (g_live && g_live_state == 1) {   // shortcut: a second swapchain (settings change) ends the bridge; restart the game to get it back
-        g_log("frame bridge: the game makes a new swapchain (%ux%u) - bridge off, game presents again", d->BufferDesc.Width, d->BufferDesc.Height);
+        g_log("frame bridge: the game makes a new swapchain (%ux%u) - DLSS off until the game restarts", d->BufferDesc.Width, d->BufferDesc.Height);
+        g_off_note = L"Graphics settings changed - restart the game to turn DLSS back on. Choices made here are saved.";
         bridge_off();
     }
     if (g_live && g_live_state == 0) {
@@ -1122,7 +1340,7 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             g_out_hwnd = d->OutputWindow;
             if (g_fg > fgb_fg_max()) g_fg = fgb_fg_max();   // NVIDIA's rules for this GPU (fgb_start logged it)
             sr_set(g_sr);
-            jit_install();   // passes viewports through unless DLAA is on (F12 panel)
+            jit_install();   // passes viewports through unless DLAA is on (F11 panel)
             if (g_motion) {
                 // the game's instance record copy (FUN_117dab80): call memcpy at +0x17DABAF -> fgm_copy
                 unsigned char *call = (unsigned char *)(UINT_PTR)(g_pt_base + 0x17DABAF);
@@ -1142,19 +1360,38 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             }
             FgpApply ap = {panel_sr, panel_fg, panel_motion};
             if (!fgp_init(g_dev, g_ctx, g_live_w, g_live_h, d->BufferDesc.Format, g_sr, (int)g_fg, g_motion ? g_motion_on : -1, ap))
-                g_log("frame bridge: F12 panel not available (back buffer format %u)", d->BufferDesc.Format);
+                g_log("frame bridge: F11 panel not available (back buffer format %u)", d->BufferDesc.Format);
         }
         else if (hid) DestroyWindow(hid);
     }
+    // After the bridge: a swapchain on the game's window after the helper's is never shown (fgbridge.c, fallback), so the
+    // game's new one (settings change) goes to a hidden window too and its frames reach the window as after a helper crash
+    if (g_live_state == 2 && g_out_hwnd && d->OutputWindow == g_out_hwnd) {
+        RECT rc = {0};
+        GetClientRect(d->OutputWindow, &rc);
+        UINT w = d->BufferDesc.Width ? d->BufferDesc.Width : (UINT)rc.right, h = d->BufferDesc.Height ? d->BufferDesc.Height : (UINT)rc.bottom;
+        HWND hid = w && h ? hidden_window(w, h) : NULL;
+        if (hid) {
+            dd.OutputWindow = hid; dd.BufferDesc.Width = w; dd.BufferDesc.Height = h;
+            g_fs_wanted = !d->Windowed;   // as with the bridge: fullscreen is kept as a borderless window
+            dd.Windowed = TRUE;
+        }
+    }
+    fgb_fallback_close();   // ours belongs to the previous swapchain
+    g_hid_sc = NULL;
     HRESULT hr = r_create_sc(f, dev, &dd, out);
+    int hidden = SUCCEEDED(hr) && dd.OutputWindow != d->OutputWindow;
     if (FAILED(hr) && g_live_state == 1) { g_log("frame bridge: game swapchain on the hidden window failed (0x%08lx) - bridge off", hr); bridge_off(); }
     if (FAILED(hr) && dd.OutputWindow != d->OutputWindow) hr = r_create_sc(f, dev, d, out);
     if (SUCCEEDED(hr) && out && *out) {
         g_sc = *out;
         g_scd = *d;
+        if (hidden) g_hid_sc = *out;
+        if (hidden && g_live_state == 2) g_log("frame bridge: the new swapchain is on a hidden window too; the mod shows its frames");
         void **vt = *(void ***)*out;
         patch_once(&vt[offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *)], (void *)w_present, (void **)&r_present);
-        if (g_live_state == 1) {
+        if (!g_present_real) g_present_real = dxgi_own(vt, offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *), (void *)r_present, "Present");
+        if (hidden) {
             patch_once(&vt[offsetof(IDXGISwapChainVtbl, SetFullscreenState) / sizeof(void *)], (void *)w_setfs, (void **)&r_setfs);
             patch_once(&vt[offsetof(IDXGISwapChainVtbl, GetFullscreenState) / sizeof(void *)], (void *)w_getfs, (void **)&r_getfs);
         }
@@ -1169,6 +1406,7 @@ static HRESULT WINAPI w_factory(REFIID r, void **out) {
     if (SUCCEEDED(hr) && out && *out) {
         void **vt = *(void ***)*out;
         patch_once(&vt[offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *)], (void *)w_create_sc, (void **)&r_create_sc);
+        if (!g_create_real) g_create_real = dxgi_own(vt, offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *), (void *)r_create_sc, "CreateSwapChain");
     }
     return hr;
 }
@@ -1209,9 +1447,12 @@ static void bp_report(void (*log)(const char *fmt, ...)) {
         g_sc ? "" : " - no swapchain seen");
     log("  D3D11CreateDevice calls seen %d, device %s", g_creates, !g_ctx ? "not known yet" : g_dev_from_sc ? "taken from the swapchain" : "from D3D11CreateDevice");
     if (g_live)
-        log("  frame bridge %s: %u frames handed over, %u pacing timeouts, HUD-less copies %u, no camera %u, no depth %u",
+        log("  frame bridge %s: %u frames handed over, %u pacing timeouts, HUD-less copies %u, native frames %u, no camera %u, no depth %u",
             g_live_state == 1 ? "running" : g_live_state == 2 ? "off" : "not started", fgb_frames(), fgb_pace_timeouts(), g_br_hud,
-            g_br_novp, g_br_nodepth);
+            g_br_native, g_br_novp, g_br_nodepth);
+    if (g_fb_frames || g_nested[0] || g_nested[1] || g_nested[2])
+        log("  fallback: %u frames presented through the mod's own swapchain, %u not S_OK (last 0x%08lX); nested Presents: "
+            "game's %u, mod's own %u, other %u (each sent straight to DXGI)", g_fb_frames, g_fb_notok, (unsigned long)g_fb_last, g_nested[0], g_nested[1], g_nested[2]);
     if (g_sr) {
         unsigned sf, st; double sa, sm;
         void fgb_sr_stats(unsigned *, unsigned *, double *, double *);
@@ -1345,16 +1586,16 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         g_fg = (unsigned)atoi(l[2]);
         g_live = g_helper[0] && g_sl[0] && (g_fg == 0 || g_fg == 1 || g_fg == 3);
         g_sr = strstr(l[3], "ultraperf") ? 5 : strstr(l[3], "perf") ? 4 : strstr(l[3], "balanced") ? 3 : strstr(l[3], "quality") ? 2
-             : strstr(l[3], "dlaa") ? 1 : 0;   // the F12 panel switches it
+             : strstr(l[3], "dlaa") ? 1 : 0;   // the F11 panel switches it
         g_motion_on = strstr(l[3], "motion") != NULL;
         // dev test of NVIDIA's GPU rules on this PC: treat the GPU as an RTX 20 / 30 (no frame generation) or an RTX 40 (2x)
         if (strstr(l[3], "fakegpu20")) { fgb_set_fg_test_limit(1); log("  test: GPU treated as an RTX 20 / 30 (no frame generation)"); }
         else if (strstr(l[3], "fakegpu40")) { fgb_set_fg_test_limit(2); log("  test: GPU treated as an RTX 40 (frame generation 2x at most)"); }
         if (strstr(l[3], "fakeamd")) { fgb_set_test_not_nvidia(1); log("  test: GPU treated as not NVIDIA (bridge stays off)"); }
-        g_motion = g_live;   // set up whenever the bridge runs, so the F12 panel can switch it on
+        g_motion = g_live;   // set up whenever the bridge runs, so the F11 panel can switch it on
         log("frame bridge %s: helper %s, Streamline %s, frame generation %ux, DLSS %s", g_live ? "armed" : "NOT armed (bad fgbridge_on.txt)",
             l[0], l[1], g_fg + 1, (const char *[]){"off", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"}[g_sr]);
-        log("  per-object motion vectors: %s (F12 panel switches it)", g_motion_on ? "on" : "off");
+        log("  per-object motion vectors: %s (F11 panel switches it)", g_motion_on ? "on" : "off");
         if (g_live) g_dev_di8_created = fgp_di8_created;   // the panel hides the game's mouse buttons while the cursor is over it
     }
     if (g_live && cam_hook(m, log)) log("frame bridge: camera read through a jump hook on FUN_1177bb10");

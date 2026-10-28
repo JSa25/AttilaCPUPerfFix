@@ -9,6 +9,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <d3d11_4.h>
+#include <d3d12.h>
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <string.h>
@@ -48,6 +49,7 @@ static ID3D11ComputeShader *g_cs;
 static ID3D11Buffer *g_cb;
 static HANDLE g_handles[9], g_map, g_wake, g_wake2, g_helper;   // wake: the helper SR thread, wake2: its present thread
 static FgbShared *g_sh;
+static HWND g_hwnd;           // the game's window (the helper presents into it)
 static UINT g_w, g_h, g_dw, g_dh;
 static uint32_t g_n;          // the frame being built
 static int g_hud_done, g_waited, g_live;
@@ -179,6 +181,7 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     if (!g_sh || !g_wake || !g_wake2) return 0;
     memset(g_sh, 0, sizeof *g_sh);
     g_sh->width = w; g_sh->height = h; g_sh->format = fmt; g_sh->hwnd = (uint32_t)(UINT_PTR)hwnd;
+    g_hwnd = hwnd;
     g_sh->luid_lo = adesc.AdapterLuid.LowPart; g_sh->luid_hi = adesc.AdapterLuid.HighPart;
     g_sh->fg_frames = fg_frames;
     g_sh->render_w = g_rw; g_sh->render_h = g_rh; g_sh->sr_on = g_sr;
@@ -504,11 +507,218 @@ void fgb_present(ID3D11Resource *backbuffer) {
 unsigned fgb_frames(void) { return g_n; }
 unsigned fgb_pace_timeouts(void) { return g_pace_timeouts; }
 
+// The game's GPU waits on the helper's fences (wait_previous, the DLSS pickup in fgb_hudless) end only when the helper
+// signals them. With the helper gone (quit mid-frame, crashed) they would hang the game's GPU (driver reset): the fences
+// are signalled past any frame here, through a D3D12 device on the game's GPU (a D3D11 fence has no CPU Signal).
+static void release_gpu_waits(void) {
+    static const GUID iid_dxgi_device = {0x54ec77fa, 0x1377, 0x44e6, {0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}};
+    static const GUID iid_d3d12_device = {0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7}};
+    static const GUID iid_d3d12_fence = {0x0a753dcf, 0xc4d8, 0x4b91, {0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76}};
+    HMODULE m = LoadLibraryExA("d3d12.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    PFN_D3D12_CREATE_DEVICE create = m ? (PFN_D3D12_CREATE_DEVICE)(void *)GetProcAddress(m, "D3D12CreateDevice") : NULL;
+    IDXGIDevice *xd = NULL; IDXGIAdapter *ad = NULL; ID3D12Device *d = NULL;
+    int n = 0;
+    if (create && SUCCEEDED(ID3D11Device_QueryInterface(g_dev, &iid_dxgi_device, (void **)&xd)) && SUCCEEDED(IDXGIDevice_GetAdapter(xd, &ad)) &&
+        SUCCEEDED(create((IUnknown *)ad, D3D_FEATURE_LEVEL_11_0, &iid_d3d12_device, (void **)&d))) {
+        HANDLE fences[2] = {g_handles[1], g_handles[2]};   // fsr, fdone
+        for (int i = 0; i < 2; i++) {
+            ID3D12Fence *f = NULL;
+            if (fences[i] && SUCCEEDED(ID3D12Device_OpenSharedHandle(d, fences[i], &iid_d3d12_fence, (void **)&f))) {
+                n += SUCCEEDED(ID3D12Fence_Signal(f, 1ull << 62));
+                ID3D12Fence_Release(f);
+            }
+        }
+        ID3D12Device_Release(d);
+    }
+    if (ad) IDXGIAdapter_Release(ad);
+    if (xd) IDXGIDevice_Release(xd);
+    g_log("frame bridge: %d of 2 helper fences released for the game's GPU", n);
+}
+
 void fgb_stop(void) {
-    if (!g_sh) return;
+    static int stopped;
+    if (!g_sh || stopped) return;
+    stopped = 1;
     __atomic_store_n(&g_sh->frames, FGB_QUIT, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);
     if (g_helper) WaitForSingleObject(g_helper, 5000);
     g_live = 0;
+    release_gpu_waits();
+}
+// n bytes of a loaded DLL as its file on disk has them (addr inside the DLL), and the file's own base address (the
+// loaded header's ImageBase is rewritten to where the DLL is loaded). 0 if anything does not fit.
+static int file_bytes(const void *addr, void *out, DWORD n, HMODULE *mod, DWORD *file_base) {
+    HMODULE m = NULL;
+    wchar_t path[MAX_PATH];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)addr, &m) ||
+        !GetModuleFileNameW(m, path, MAX_PATH))
+        return 0;
+    const unsigned char *b = (const unsigned char *)m;
+    const IMAGE_NT_HEADERS32 *nt = (const IMAGE_NT_HEADERS32 *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);
+    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    DWORD rva = (DWORD)((const unsigned char *)addr - b), off = 0, got = 0, got2 = 0;
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (rva >= sec[i].VirtualAddress && rva + n <= sec[i].VirtualAddress + sec[i].SizeOfRawData)
+            off = rva - sec[i].VirtualAddress + sec[i].PointerToRawData;
+    HANDLE f = off ? CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL) : INVALID_HANDLE_VALUE;
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    if (SetFilePointer(f, (LONG)off, NULL, FILE_BEGIN) != off || !ReadFile(f, out, n, &got, NULL)) got = 0;
+    DWORD base_at = (DWORD)((const unsigned char *)&nt->OptionalHeader.ImageBase - b);
+    if (SetFilePointer(f, (LONG)base_at, NULL, FILE_BEGIN) != base_at || !ReadFile(f, file_base, 4, &got2, NULL)) got2 = 0;
+    CloseHandle(f);
+    *mod = m;
+    return got == n && got2 == 4;
+}
+
+// The function a vtable slot held before anyone hooked it: the vtable entry as the DLL file has it, moved to where the
+// DLL is loaded. NULL if anything does not fit.
+void *fgb_vt_original(void **vt, size_t slot) {
+    HMODULE m = NULL, fm = NULL;
+    DWORD v = 0, file_base = 0;
+    if (!file_bytes(&vt[slot], &v, 4, &m, &file_base)) return NULL;
+    UINT_PTR fn = (UINT_PTR)v - file_base + (UINT_PTR)m;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)fn, &fm) || fm != m)
+        return NULL;
+    return (void *)fn;
+}
+
+// A Windows function as it is in its DLL, even when another mod has put a jump over its first bytes (inline hook;
+// 6.3.2 test: dxgi's Present started with E9, and calling it led through the UI mod back into our Present hook). Works
+// for the hot-patch start "mov edi,edi; push ebp; mov ebp,esp" (8B FF 55 8B EC, dxgi's Present and CreateSwapChain):
+// those 5 bytes, then a jump to the untouched rest. fn itself if nothing is hooked; NULL if it does not fit.
+void *fgb_unhooked(void *fn) {
+    static const unsigned char hot[5] = {0x8B, 0xFF, 0x55, 0x8B, 0xEC};
+    unsigned char disk[8];
+    HMODULE m = NULL;
+    DWORD file_base = 0;
+    if (fn && !memcmp(fn, hot, 5)) return fn;   // its start is intact: not hooked there
+    if (!fn || !file_bytes(fn, disk, sizeof disk, &m, &file_base) || memcmp(disk, hot, 5)) return NULL;
+    // more than the start replaced? The next instruction must be as in the file (only a few bytes: further on, addresses
+    // differ from the file where Windows relocated them)
+    if (memcmp((const unsigned char *)fn + 5, disk + 5, 3)) return NULL;
+    unsigned char *t = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return NULL;
+    memcpy(t, hot, 5);
+    t[5] = 0xE9;
+    *(int *)(t + 6) = (int)((const unsigned char *)fn + 5 - (t + 10));
+    DWORD old;
+    VirtualProtect(t, 16, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), t, 16);
+    return t;
+}
+
+void fgb_test_kill_helper(void) { if (g_helper) TerminateProcess(g_helper, 1); }   // bridgetest killhelper
+
+// ---- After the bridge, while the game's swapchain sits on a hidden window (the helper died, the back buffer changed
+// size, or a new swapchain after a settings change): each frame is copied into a swapchain of our own, so the game does
+// not look frozen. It is on a child window covering the game's client area: a swapchain on the game's window itself
+// after the helper's is never shown (bridgetest killhelper / stophelper: flip or blit, presents succeed, the window keeps
+// the helper's last frame). create: the factory's original CreateSwapChain (the game's factory slot is hooked), NULL =
+// the factory's own.
+static IDXGISwapChain *g_fb_sc;
+static HWND g_fb_wnd;
+static RECT g_fb_rc;
+static D3D11_TEXTURE2D_DESC g_fb_src;
+static unsigned g_fb_tries;
+// the device of the frames shown: the game's back buffer's (a settings change may come with a new D3D11 device; copying
+// its back buffer with the first device's context removed the device, 6.3.2 test: 7204 of 7205 presents 0x887A0005)
+static ID3D11Device *g_fb_dev;
+static ID3D11DeviceContext *g_fb_ctx;
+IDXGISwapChain *fgb_fallback_sc(void) { return g_fb_sc; }
+HWND fgb_fallback_window(void) { return g_fb_wnd; }
+void fgb_fallback_close(void) {
+    if (g_fb_sc) IDXGISwapChain_Release(g_fb_sc);
+    if (g_fb_wnd) DestroyWindow(g_fb_wnd);
+    if (g_fb_ctx) ID3D11DeviceContext_Release(g_fb_ctx);
+    if (g_fb_dev) ID3D11Device_Release(g_fb_dev);
+    g_fb_sc = NULL;
+    g_fb_wnd = NULL;
+    g_fb_ctx = NULL;
+    g_fb_dev = NULL;
+}
+typedef HRESULT(STDMETHODCALLTYPE *fgb_create_sc_fn)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
+static LRESULT CALLBACK fb_child_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    return m == WM_NCHITTEST ? HTTRANSPARENT : DefWindowProcW(h, m, w, l);   // the mouse goes to the game's window under it
+}
+static IDXGISwapChain *fb_create(const D3D11_TEXTURE2D_DESC *s, fgb_create_sc_fn create) {
+    static const GUID iid_dxgi_device = {0x54ec77fa, 0x1377, 0x44e6, {0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}};
+    static const GUID iid_factory = {0x7b7166ec, 0x21c7, 0x44ae, {0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69}};
+    IDXGIDevice *xd = NULL; IDXGIAdapter *ad = NULL; IDXGIFactory *f = NULL; IDXGISwapChain *sc = NULL;
+    HRESULT hr = ID3D11Device_QueryInterface(g_fb_dev, &iid_dxgi_device, (void **)&xd);
+    if (SUCCEEDED(hr)) hr = IDXGIDevice_GetAdapter(xd, &ad);
+    if (SUCCEEDED(hr)) hr = IDXGIAdapter_GetParent(ad, &iid_factory, (void **)&f);
+    if (SUCCEEDED(hr)) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = fb_child_proc; wc.hInstance = GetModuleHandleW(NULL); wc.lpszClassName = L"fgb_fallback";
+        RegisterClassW(&wc);
+        GetClientRect(g_hwnd, &g_fb_rc);
+        g_fb_wnd = CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"fgb_fallback", L"", WS_CHILD | WS_VISIBLE, 0, 0, g_fb_rc.right, g_fb_rc.bottom,
+                                   g_hwnd, NULL, wc.hInstance, NULL);
+        if (!g_fb_wnd) hr = HRESULT_FROM_WIN32(GetLastError());
+    }
+    if (SUCCEEDED(hr)) {
+        if (!create) create = f->lpVtbl->CreateSwapChain;
+        // flip model (the window's other swapchain, the helper's, was flip too); its buffers take no _SRGB format
+        DXGI_FORMAT ff = s->Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? DXGI_FORMAT_R8G8B8A8_UNORM
+                       : s->Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ? DXGI_FORMAT_B8G8R8A8_UNORM : s->Format;
+        DXGI_SWAP_CHAIN_DESC d = {{s->Width, s->Height, {0, 1}, ff, 0, 0}, {1, 0}, DXGI_USAGE_RENDER_TARGET_OUTPUT, 2, g_fb_wnd, TRUE,
+                                  DXGI_SWAP_EFFECT_FLIP_DISCARD, 0};
+        hr = create(f, (IUnknown *)g_fb_dev, &d, &sc);
+        if (FAILED(hr)) {   // a format flip model does not take: a blit swapchain
+            d.BufferDesc.Format = s->Format; d.BufferCount = 1; d.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+            hr = create(f, (IUnknown *)g_fb_dev, &d, &sc);
+        }
+        if (SUCCEEDED(hr)) IDXGIFactory_MakeWindowAssociation(f, g_fb_wnd, DXGI_MWA_NO_WINDOW_CHANGES);   // the game runs its window
+    }
+    if (FAILED(hr)) {
+        sc = NULL;
+        if (g_fb_wnd) DestroyWindow(g_fb_wnd);
+        g_fb_wnd = NULL;
+        g_log("frame bridge: the mod's own swapchain on the game window failed (0x%08lx), retrying", hr);
+    }
+    if (f) IDXGIFactory_Release(f);
+    if (ad) IDXGIAdapter_Release(ad);
+    if (xd) IDXGIDevice_Release(xd);
+    return sc;
+}
+// src: the game's back buffer. Returns the swapchain to present (the caller presents it), or NULL: not this frame.
+IDXGISwapChain *fgb_fallback_frame(ID3D11Resource *src, fgb_create_sc_fn create) {
+    static const GUID iid_resource = {0xdc8e63f3, 0xd12b, 0x4952, {0xb4, 0x7b, 0x5e, 0x45, 0x02, 0x6a, 0x86, 0x2d}};
+    D3D11_TEXTURE2D_DESC s;
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)src, &s);
+    ID3D11Device *dev = NULL;
+    ID3D11Resource_GetDevice(src, &dev);
+    if (s.SampleDesc.Count != 1 || !dev) {
+        if (dev) ID3D11Device_Release(dev);
+        return NULL;
+    }
+    if (g_fb_sc && (s.Width != g_fb_src.Width || s.Height != g_fb_src.Height || s.Format != g_fb_src.Format || dev != g_fb_dev)) {
+        if (dev != g_fb_dev) g_log("frame bridge: the game's frames come from another D3D11 device now - the mod's swapchain follows");
+        fgb_fallback_close();
+    }
+    if (!g_fb_sc) {
+        if (g_fb_tries++ % 120) { ID3D11Device_Release(dev); return NULL; }   // after a failure: again in 120 frames
+        if (g_fb_dev) ID3D11Device_Release(g_fb_dev);
+        if (g_fb_ctx) ID3D11DeviceContext_Release(g_fb_ctx);
+        g_fb_dev = dev;   // the reference GetDevice gave
+        ID3D11Device_GetImmediateContext(dev, &g_fb_ctx);
+        dev = NULL;
+        if (!(g_fb_sc = fb_create(&s, create))) return NULL;
+        g_fb_src = s;
+        g_fb_tries = 0;
+        g_log("frame bridge: the game's frames now go to its window through the mod's own swapchain (%ux%u)", s.Width, s.Height);
+    }
+    if (dev) ID3D11Device_Release(dev);
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    if (rc.right != g_fb_rc.right || rc.bottom != g_fb_rc.bottom) {   // the game resized its window: the child follows
+        g_fb_rc = rc;
+        MoveWindow(g_fb_wnd, 0, 0, rc.right, rc.bottom, FALSE);
+    }
+    ID3D11Resource *bb = NULL;
+    if (FAILED(IDXGISwapChain_GetBuffer(g_fb_sc, 0, &iid_resource, (void **)&bb))) return NULL;
+    ID3D11DeviceContext_CopyResource(g_fb_ctx, bb, src);
+    ID3D11Resource_Release(bb);
+    return g_fb_sc;
 }

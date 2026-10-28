@@ -32,7 +32,7 @@ static ID3DDeviceContextState *m_state, *m_game_state;
 static void (*m_log)(const char *fmt, ...);
 
 static int m_on;
-static volatile int m_enabled = 1;   // the F12 panel's switch (the copy hook stays, returning at once when off)
+static volatile int m_enabled = 1;   // the F11 panel's switch (the copy hook stays, returning at once when off)
 void fgm_set_enabled(int on) { m_enabled = on; }
 
 // ---- the skinned layouts (CreateInputLayout with one of the three shaders' bytecode) ----
@@ -177,7 +177,8 @@ typedef struct {
 } MDraw;
 static MDraw m_draws[M_MAX_DRAWS];
 static UINT m_ndraws;
-static const void *m_items[M_MAX_INST];
+typedef struct { float cur[16]; int tex, bones; } MItem;   // a model's record, texture index and skeleton size
+static MItem m_items[M_MAX_INST];
 static float (*m_prev_cpu)[16];   // M_MAX_INST previous records (64 bytes)
 static volatile LONG m_queued, m_done;   // instances handed to / finished by the worker
 static HANDLE m_wake, m_thread;
@@ -206,10 +207,9 @@ static DWORD WINAPI worker(void *arg) {
             if (m_grid_frame != f) build_grid(f);
             MEnt *ce = m_ent[f & 1];
             for (LONG i = m_done; i < q; i++) {
-                const unsigned char *item = m_items[i];
-                const unsigned char *pose = *(const unsigned char *const *)(item + 0x60);
-                int tex = *(const int *)(item + 0x5C), bones = pose ? *(const int *)(pose + 4) : -1;
-                const float *cur = (const float *)(item + 0x74);   // this frame's record, as the game copied it
+                const MItem *it = &m_items[i];   // copied at the draw (fgm_draw): the game's own records may be gone by now
+                int tex = it->tex, bones = it->bones;
+                const float *cur = it->cur;
                 float *out = m_prev_cpu[i];
                 const MEnt *h = nearest(f, cur[3], cur[7], cur[11], bones);
                 if (h && h->tex >= 0 && h->tex < M_TEX && m_prev_ok[h->tex]) {
@@ -297,7 +297,14 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
     ID3D11DeviceContext_IAGetIndexBuffer(c, &d->ib, &d->ib_fmt, &d->ib_off);
     d->idx = idx; d->inst = inst; d->start_idx = start_idx; d->base_v = base_v;
     d->first = (UINT)m_queued;
-    memcpy(&m_items[d->first], &items[off / 120], inst * sizeof(void *));   // the slots may be refilled later this frame
+    for (UINT k = 0; k < inst; k++) {   // what the worker needs, copied now: the slots may be refilled later this frame, and
+        // the game may free its records before the worker gets to them (6.3.2: end of a battle, the worker read a freed pose)
+        const unsigned char *item = items[off / 120 + k], *pose = *(const unsigned char *const *)(item + 0x60);
+        MItem *mi = &m_items[d->first + k];
+        memcpy(mi->cur, item + 0x74, sizeof mi->cur);   // this frame's record, as the game copied it
+        mi->tex = *(const int *)(item + 0x5C);
+        mi->bones = pose ? *(const int *)(pose + 4) : -1;
+    }
     verify_draw(vb[1], off, &items[off / 120], inst);
     InterlockedExchangeAdd(&m_queued, (LONG)inst);
     SetEvent(m_wake);
