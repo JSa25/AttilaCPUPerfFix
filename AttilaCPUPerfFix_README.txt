@@ -195,6 +195,11 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.3.1: with the add-on, a game set to fullscreen no longer stays
+           frozen at its start screen: it runs as a borderless window
+           while the add-on is on. Crash records in heapfix.log show
+           more detail.
+
 Version 6.3: support for the optional "Upscaling and Framegen for Attila"
            add-on (NVIDIA DLSS upscaling and frame generation on RTX
            cards, separate download; AMD FSR support in the works).

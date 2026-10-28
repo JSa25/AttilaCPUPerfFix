@@ -112,21 +112,55 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     }
     p += snprintf(p, end - p, "  eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX ebp=%08lX esp=%08lX\n",
                   c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
-    if (code != EXCEPTION_STACK_OVERFLOW) {
-        // Stack scan: values on the stack that point into a loaded module, the likely return addresses.
+    {   // Stack scan: values on the stack that point into a loaded module, the likely return addresses (for a stack
+        // overflow: the innermost frames, the loop that ran away)
         NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
         DWORD *sp = (DWORD *)(UINT_PTR)c->Esp, *top = (DWORD *)tib->StackBase;
         int found = 0;
+        DWORD last = 0;
         p += snprintf(p, end - p, "  stack:");
-        for (; sp < top && sp < (DWORD *)(UINT_PTR)c->Esp + 4096 && found < 24 && end - p > 80; sp++) {
+        for (; sp < top && sp < (DWORD *)(UINT_PTR)c->Esp + 4096 && found < (code == EXCEPTION_STACK_OVERFLOW ? 40 : 24) && end - p > 80; sp++) {
             DWORD base;
             if (image_of(*sp, &base)) {
                 *p++ = ' ';
                 p += where(p, end - p, *sp);
                 found++;
+                last = *sp;
             }
         }
         *p++ = '\n';
+        if (code == EXCEPTION_STACK_OVERFLOW && last) {
+            // The rest of the overflowed stack: which modules fill it, and the frames just outside the outermost
+            // occurrence of the innermost address (the loop's own return address): who started the loop.
+            static DWORD bases[24], counts[24];
+            static const char *names[24];
+            int nmod = 0;
+            DWORD *s0 = (DWORD *)(UINT_PTR)c->Esp, *first = NULL;
+            for (sp = s0; sp < top; sp++) {
+                DWORD base;
+                const char *nm = image_of(*sp, &base);
+                if (!nm) continue;
+                if (*sp == last) first = sp;
+                int i = 0;
+                while (i < nmod && bases[i] != base) i++;
+                if (i == nmod && nmod < 24) { bases[i] = base; names[i] = nm; counts[i] = 0; nmod++; }
+                if (i < nmod) counts[i]++;
+            }
+            p += snprintf(p, end - p, "  stack used %lu KB; module-pointing values:", (DWORD)((top - s0) * 4 / 1024));
+            for (int i = 0; i < nmod && end - p > 80; i++) p += snprintf(p, end - p, " %s %lu", names[i], counts[i]);
+            p += snprintf(p, end - p, "\n  outside the loop (from %lu KB below the stack top, outward):",
+                          first ? (DWORD)((top - first) * 4 / 1024) : 0);
+            found = 0;
+            for (sp = first ? first + 1 : top; sp < top && found < 48 && end - p > 80; sp++) {
+                DWORD base;
+                if (*sp != last && image_of(*sp, &base)) {
+                    *p++ = ' ';
+                    p += where(p, end - p, *sp);
+                    found++;
+                }
+            }
+            *p++ = '\n';
+        }
     }
     dwrite(g_buf, (int)(p - g_buf));
     InterlockedExchange(&g_busy, 0);

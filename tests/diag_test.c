@@ -14,7 +14,13 @@ static void say(const char *fmt, ...) {
 }
 
 extern char fault_end[];
+static void WINAPI overflow_done(void) { ExitThread(0); }
 static LONG CALLBACK recover(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {   // end the overflowing thread from fresh stack
+        e->ContextRecord->Esp = (DWORD)(UINT_PTR)((NT_TIB *)NtCurrentTeb())->StackBase - 256;
+        e->ContextRecord->Eip = (DWORD)(UINT_PTR)overflow_done;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     e->ContextRecord->Eip = (DWORD)(UINT_PTR)fault_end;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -24,6 +30,13 @@ static __attribute__((noinline)) void fault(void) {
     __asm__ volatile("movl $1, 0x00000000\n\t.globl _fault_end\n_fault_end:\n\t" ::: "memory");
 }
 
+static __attribute__((noinline)) int deep(volatile int n) {
+    volatile char pad[200];
+    pad[0] = (char)n;
+    return deep(n + 1) + pad[0];
+}
+static DWORD WINAPI overflow_thread(void *x) { (void)x; return (DWORD)deep(0); }
+
 int main(void) {
     GetModuleFileNameW(NULL, g_path, MAX_PATH);
     wcscpy(wcsrchr(g_path, L'\\') + 1, L"diag_test.log");
@@ -31,6 +44,9 @@ int main(void) {
     diag_startup(NULL, g_path, say);                     // not the game: one explanation, no handler
     diag_startup(GetModuleHandleW(NULL), g_path, say);   // "the game": full startup lines + handler
     AddVectoredExceptionHandler(0, recover);             // after diag's, like the game's own handling
+    HANDLE th = CreateThread(NULL, 0, overflow_thread, NULL, 0, NULL);   // record 1: a runaway recursion
+    WaitForSingleObject(th, INFINITE);
+    CloseHandle(th);
     for (int i = 0; i < 10; i++) {
         g_uikeep_tid = i == 3 ? GetCurrentThreadId() : 0;  // one crash during the menu texture fix's work
         fault();
@@ -53,9 +69,13 @@ int main(void) {
     CHECK(strstr(text, "write to address 00000000"));
     CHECK(strstr(text, "main thread"));
     CHECK(strstr(text, "  stack: "));
+    char *so = strstr(text, "0xC00000FD stack overflow at exe+0x");   // its stack scan shows the recursion
+    CHECK(so && strstr(so, "  stack: exe+0x") && strstr(so, "  stack: exe+0x") < strstr(so, "] EXCEPTION 2:"));
+    char *ol = strstr(so, "  outside the loop (from ");   // and the frames that started it: the thread's own start
+    CHECK(strstr(so, "module-pointing values: exe ") && ol && ol < strstr(so, "] EXCEPTION 2:") && strstr(ol, "exe+0x"));
     char *u = strstr(text, "create an empty uikeep_off.txt");  // only in the 4th record
     CHECK(u && !strstr(u + 1, "create an empty uikeep_off.txt"));
-    CHECK(strstr(text, "] EXCEPTION 4:") < u && (!strstr(text, "] EXCEPTION 5:") || u < strstr(text, "] EXCEPTION 5:")));
+    CHECK(strstr(text, "] EXCEPTION 5:") < u && (!strstr(text, "] EXCEPTION 6:") || u < strstr(text, "] EXCEPTION 6:")));
     printf("\nall diag tests passed (%d records for 10 faults)\n", recs);
     return 0;
 }

@@ -395,6 +395,12 @@ static void patch_slot(void **slot, void *to, void **old) {
     *slot = to;
     VirtualProtect(slot, sizeof *slot, prot, &prot);
 }
+// DXGI factory / swapchain slots: hooked once. Another mod (the 4K UI mod hooks Present) may have put its own hook in
+// the slot after ours, calling ours as its original; hooking again would make ours call it back, forever (6.3: a new
+// swapchain, e.g. switching to fullscreen in game, overflowed the stack). All objects of a class share the vtable.
+static void patch_once(void **slot, void *to, void **old) {
+    if (!*old) patch_slot(slot, to, old);
+}
 
 // The helper's flip-model swapchain needs the game's window to itself (in game, Streamline's CreateSwapChainForHwnd got
 // "Access is denied" next to the game's swapchain; guess: Windows 11 turns windowed blit swapchains into flip ones). So the
@@ -1063,6 +1069,30 @@ static void panel_motion(int on) {
     settings_save();
 }
 
+// Exclusive fullscreen (6.3.1, players' reports: with gfx_fullscreen true the game froze at its start screen): the game's
+// swapchain sits on the hidden window, so exclusive fullscreen there covered the screen with a picture nobody draws,
+// over the window the helper presents into. While the bridge runs, the game's swapchain stays windowed: its requests to
+// go fullscreen are answered without switching, and it is told it is in the state it asked for (its window already has
+// the fullscreen size), so the game runs as a borderless window.
+static BOOL g_fs_wanted;
+static HRESULT(STDMETHODCALLTYPE *r_setfs)(IDXGISwapChain *, BOOL, IDXGIOutput *);
+static HRESULT(STDMETHODCALLTYPE *r_getfs)(IDXGISwapChain *, BOOL *, IDXGIOutput **);
+static HRESULT STDMETHODCALLTYPE w_setfs(IDXGISwapChain *sc, BOOL fs, IDXGIOutput *target) {
+    if (sc != g_sc || g_live_state != 1) return r_setfs(sc, fs, target);
+    if (fs != g_fs_wanted) g_log("frame bridge: the game switches to %s - kept as a borderless window", fs ? "fullscreen" : "windowed");
+    g_fs_wanted = fs;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE w_getfs(IDXGISwapChain *sc, BOOL *fs, IDXGIOutput **target) {
+    if (sc != g_sc || g_live_state != 1) return r_getfs(sc, fs, target);
+    if (fs) *fs = g_fs_wanted;
+    if (target) {   // the monitor the window is on, as a fullscreen swapchain would report it
+        *target = NULL;
+        if (g_fs_wanted && FAILED(IDXGISwapChain_GetContainingOutput(sc, target))) *target = NULL;
+    }
+    return S_OK;
+}
+
 static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) {
     mp_device(dev);
     DXGI_SWAP_CHAIN_DESC dd = *d;
@@ -1084,6 +1114,11 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
         if (g_live_state != 1) g_motion = 0;   // bridge off (e.g. not an NVIDIA GPU): no per-stage draw hooks either
         if (g_live_state == 1) {
             dd.OutputWindow = hid; dd.BufferDesc.Width = g_live_w; dd.BufferDesc.Height = g_live_h;
+            if (!dd.Windowed) {   // see w_setfs: exclusive fullscreen on the hidden window would cover the screen
+                dd.Windowed = TRUE;
+                g_fs_wanted = TRUE;
+                g_log("frame bridge: the game asked for exclusive fullscreen - it runs as a borderless window while the add-on is on");
+            }
             g_out_hwnd = d->OutputWindow;
             if (g_fg > fgb_fg_max()) g_fg = fgb_fg_max();   // NVIDIA's rules for this GPU (fgb_start logged it)
             sr_set(g_sr);
@@ -1118,7 +1153,11 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
         g_sc = *out;
         g_scd = *d;
         void **vt = *(void ***)*out;
-        patch_slot(&vt[offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *)], (void *)w_present, (void **)&r_present);
+        patch_once(&vt[offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *)], (void *)w_present, (void **)&r_present);
+        if (g_live_state == 1) {
+            patch_once(&vt[offsetof(IDXGISwapChainVtbl, SetFullscreenState) / sizeof(void *)], (void *)w_setfs, (void **)&r_setfs);
+            patch_once(&vt[offsetof(IDXGISwapChainVtbl, GetFullscreenState) / sizeof(void *)], (void *)w_getfs, (void **)&r_getfs);
+        }
     }
     return hr;
 }
@@ -1129,7 +1168,7 @@ static HRESULT WINAPI w_factory(REFIID r, void **out) {
     HRESULT hr = r_factory(r, out);
     if (SUCCEEDED(hr) && out && *out) {
         void **vt = *(void ***)*out;
-        patch_slot(&vt[offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *)], (void *)w_create_sc, (void **)&r_create_sc);
+        patch_once(&vt[offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *)], (void *)w_create_sc, (void **)&r_create_sc);
     }
     return hr;
 }
