@@ -35,7 +35,7 @@ static int p_w, p_h, p_x, p_y, p_open, p_dirty = 1, p_ok, p_hover = -1;
 static float p_u;               // 1 = 1080p
 static float p_cx0, p_cy0, p_cx1, p_cy1, p_cr;   // the card (rounded rectangle) inside the texture; outside: its shadow
 static UINT p_bw, p_bh;
-static int p_sr, p_fg, p_motion;   // current choices: SR 0 off / 1 DLAA / 2..5 Quality..Ultra Performance; FG 0 / 1 / 2 / 3 generated frames; motion 0 / 1, -1 not available
+static int p_sr, p_fg, p_motion;   // current choices: SR 0 off / 1 DLAA / 2..5 Quality..Ultra Performance; FG 0 / 1 / 2 / 3 generated frames; motion 0 / 1, -1 not available, -2 no frame generation on this GPU
 static FgpApply p_apply;
 static volatile int p_block;       // the game's mouse buttons are hidden (panel open, cursor over it)
 static double p_game_fps, p_shown_fps;
@@ -199,7 +199,8 @@ static void redraw(void) {
     if (!fgmax) _snwprintf(cap[1], 64, L"Needs an RTX 40 or 50 series GPU");
     else if (p_fg) _snwprintf(cap[1], 64, L"%d generated per rendered frame", p_fg);
     else _snwprintf(cap[1], 64, fgmax == 1 ? L"3x and 4x need an RTX 50 series GPU" : L"Every frame rendered");
-    _snwprintf(cap[2], 64, p_motion < 0 ? L"Not available this session" : p_motion ? L"Soldiers and horses tracked" : L"Camera movement only");
+    _snwprintf(cap[2], 64, p_motion == -2 ? L"Needs frame generation" : p_motion < 0 ? L"Not available this session"
+               : p_motion ? L"Soldiers and horses tracked" : L"Camera movement only");
     static const wchar_t *const label[3] = {L"Super Resolution", L"Frame Generation", L"Motion Vectors"};
     float lab = x0 + 196 * u, rh = 38 * u;
     for (int row = 0; row < 3; row++) {
@@ -208,7 +209,13 @@ static void redraw(void) {
         text(cap[row], p_tiny, C_DIM, (int)x0, (int)(y + rh * 0.5f), (int)(c0 - 10 * u), (int)(y + rh + 3 * u), DT_LEFT | DT_END_ELLIPSIS);
         if (row == 0) choices(0, c0, y, x1, y + rh, sr_names, 6, p_sr, 6);
         else if (row == 1) choices(1, c0, y, x1, y + rh, fg_names, 4, p_fg, (int)fgmax + 1);
-        else choices(2, c0, y, x1, y + rh, mv_names, 2, p_motion, p_motion >= 0 ? 2 : 0);
+        else {
+            choices(2, c0, y, x1, y + rh, mv_names, 2, p_motion, p_motion >= 0 ? 2 : 0);
+            y += rh + 8 * u;   // per-object motion's cost, under its row
+            text(L"Per object costs a lot of fps in big battles. Use it only if you see smearing or ghosting with frame generation.",
+                 p_tiny, C_DIM, (int)x0, (int)y, (int)x1, (int)(y + 18 * u), DT_LEFT | DT_END_ELLIPSIS);
+            y += 18 * u - rh - 8 * u;
+        }
         y += rh + 20 * u;
     }
     y -= 4 * u;
@@ -346,7 +353,7 @@ int fgp_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh, DXGI
     if (p_fg > (int)fgb_fg_max()) p_fg = (int)fgb_fg_max();   // never show a choice this GPU does not allow as the current one
     float u = p_u = bh / 1080.0f;
     float m = 20 * u;   // room for the shadow around the panel
-    p_cx0 = m; p_cy0 = m; p_cx1 = m + 790 * u; p_cy1 = m + 290 * u; p_cr = 3 * u;
+    p_cx0 = m; p_cy0 = m; p_cx1 = m + 790 * u; p_cy1 = m + 316 * u; p_cr = 3 * u;
     p_w = (int)ceilf(p_cx1 + m); p_h = (int)ceilf(p_cy1 + m);
     p_x = (int)(bw * 0.03f - m); p_y = (int)(bh * 0.08f - m);
     if (p_x < 0) p_x = 0;

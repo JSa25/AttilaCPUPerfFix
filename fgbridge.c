@@ -562,6 +562,9 @@ void fgb_present(ID3D11Resource *backbuffer) {
     ID3D11DeviceContext4_Signal(g_ctx4, g_fence, 2ull * g_n + 2);
     ID3D11DeviceContext_Flush(g_ctx);
     g_sh->reset = !g_hud_done;
+    // a frame without the scene (menu, pause, loading): the next one counts the camera as not moved, not as moved
+    // since the last scene frame, seconds ago (one frame of huge wrong motion vectors: a smear after every menu)
+    if (!g_hud_done) g_have_prev = 0;
     __atomic_store_n(&g_sh->frames, g_n + 1, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);

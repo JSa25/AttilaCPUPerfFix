@@ -195,6 +195,18 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.5.2: changes for the Upscaling and Framegen add-on. The add-on
+           now updates itself: when Steam updates it, this mod copies the
+           new files into the game folder at the next start, so its
+           install.bat no longer has to be run again (an older version is
+           never installed over a newer one). Per-object motion is now off
+           by default: it costs a lot of fps in big battles and mostly helps
+           frame generation. On RTX 20 / 30 cards it is not offered. Turn it
+           on in F11 if you see smearing or ghosting with frame generation.
+           After a menu, the pause screen or loading, DLSS no longer gets one
+           frame of wrong camera motion (a short smear). Without the add-on
+           6.5.2 works exactly like 6.5.1.
+
 Version 6.5.1: with the add-on's per-object motion on, some battle maps
            no longer crash at the end of loading or around the battle start
            (dinput8.dll+0x16AE2 in the log). Without the add-on 6.5.1 works

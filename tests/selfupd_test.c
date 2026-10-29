@@ -71,6 +71,56 @@ int main(void) {
     CHECK(update_from(g_self, g_ws, 5, say) == 0);   // next start: up to date, .old cleaned up
     CHECK(!exists(old_));
 
+    // The add-on's folder: only where it is installed, only to a higher version.txt number, the player's files kept.
+    wchar_t gfb[MAX_PATH], wfb[MAX_PATH], wlic[MAX_PATH], helper[MAX_PATH], whelper[MAX_PATH], lic[MAX_PATH], mine[MAX_PATH];
+    wchar_t gver[MAX_PATH], wver[MAX_PATH], wa[MAX_PATH], glic[MAX_PATH];
+    swprintf(gfb, MAX_PATH, L"%ls\\FrameBridge", g_dir);
+    swprintf(wfb, MAX_PATH, L"%ls\\ws_FrameBridge", g_dir);
+    swprintf(wlic, MAX_PATH, L"%ls\\licenses", wfb);
+    swprintf(glic, MAX_PATH, L"%ls\\licenses", gfb);
+    swprintf(wa, MAX_PATH, L"%ls\\a.txt", wlic);
+    swprintf(helper, MAX_PATH, L"%ls\\helper64.exe", gfb);
+    swprintf(whelper, MAX_PATH, L"%ls\\helper64.exe", wfb);
+    swprintf(lic, MAX_PATH, L"%ls\\a.txt", glic);
+    swprintf(mine, MAX_PATH, L"%ls\\settings.txt", gfb);
+    swprintf(gver, MAX_PATH, L"%ls\\version.txt", gfb);
+    swprintf(wver, MAX_PATH, L"%ls\\version.txt", wfb);
+    const wchar_t *files[] = { helper, lic, mine, gver, whelper, wa, wver }, *dirs[] = { glic, wlic, wfb, gfb };
+    for (int i = 0; i < 7; i++) DeleteFileW(files[i]);
+    for (int i = 0; i < 4; i++) RemoveDirectoryW(dirs[i]);
+    char buf[64] = {0};
+    FILE *f;
+#define READ(p) (f = _wfopen(p, L"rb"), memset(buf, 0, sizeof buf), fread(buf, 1, sizeof buf - 1, f), fclose(f), buf)
+
+    CHECK(addon_update_from(gfb, wfb, say) == 0);   // neither folder
+    CreateDirectoryW(wfb, NULL);
+    CreateDirectoryW(wlic, NULL);
+    make(whelper, 0, "helper v1");
+    make(wa, 0, "license");
+    make(wver, 0, "addon_version=2\r\n");
+    CHECK(addon_update_from(gfb, wfb, say) == 0 && !exists(gfb));   // add-on not installed: stays not installed
+    CreateDirectoryW(gfb, NULL);
+    make(mine, 0, "my settings");
+    make(helper, 0, "helper v0");                   // installed before version.txt existed (= version 0)
+    CHECK(addon_update_from(gfb, wfb, say) == 3);   // helper, licenses\a.txt, version.txt
+    CHECK(!strcmp(READ(helper), "helper v1") && exists(lic) && addon_version(gfb) == 2);
+    CHECK(addon_update_from(gfb, wfb, say) == 0);   // same version: nothing copied
+
+    make(helper, 0, "my test helper");
+    make(gver, 0, "addon_version=5\r\n");
+    make(whelper, 0, "helper v3");
+    make(wver, 0, "addon_version=3\r\n");
+    CHECK(addon_update_from(gfb, wfb, say) == 0 && !strcmp(READ(helper), "my test helper"));   // newer install stays
+    make(gver, 0, "addon_version=2\r\n");
+    CHECK(addon_update_from(gfb, wfb, say) == 3 && !strcmp(READ(helper), "helper v3") && addon_version(gfb) == 3);
+    make(wver, 0, "addon_version=1\r\n");
+    make(whelper, 0, "helper v1");
+    CHECK(addon_update_from(gfb, wfb, say) == 0 && !strcmp(READ(helper), "helper v3"));   // older Workshop copy: no downgrade
+    DeleteFileW(wver);
+    CHECK(addon_update_from(gfb, wfb, say) == 0);   // Workshop copy without version.txt (the packages before it)
+    CHECK(!strcmp(READ(mine), "my settings"));      // settings.txt is not in the package: kept
+#undef READ
+
     // The real binary carries its own marker (also checks the bare prefix in it is skipped).
     wchar_t me[MAX_PATH];
     GetModuleFileNameW(NULL, me, MAX_PATH);

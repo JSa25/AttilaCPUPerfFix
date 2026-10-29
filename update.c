@@ -5,10 +5,12 @@
 // the marker, uses no network, and on any failure keeps the current DLL and says so in the log.
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "version.h"
 #define WORKSHOP_ITEM L"3824249154"
+#define ADDON_ITEM L"3828791891"   // the add-on, "Upscaling and Framegen for Attila"
 static const char MARKER[] = "AttilaCPUPerfFix-version:";
 #define STR_(x) #x
 #define STR(x) STR_(x)
@@ -65,6 +67,68 @@ int update_from(const wchar_t *self, const wchar_t *ws, int mine, void (*log)(co
     return 1;
 }
 
+// The add-on (Workshop item 3828791891) is copied into <game>\FrameBridge by its install.bat, which players forget to
+// run again after Steam updates the item. Its version is the number in FrameBridge\version.txt ("addon_version=N",
+// written by tools/pack_framebridge.sh; none = 0). If the add-on is installed and the Workshop copy's number is higher,
+// all its files are copied over, version.txt last, so a failed update is tried again next start. Never downgrades
+// (an older Workshop copy, a newer Nexus or test install stays). Files only in the game folder (settings.txt, the
+// logs) are left alone. sync_dir returns the number of files that could not be copied.
+static int addon_version(const wchar_t *dir) {
+    wchar_t p[MAX_PATH];
+    char buf[64] = {0};
+    if (swprintf(p, MAX_PATH, L"%ls\\version.txt", dir) < 0) return 0;
+    FILE *f = _wfopen(p, L"rb");
+    if (!f) return 0;
+    fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    const char *v = strstr(buf, "addon_version=");
+    return v ? atoi(v + 14) : 0;
+}
+
+static int sync_dir(const wchar_t *dst, const wchar_t *src, int *copied) {
+    wchar_t pat[MAX_PATH], s[MAX_PATH], d[MAX_PATH];
+    if (swprintf(pat, MAX_PATH, L"%ls\\*", src) < 0) return 1;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 1;
+    int failed = 0;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..") || !_wcsicmp(fd.cFileName, L"version.txt")) continue;
+        if (swprintf(s, MAX_PATH, L"%ls\\%ls", src, fd.cFileName) < 0 || swprintf(d, MAX_PATH, L"%ls\\%ls", dst, fd.cFileName) < 0) {
+            failed++;
+            continue;
+        }
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            CreateDirectoryW(d, NULL);
+            failed += sync_dir(d, s, copied);
+            continue;
+        }
+        if (CopyFileW(s, d, FALSE)) (*copied)++;
+        else failed++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return failed;
+}
+
+// game_fb = <game>\FrameBridge, ws_fb = the add-on's Workshop FrameBridge folder. Returns the number of files copied.
+int addon_update_from(const wchar_t *game_fb, const wchar_t *ws_fb, void (*log)(const char *fmt, ...)) {
+    if (GetFileAttributesW(game_fb) == INVALID_FILE_ATTRIBUTES) return 0;  // add-on not installed: never install it
+    if (GetFileAttributesW(ws_fb) == INVALID_FILE_ATTRIBUTES) return 0;    // not subscribed (e.g. installed from Nexus)
+    int theirs = addon_version(ws_fb), mine = addon_version(game_fb);
+    if (theirs <= mine) return 0;
+    wchar_t s[MAX_PATH], d[MAX_PATH];
+    int copied = 0, failed = sync_dir(game_fb, ws_fb, &copied);
+    if (!failed && (swprintf(s, MAX_PATH, L"%ls\\version.txt", ws_fb) < 0 || swprintf(d, MAX_PATH, L"%ls\\version.txt", game_fb) < 0 ||
+                    !CopyFileW(s, d, FALSE)))
+        failed++;
+    if (failed)
+        log("update: add-on version %d from the Steam Workshop: %d file(s) could not be copied into FrameBridge - run the "
+            "add-on's install.bat", theirs, failed);
+    else
+        log("update: add-on version %d installed from the Steam Workshop (was %d, %d files)", theirs, mine, copied + 1);
+    return failed ? 0 : copied + 1;
+}
+
 // The game folder is steamapps\common\<game>; the Workshop copy lives in the same library's steamapps\workshop.
 void update_check(HMODULE self, void (*log)(const char *fmt, ...)) {
     wchar_t me[MAX_PATH], ws[MAX_PATH];
@@ -81,9 +145,15 @@ void update_check(HMODULE self, void (*log)(const char *fmt, ...)) {
         *s = 0;
     }
     if (wcslen(ws) + 64 >= MAX_PATH) return;
+    wchar_t game_fb[MAX_PATH], ws_fb[MAX_PATH];
+    swprintf(ws_fb, MAX_PATH, L"%ls\\workshop\\content\\325610\\" ADDON_ITEM L"\\FrameBridge", ws);
     wcscat(ws, L"\\workshop\\content\\325610\\" WORKSHOP_ITEM L"\\dinput8.dll");
     // Our version is read from our own file, the same way as the Workshop copy's, so the comparison can never
     // disagree with the marker and re-install the same file on every start.
     int mine = file_version(me);
-    update_from(me, ws, mine ? mine : MOD_VERSION_NUM, log);
+    // a new DLL first: the add-on's new files may need it, so they follow on the next start, when it runs
+    if (update_from(me, ws, mine ? mine : MOD_VERSION_NUM, log)) return;
+    wcscpy(game_fb, me);
+    wcscpy(wcsrchr(game_fb, L'\\') + 1, L"FrameBridge");
+    addon_update_from(game_fb, ws_fb, log);
 }
