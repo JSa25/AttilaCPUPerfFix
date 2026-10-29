@@ -11,11 +11,12 @@
 #define COBJMACROS
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi.h>
+#include <dxgi1_2.h>
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <intrin.h>
 
 extern unsigned g_pt_base;
 extern DWORD g_pt_main;
@@ -77,7 +78,7 @@ void fgb_set_motion(void (*pass)(ID3D11Resource *depth, float jx, float jy));
 ID3D11Texture2D *fgb_mv_texture(void);
 int fgm_init(ID3D11Device *, ID3D11DeviceContext *, ID3D11Texture2D *mv, UINT w, UINT h, void (*log)(const char *fmt, ...));
 void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT n, unsigned long long sig);
-void fgm_mapped(ID3D11Resource *r, const D3D11_MAPPED_SUBRESOURCE *m);
+void fgm_mapped(ID3D11Resource *r, D3D11_MAP type, const D3D11_MAPPED_SUBRESOURCE *m);
 void *__cdecl fgm_copy(void *dst, const void *src, size_t n);
 void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT base_v, UINT start_inst);
 void fgm_pass(ID3D11Resource *depth, float jx, float jy);
@@ -495,6 +496,10 @@ static HRESULT present_hooked(IDXGISwapChain *sc, UINT sync, UINT flags, unsigne
                 }
                 fgp_frame(bb, g_out_hwnd);
                 fgb_present(bb);
+                // the game's own swapchain is presented too (hidden window, sync 0, past the overlay / UI mod hooks):
+                // without its Presents the NVIDIA driver held the game's main thread ~30-40% of each frame on a battle
+                // clump, the GPU half idle (AGENT_LOG 109: 120-135 fps without the add-on, 75 with it; 155 with this)
+                present_body(sc, 0, 0);
                 if (g_motion) { fgm_frame_end(); mp_hook(NULL); }   // hooks back before the next frame's instance copies
                 ID3D11Resource_Release(bb);
                 g_scene_last = g_hud_this_frame;
@@ -667,6 +672,35 @@ static int vp_adjust(D3D11_VIEWPORT *v) {
 // pixel shaders get a copy of the camera block whose matrices see the full-size target as the screen: the inverse ones
 // take that "full-screen" ndc to the real one (M * S), the forward ones the other way (S^-1 * M), x and y only. Vertex
 // shaders keep the game's block: geometry is placed by the shrunk viewport.
+// game calls through the hooks below, per 30 s report (AGENT_LOG 109: what the add-on adds per call, times this many)
+enum { HK_MAP, HK_UNMAP, HK_UPDSUB, HK_PSCB, HK_OMRT, HK_OMDSS, HK_RSVP, HK_DRAW, HK_N };
+static unsigned g_hk[HK_N];
+static unsigned g_cam_calls;   // the set-camera jump hook (cam_seen), any thread
+// Where the game's main thread blocks (AGENT_LOG 109: in Map and OMSetRenderTargets, 3x as long with the add-on, the GPU
+// half idle): time in the real calls, and the Maps that took > 0.2 ms by what was mapped
+static unsigned long long g_map_ticks, g_omrt_ticks;
+typedef struct { UINT type, dim, usage, bind, cpu, size, flags; unsigned n; unsigned long long ticks; } SlowMap;
+static SlowMap g_slow[32];
+static unsigned g_nslow;
+static unsigned long long g_tsc_ms;   // TSC ticks per ms, measured at the reports
+static void slow_map(ID3D11Resource *r, D3D11_MAP t, UINT f, unsigned long long ticks) {
+    SlowMap k = {(UINT)t, 0, 0, 0, 0, 0, f, 0, 0};
+    D3D11_RESOURCE_DIMENSION dim;
+    ID3D11Resource_GetType(r, &dim);
+    k.dim = dim;
+    if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+        D3D11_BUFFER_DESC d;
+        ID3D11Buffer_GetDesc((ID3D11Buffer *)r, &d);
+        k.usage = d.Usage; k.bind = d.BindFlags; k.cpu = d.CPUAccessFlags; k.size = d.ByteWidth;
+    } else if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        D3D11_TEXTURE2D_DESC d;
+        ID3D11Texture2D_GetDesc((ID3D11Texture2D *)r, &d);
+        k.usage = d.Usage; k.bind = d.BindFlags; k.cpu = d.CPUAccessFlags; k.size = d.Width << 16 | (d.Height & 0xFFFF);
+    }
+    for (unsigned i = 0; i < g_nslow; i++)
+        if (!memcmp(&g_slow[i], &k, offsetof(SlowMap, n))) { g_slow[i].n++; g_slow[i].ticks += ticks; return; }
+    if (g_nslow < 32) { k.n = 1; k.ticks = ticks; g_slow[g_nslow++] = k; }
+}
 typedef struct { ID3D11Buffer *game, *ours; void *mapped; int valid; } CamBuf;
 static CamBuf g_cbuf[8];
 static unsigned g_ncbuf, g_cam_writes;
@@ -737,6 +771,7 @@ static void ps_cb_apply(ID3D11DeviceContext *c) {
 }
 
 static void STDMETHODCALLTYPE w_pscb(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11Buffer *const *b) {
+    g_hk[HK_PSCB]++;
     if (c != g_ctx || start != 0 || !n || !b || n > 14) { r_pscb(c, start, n, b); return; }
     ID3D11Buffer *g = b[0];
     for (unsigned i = 0; i < g_ncbuf; i++)
@@ -759,11 +794,13 @@ static void cam_mapped(ID3D11DeviceContext *c, ID3D11Resource *r, D3D11_MAP t, c
     if (e) e->mapped = m->pData;
 }
 static void STDMETHODCALLTYPE w_unmap(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub) {
+    g_hk[HK_UNMAP]++;
     CamBuf *e = c == g_ctx ? cam_find(r, 0) : NULL;
     if (e && e->mapped) { cam_write(e, e->mapped); e->mapped = NULL; }
     r_unmap(c, r, sub);
 }
 static void STDMETHODCALLTYPE w_updsub(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub, const D3D11_BOX *box, const void *data, UINT rp, UINT dp) {
+    g_hk[HK_UPDSUB]++;
     r_updsub(c, r, sub, box, data, rp, dp);
     if (c != g_ctx || g_live_state != 1 || box || !data) return;
     CamBuf *e = cam_find(r, 1);
@@ -781,6 +818,7 @@ static void jit_apply(ID3D11DeviceContext *c, int force) {
 }
 
 static void STDMETHODCALLTYPE w_rsvp(ID3D11DeviceContext *c, UINT n, const D3D11_VIEWPORT *v) {
+    g_hk[HK_RSVP]++;
     if (c != g_ctx || n > 16) { r_rsvp(c, n, v); return; }
     g_ngvp = n;
     if (n) memcpy(g_gvp, v, n * sizeof *v);
@@ -831,7 +869,10 @@ static void target_changed(UINT n, ID3D11RenderTargetView *const *rtv, ID3D11Dep
 }
 
 static void STDMETHODCALLTYPE w_omrt(ID3D11DeviceContext *c, UINT n, ID3D11RenderTargetView *const *rtv, ID3D11DepthStencilView *dsv) {
+    g_hk[HK_OMRT]++;
+    unsigned long long t0 = __rdtsc();
     r_omrt(c, n, rtv, dsv);
+    g_omrt_ticks += __rdtsc() - t0;
     if (c != g_ctx) return;
     dsv_changed(dsv);
     target_changed(n, rtv, dsv);
@@ -840,6 +881,7 @@ static void STDMETHODCALLTYPE w_omrt(ID3D11DeviceContext *c, UINT n, ID3D11Rende
 
 static void STDMETHODCALLTYPE w_omrtuav(ID3D11DeviceContext *c, UINT n, ID3D11RenderTargetView *const *rtv, ID3D11DepthStencilView *dsv,
                                         UINT us, UINT nu, ID3D11UnorderedAccessView *const *u, const UINT *ic) {
+    g_hk[HK_OMRT]++;
     r_omrtuav(c, n, rtv, dsv, us, nu, u, ic);
     if (c != g_ctx || n == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) return;
     dsv_changed(dsv);
@@ -848,6 +890,7 @@ static void STDMETHODCALLTYPE w_omrtuav(ID3D11DeviceContext *c, UINT n, ID3D11Re
 }
 
 static void STDMETHODCALLTYPE w_omdss(ID3D11DeviceContext *c, ID3D11DepthStencilState *st, UINT ref) {
+    g_hk[HK_OMDSS]++;
     r_omdss(c, st, ref);
     if (c != g_ctx) return;
     if (st != g_last_dss) {
@@ -1113,6 +1156,7 @@ static void mp_draw(ID3D11DeviceContext *c, const char *kind, UINT count, UINT i
 }
 
 static void STDMETHODCALLTYPE w_dii(ID3D11DeviceContext *c, UINT ic, UINT inst, UINT si, INT bv, UINT sinst) {
+    g_hk[HK_DRAW]++;
     mp_draw(c, "DrawIndexedInstanced", ic, inst, sinst);
     if (g_motion && c == g_ctx && GetCurrentThreadId() == g_pt_main && mp_stage_vt() == 0x1CCE4E4) fgm_draw(c, ic, inst, si, bv, sinst);
     r_dii(c, ic, inst, si, bv, sinst);
@@ -1131,8 +1175,13 @@ static void STDMETHODCALLTYPE w_draw(ID3D11DeviceContext *c, UINT vc, UINT sv) {
 }
 static HRESULT(STDMETHODCALLTYPE *r_map)(ID3D11DeviceContext *, ID3D11Resource *, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE *);
 static HRESULT STDMETHODCALLTYPE w_map(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub, D3D11_MAP t, UINT f, D3D11_MAPPED_SUBRESOURCE *m) {
+    unsigned long long t0 = __rdtsc();
     HRESULT hr = r_map(c, r, sub, t, f, m);
-    if (SUCCEEDED(hr) && g_motion && c == g_ctx) fgm_mapped(r, m);
+    unsigned long long dt = __rdtsc() - t0;
+    g_map_ticks += dt;
+    if (g_tsc_ms && dt * 5 > g_tsc_ms && c == g_ctx) slow_map(r, t, f, dt);
+    g_hk[HK_MAP]++;
+    if (SUCCEEDED(hr) && g_motion && c == g_ctx) fgm_mapped(r, t, m);
     if (SUCCEEDED(hr)) cam_mapped(c, r, t, m);
     return hr;
 }
@@ -1292,6 +1341,20 @@ static HRESULT STDMETHODCALLTYPE w_setfs(IDXGISwapChain *sc, BOOL fs, IDXGIOutpu
     g_fs_wanted = fs;
     return S_OK;
 }
+// Other mods find the game's window through its swapchain (the 4K UI mod's F10 menu showed but took no clicks: it
+// subclassed the hidden window, which gets no input). The hidden swapchain says the window the game gave it.
+static HRESULT(STDMETHODCALLTYPE *r_getdesc)(IDXGISwapChain *, DXGI_SWAP_CHAIN_DESC *);
+static HRESULT(STDMETHODCALLTYPE *r_gethwnd)(IDXGISwapChain1 *, HWND *);
+static HRESULT STDMETHODCALLTYPE w_getdesc(IDXGISwapChain *sc, DXGI_SWAP_CHAIN_DESC *d) {
+    HRESULT hr = r_getdesc(sc, d);
+    if (SUCCEEDED(hr) && d && sc == g_hid_sc && g_out_hwnd) d->OutputWindow = g_out_hwnd;
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE w_gethwnd(IDXGISwapChain1 *sc, HWND *h) {
+    HRESULT hr = r_gethwnd(sc, h);
+    if (SUCCEEDED(hr) && h && (IDXGISwapChain *)sc == g_hid_sc && g_out_hwnd) *h = g_out_hwnd;
+    return hr;
+}
 static HRESULT STDMETHODCALLTYPE w_getfs(IDXGISwapChain *sc, BOOL *fs, IDXGIOutput **target) {
     if (sc != g_hid_sc) return r_getfs(sc, fs, target);
     if (fs) *fs = g_fs_wanted;
@@ -1394,6 +1457,14 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
         if (hidden) {
             patch_once(&vt[offsetof(IDXGISwapChainVtbl, SetFullscreenState) / sizeof(void *)], (void *)w_setfs, (void **)&r_setfs);
             patch_once(&vt[offsetof(IDXGISwapChainVtbl, GetFullscreenState) / sizeof(void *)], (void *)w_getfs, (void **)&r_getfs);
+            patch_once(&vt[offsetof(IDXGISwapChainVtbl, GetDesc) / sizeof(void *)], (void *)w_getdesc, (void **)&r_getdesc);
+            static const GUID iid_sc1 = {0x790a45f7, 0x0d42, 0x4876, {0x98, 0x3a, 0x0a, 0x55, 0xcf, 0xe6, 0xf4, 0xaa}};
+            IDXGISwapChain1 *s1 = NULL;   // GetHwnd: only where IDXGISwapChain1 is the same object (same table, one more slot)
+            if (SUCCEEDED(IDXGISwapChain_QueryInterface(*out, &iid_sc1, (void **)&s1))) {
+                if ((void *)s1 == (void *)*out)
+                    patch_once(&vt[offsetof(IDXGISwapChain1Vtbl, GetHwnd) / sizeof(void *)], (void *)w_gethwnd, (void **)&r_gethwnd);
+                IDXGISwapChain1_Release(s1);
+            }
         }
     }
     return hr;
@@ -1441,6 +1512,28 @@ static FARPROC WINAPI w_gpa(HMODULE m, LPCSTR name) {
     return f;
 }
 
+// AGENT_LOG 109: an experiment that put d3d11's functions back in the hooked slots found most of them still calling
+// ours: another hook sits on top and calls ours as its original. Once per run: who holds each slot.
+static void hook_owners(void (*log)(const char *fmt, ...)) {
+    if (!g_ctx || !r_omrt) return;
+    void **vt = *(void ***)g_ctx;
+#define SL(m) &vt[offsetof(ID3D11DeviceContextVtbl, m) / sizeof(void *)], #m
+    struct { void **slot; const char *name; void *ours; } h[] = {
+        {SL(RSSetViewports), (void *)w_rsvp}, {SL(RSGetViewports), (void *)w_rsgetvp}, {SL(OMSetRenderTargets), (void *)w_omrt},
+        {SL(OMSetRenderTargetsAndUnorderedAccessViews), (void *)w_omrtuav}, {SL(OMSetDepthStencilState), (void *)w_omdss},
+        {SL(PSSetConstantBuffers), (void *)w_pscb}, {SL(Map), (void *)w_map}, {SL(Unmap), (void *)w_unmap},
+        {SL(UpdateSubresource), (void *)w_updsub}, {SL(DrawIndexedInstanced), (void *)w_dii}, {SL(DrawIndexed), (void *)w_di},
+        {SL(DrawInstanced), (void *)w_dinst}, {SL(Draw), (void *)w_draw}};
+#undef SL
+    char line[1500];
+    int len = 0;
+    for (unsigned i = 0; i < sizeof h / sizeof *h; i++) {
+        char buf[MAX_PATH];
+        len += snprintf(line + len, sizeof line - len, "%s %s: %s", i ? "," : "", h[i].name, *h[i].slot == h[i].ours ? "ours" : module_name(*h[i].slot, buf));
+    }
+    log("  D3D11 context slots the add-on hooks, who is first in each now:%s", line);
+}
+
 static void bp_report(void (*log)(const char *fmt, ...)) {
     log("bridge probe: %u presents (%u not on the main thread), sync interval 0/1/2/3/more: %u/%u/%u/%u/%u, captures %d%s",
         g_presents, g_present_other_thread, g_sync[0], g_sync[1], g_sync[2], g_sync[3], g_sync[4], g_captures,
@@ -1469,6 +1562,50 @@ static void bp_report(void (*log)(const char *fmt, ...)) {
         fgb_cpu_stats(&hm, &pm, &wm, &fr);
         if (fr) log("  frame bridge main-thread time per frame: HUD-less step %.3f ms (incl. the DLSS pickup and the motion pass), "
                     "Present step %.3f ms, of which waiting for the helper %.3f ms", hm / fr, pm / fr, wm / fr);
+        void fgb_gpu_stats(double ms[4], unsigned *frames, unsigned *lost);
+        double g4[4];
+        unsigned gf, gl;
+        fgb_gpu_stats(g4, &gf, &gl);
+        void fgb_wait_stats(unsigned *queued, unsigned *frames);
+        unsigned wq, wf;
+        fgb_wait_stats(&wq, &wf);
+        if (gf) log("  frame bridge GPU per frame (%u frames timed, %u not read): frame interval %.3f ms, a wait for the helper queued in %u of %u "
+                    "frames (stalled %.3f ms each), HUD-less step %.3f ms (copies, motion vectors, motion pass, DLSS pickup), Present step %.3f ms",
+                    gf, gl, g4[0], wq, wf, g4[1], g4[2], g4[3]);
+        if (fr) log("  game calls through the add-on's hooks per frame: Map %.0f, Unmap %.0f, UpdateSubresource %.0f, PSSetConstantBuffers %.0f, "
+                    "OMSetRenderTargets %.0f, OMSetDepthStencilState %.0f, RSSetViewports %.0f, DrawIndexedInstanced %.0f",
+                    (double)g_hk[HK_MAP] / fr, (double)g_hk[HK_UNMAP] / fr, (double)g_hk[HK_UPDSUB] / fr, (double)g_hk[HK_PSCB] / fr,
+                    (double)g_hk[HK_OMRT] / fr, (double)g_hk[HK_OMDSS] / fr, (double)g_hk[HK_RSVP] / fr, (double)g_hk[HK_DRAW] / fr);
+        memset(g_hk, 0, sizeof g_hk);
+        {   // TSC rate from QPC between reports, then the time in the real Map / OMSetRenderTargets
+            static LARGE_INTEGER q0; static unsigned long long c0;
+            LARGE_INTEGER q, qf; unsigned long long cn = __rdtsc();
+            QueryPerformanceCounter(&q); QueryPerformanceFrequency(&qf);
+            if (q0.QuadPart && q.QuadPart > q0.QuadPart) g_tsc_ms = (cn - c0) * (unsigned long long)qf.QuadPart / 1000 / (unsigned long long)(q.QuadPart - q0.QuadPart);
+            q0 = q; c0 = cn;
+        }
+        if (fr && g_tsc_ms) {
+            char sl[900];
+            int len = 0;
+            for (int t = 0; t < 5; t++) {
+                int best = -1;
+                for (unsigned i = 0; i < g_nslow; i++) if (g_slow[i].n && (best < 0 || g_slow[i].ticks > g_slow[best].ticks)) best = (int)i;
+                if (best < 0) break;
+                SlowMap *k = &g_slow[best];
+                len += snprintf(sl + len, sizeof sl - len, "%s map type %u flags 0x%X on %s usage %u bind 0x%X cpu 0x%X %s %u: %u calls %.3f ms per frame",
+                                t ? ";" : "", k->type, k->flags, k->dim == 1 ? "buffer" : k->dim == 3 ? "texture2d" : "other", k->usage, k->bind, k->cpu,
+                                k->dim == 3 ? "size (w<<16|h)" : "bytes", k->size, k->n, (double)k->ticks / g_tsc_ms / fr);
+                k->n = 0;
+            }
+            log("  main thread in the game's D3D11 calls per frame: Map %.3f ms, OMSetRenderTargets %.3f ms; Maps over 0.2 ms:%s",
+                (double)g_map_ticks / g_tsc_ms / fr, (double)g_omrt_ticks / g_tsc_ms / fr, len ? sl : " none");
+        }
+        g_map_ticks = g_omrt_ticks = 0;
+        g_nslow = 0;
+        static int owners_done;
+        if (!owners_done++) hook_owners(log);
+        log("  set-camera hook calls per frame: %.0f", (double)g_cam_calls / fr);
+        g_cam_calls = 0;
     }
     if (g_motion) fgm_report(log);
     for (int i = 0; i < 8 && g_callers[i].n; i++) {
@@ -1489,6 +1626,7 @@ static void bp_report(void (*log)(const char *fmt, ...)) {
 // jump hook: the stub calls cam_seen(block, stage) and goes on into the original code (push esi; mov esi,[esp+0Ch] copied).
 static unsigned char *g_cam_tramp;
 __attribute__((cdecl, used)) void cam_seen(const unsigned char *cam, const unsigned *stage) {
+    g_cam_calls++;
     if (!g_live || !cam || !stage || GetCurrentThreadId() != g_pt_main) return;
     if (stage[0] - g_pt_base != 0x1CCE4E4) return;
     memcpy(g_vp, cam + 0x1B0, 64);

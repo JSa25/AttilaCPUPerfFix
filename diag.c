@@ -9,6 +9,8 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <psapi.h>
+#include <tlhelp32.h>
 
 #include "version.h"
 #define MOD_VERSION "v" MOD_VERSION_STR
@@ -180,6 +182,269 @@ static void pref(const char *text, const char *name, char *out, int cap) {
     }
 }
 
+// ---- Main-thread sampler (AGENT_LOG 109: ~65 fps with the DLSS add-on in a big battle, 120-135 without, while the
+// add-on's own measured work is ~2 ms of GPU and < 0.5 ms of main thread per frame). With sample_on.txt in the game
+// folder, the main thread is paused every ~1 ms: its instruction pointer is counted per module, with the innermost game
+// return address on its stack (the game call that led there); every 30 s heapfix.log gets the shares.
+#define SM_MODS 192
+static struct { DWORD lo, hi; char name[32]; } g_sm_mod[SM_MODS];
+static int g_sm_nmod, g_sm_self = -1;
+static unsigned g_sm_cnt[SM_MODS + 1];   // + not in a module
+static struct { int mod; DWORD caller; unsigned n; } g_sm_pair[4096];
+static struct { DWORD off; unsigned n; } g_sm_own[1024];   // our DLL: 16-byte buckets of the instruction pointer
+static unsigned char *g_sm_text_lo, *g_sm_text_hi;
+static unsigned g_sm_waitby[SM_MODS + 1];   // samples in a Windows module (wait, system call), by the module that called it
+static DWORD g_sm_empire;
+
+static void sm_modules(void) {
+    HMODULE m[SM_MODS];
+    DWORD need = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), m, sizeof m, &need)) return;
+    int n = (int)(need / sizeof *m) < SM_MODS ? (int)(need / sizeof *m) : SM_MODS, k = 0;
+    for (int i = 0; i < n; i++) {
+        MODULEINFO mi;
+        char name[MAX_PATH];
+        if (!K32GetModuleInformation(GetCurrentProcess(), m[i], &mi, sizeof mi) || !GetModuleFileNameA(m[i], name, MAX_PATH)) continue;
+        const char *b = strrchr(name, '\\');
+        g_sm_mod[k].lo = (DWORD)(UINT_PTR)mi.lpBaseOfDll;
+        g_sm_mod[k].hi = g_sm_mod[k].lo + mi.SizeOfImage;
+        snprintf(g_sm_mod[k].name, sizeof g_sm_mod[k].name, "%s", b ? b + 1 : name);
+        if (g_sm_mod[k].lo == g_self_base) g_sm_self = k;
+        k++;
+    }
+    g_sm_nmod = k;
+}
+static int sm_find(DWORD a) {
+    for (int i = 0; i < g_sm_nmod; i++) if (a >= g_sm_mod[i].lo && a < g_sm_mod[i].hi) return i;
+    return SM_MODS;
+}
+static int sm_is_return(const unsigned char *r) {   // as profiler.c: a game code address right after a CALL
+    if (r < g_sm_text_lo + 7 || r >= g_sm_text_hi) return 0;
+    if (r[-5] == 0xE8) return 1;
+    if (r[-2] == 0xFF && (r[-1] & 0x38) == 0x10 && ((r[-1] & 0xC0) == 0xC0 || ((r[-1] & 0xC0) == 0 && (r[-1] & 7) != 4 && (r[-1] & 7) != 5))) return 1;
+    if (r[-3] == 0xFF && (r[-2] & 0x38) == 0x10 && (r[-2] & 0xC0) == 0x40) return 1;
+    if (r[-6] == 0xFF && (r[-5] & 0x38) == 0x10 && ((r[-5] & 0xC0) == 0x80 || r[-5] == 0x15)) return 1;
+    if (r[-7] == 0xFF && (r[-6] & 0x38) == 0x10 && (r[-6] & 0xC0) == 0x80 && (r[-6] & 7) == 4) return 1;
+    return 0;
+}
+static int sm_system(int m) {   // Windows' own layers: who called into them is the interesting part
+    if (m >= g_sm_nmod) return 0;
+    const char *n = g_sm_mod[m].name;
+    return !_stricmp(n, "ntdll.dll") || !_stricmp(n, "KERNELBASE.dll") || !_stricmp(n, "KERNEL32.DLL") || !_stricmp(n, "win32u.dll");
+}
+static int sm_is_call_return(DWORD v, int m) {   // v in module m, right after a CALL (any module; the bytes are mapped)
+    const unsigned char *r = (const unsigned char *)(UINT_PTR)v;
+    if (v < g_sm_mod[m].lo + 8) return 0;
+    MEMORY_BASIC_INFORMATION mb;
+    if (!VirtualQuery(r - 8, &mb, sizeof mb) || mb.State != MEM_COMMIT || !(mb.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE | PAGE_EXECUTE_READWRITE))) return 0;
+    if (r[-5] == 0xE8) return 1;
+    if (r[-2] == 0xFF && (r[-1] & 0x38) == 0x10) return 1;
+    if (r[-3] == 0xFF && (r[-2] & 0x38) == 0x10 && (r[-2] & 0xC0) == 0x40) return 1;
+    if (r[-6] == 0xFF && (r[-5] & 0x38) == 0x10 && ((r[-5] & 0xC0) == 0x80 || r[-5] == 0x15)) return 1;
+    return 0;
+}
+// CPU time of every thread of the process (and of the add-on's helper process) since the last report
+#define SM_THREADS 256
+static struct { DWORD tid; ULONG64 cpu; int seen; } g_sm_thr[SM_THREADS];
+static ULONG64 g_sm_helper_cpu;
+static void sm_threads(void (*log)(const char *fmt, ...), double secs) {
+    typedef LONG(NTAPI * qit_fn)(HANDLE, int, void *, ULONG, ULONG *);
+    static qit_fn qit;
+    if (!qit) qit = (qit_fn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD | TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    struct { DWORD tid; double pct; DWORD start; } top[13] = {{0}};
+    double total = 0;
+    THREADENTRY32 te = {sizeof te};
+    for (int i = 0; i < SM_THREADS; i++) g_sm_thr[i].seen = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+        HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        FILETIME a, b2, k, u;
+        DWORD start = 0;
+        if (qit) qit(h, 9, &start, sizeof start, NULL);   // ThreadQuerySetWin32StartAddress
+        if (GetThreadTimes(h, &a, &b2, &k, &u)) {
+            ULONG64 cpu = ((ULONG64)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((ULONG64)u.dwHighDateTime << 32 | u.dwLowDateTime);
+            int slot = -1, free_ = -1;
+            for (int i = 0; i < SM_THREADS; i++) {
+                if (g_sm_thr[i].tid == te.th32ThreadID) { slot = i; break; }
+                if (!g_sm_thr[i].tid && free_ < 0) free_ = i;
+            }
+            double pct = slot >= 0 ? (double)(cpu - g_sm_thr[slot].cpu) / 1e5 / secs : 0;   // 100 ns units -> % of one CPU
+            if (slot < 0) slot = free_;
+            if (slot >= 0) { g_sm_thr[slot].tid = te.th32ThreadID; g_sm_thr[slot].cpu = cpu; g_sm_thr[slot].seen = 1; }
+            total += pct;
+            for (int i = 0; i < 12; i++)
+                if (pct > top[i].pct) {
+                    memmove(&top[i + 1], &top[i], (11 - i) * sizeof *top);
+                    top[i].tid = te.th32ThreadID; top[i].pct = pct; top[i].start = start;
+                    break;
+                }
+        }
+        CloseHandle(h);
+    }
+    for (int i = 0; i < SM_THREADS; i++) if (!g_sm_thr[i].seen) g_sm_thr[i].tid = 0;
+    double helper = -1;
+    PROCESSENTRY32W pe = {sizeof pe};
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        if (pe.th32ParentProcessID != GetCurrentProcessId() || _wcsicmp(pe.szExeFile, L"helper64.exe")) continue;
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+        FILETIME a, b2, k, u;
+        if (h && GetProcessTimes(h, &a, &b2, &k, &u)) {
+            ULONG64 cpu = ((ULONG64)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((ULONG64)u.dwHighDateTime << 32 | u.dwLowDateTime);
+            if (g_sm_helper_cpu) helper = (double)(cpu - g_sm_helper_cpu) / 1e5 / secs;
+            g_sm_helper_cpu = cpu;
+        }
+        if (h) CloseHandle(h);
+    }
+    CloseHandle(snap);
+    char line[1400] = "";
+    int len = 0;
+    for (int i = 0; i < 12 && top[i].pct >= 2; i++) {
+        int m = sm_find(top[i].start);
+        len += snprintf(line + len, sizeof line - len, "%s %lu%s %s+0x%X %.0f%%", i ? "," : "", (unsigned long)top[i].tid,
+                        top[i].tid == g_main_tid ? " (main)" : "", m < g_sm_nmod ? g_sm_mod[m].name : "?",
+                        m < g_sm_nmod ? (unsigned)(top[i].start - g_sm_mod[m].lo) : (unsigned)top[i].start, top[i].pct);
+    }
+    log("  threads by CPU (%% of one CPU; thread id, start address): all %.0f%%;%s", total, line);
+    if (helper >= 0) log("  the add-on's helper64.exe: %.0f%% of one CPU", helper);
+}
+static void sm_report(void (*log)(const char *fmt, ...), unsigned total, double secs) {
+    char line[1400];
+    int len = 0;
+    unsigned used[16] = {0};
+    for (int t = 0; t < 14; t++) {   // modules, largest first
+        int best = -1;
+        for (int i = 0; i <= SM_MODS; i++) {
+            int taken = 0;
+            for (int j = 0; j < t; j++) taken |= used[j] == (unsigned)i + 1;
+            if (!taken && g_sm_cnt[i] && (best < 0 || g_sm_cnt[i] > g_sm_cnt[best])) best = i;
+        }
+        if (best < 0 || g_sm_cnt[best] * 200 < total) break;
+        used[t] = (unsigned)best + 1;
+        len += snprintf(line + len, sizeof line - len, "%s %s %.1f%%", t ? "," : "", best == SM_MODS ? "(no module)" : g_sm_mod[best].name,
+                        100.0 * g_sm_cnt[best] / total);
+    }
+    log("main-thread sampler: %u samples in %.0f s:%s", total, secs, line);
+    len = 0;
+    for (int t = 0; t < 16; t++) {   // where in which module, by the game call that led there
+        int best = -1;
+        for (int i = 0; i < 4096; i++) if (g_sm_pair[i].n && (best < 0 || g_sm_pair[i].n > g_sm_pair[best].n)) best = i;
+        if (best < 0 || g_sm_pair[best].n * 100 < total) break;
+        int m = g_sm_pair[best].mod;
+        len += snprintf(line + len, sizeof line - len, "%s %s via game +0x%X %.1f%%", t ? "," : "", m == SM_MODS ? "(no module)" : g_sm_mod[m].name,
+                        (unsigned)g_sm_pair[best].caller, 100.0 * g_sm_pair[best].n / total);
+        g_sm_pair[best].n = 0;
+    }
+    log("  main thread by the game call it came from:%s", line);
+    len = 0;
+    for (int t = 0; t < 12 && g_sm_self >= 0; t++) {   // inside our DLL: offsets for a symbol lookup in an unstripped build
+        int best = -1;
+        for (int i = 0; i < 1024; i++) if (g_sm_own[i].n && (best < 0 || g_sm_own[i].n > g_sm_own[best].n)) best = i;
+        if (best < 0) break;
+        len += snprintf(line + len, sizeof line - len, " +0x%X %.2f%%", (unsigned)g_sm_own[best].off, 100.0 * g_sm_own[best].n / total);
+        g_sm_own[best].n = 0;
+    }
+    if (len) log("  in dinput8.dll (16-byte steps):%s", line);
+    len = 0;
+    for (int t = 0; t < 10; t++) {   // samples inside Windows (waits, system calls), by the module that called into it
+        int best = -1;
+        for (int i = 0; i <= SM_MODS; i++) if (g_sm_waitby[i] && (best < 0 || g_sm_waitby[i] > g_sm_waitby[best])) best = i;
+        if (best < 0 || g_sm_waitby[best] * 200 < total) break;
+        len += snprintf(line + len, sizeof line - len, "%s %s %.1f%%", t ? "," : "", best == SM_MODS ? "(not found)" : g_sm_mod[best].name,
+                        100.0 * g_sm_waitby[best] / total);
+        g_sm_waitby[best] = 0;
+    }
+    if (len) log("  main thread inside Windows (waits, system calls), by the module that called:%s", line);
+    sm_threads(log, secs);
+    memset(g_sm_cnt, 0, sizeof g_sm_cnt);
+    memset(g_sm_waitby, 0, sizeof g_sm_waitby);
+    memset(g_sm_pair, 0, sizeof g_sm_pair);
+    memset(g_sm_own, 0, sizeof g_sm_own);
+}
+static wchar_t g_sm_flag[MAX_PATH];
+
+static void (*g_sm_log)(const char *fmt, ...);
+static DWORD WINAPI sampler_thread(void *arg) {
+    (void)arg;
+    HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, g_main_tid);
+    if (!th) return 0;
+    for (;;) {
+        if (GetFileAttributesW(g_sm_flag) == INVALID_FILE_ATTRIBUTES) { Sleep(1000); continue; }
+        timeBeginPeriod(1);
+        sm_modules();
+        g_sm_log("main-thread sampler on (sample_on.txt): the main thread's place every ~1 ms, shares every 30 s");
+        LARGE_INTEGER f, t0, t;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        unsigned total = 0, since_mod = 0;
+        for (int checks = 0;; checks++) {
+            if (checks % 1000 == 999 && GetFileAttributesW(g_sm_flag) == INVALID_FILE_ATTRIBUTES) break;
+            Sleep(1);
+            CONTEXT c = {.ContextFlags = CONTEXT_CONTROL};
+            DWORD eip = 0, caller = 0, nst = 0;
+            static DWORD st[512];   // the top of its stack, looked at after it runs again
+            if (SuspendThread(th) == (DWORD)-1) break;
+            if (GetThreadContext(th, &c)) {   // only reads while it is paused: it may hold the loader or heap lock
+                eip = c.Eip;
+                MEMORY_BASIC_INFORMATION mb;
+                if (VirtualQuery((void *)(UINT_PTR)c.Esp, &mb, sizeof mb) && mb.State == MEM_COMMIT) {
+                    const DWORD *sp = (const DWORD *)(UINT_PTR)c.Esp, *end = (const DWORD *)((const unsigned char *)mb.BaseAddress + mb.RegionSize);
+                    if (end - sp > 16384) end = sp + 16384;
+                    nst = (DWORD)(end - sp < 512 ? end - sp : 512);
+                    memcpy(st, sp, nst * 4);
+                    for (; sp < end && !caller; sp++) if (sm_is_return((const unsigned char *)(UINT_PTR)*sp)) caller = *sp;
+                    if (sm_is_return((const unsigned char *)(UINT_PTR)eip)) caller = 0;   // in game code itself: no call to show
+                }
+            }
+            ResumeThread(th);
+            if (!eip) continue;
+            int m = sm_find(eip);
+            if (m == SM_MODS && since_mod++ > 1000) { sm_modules(); m = sm_find(eip); since_mod = 0; }   // a DLL loaded since
+            g_sm_cnt[m]++;
+            total++;
+            if (sm_system(m)) {   // in Windows: the first return address into a module of its own
+                int who = SM_MODS;
+                for (DWORD i = 0; i < nst && who == SM_MODS; i++) {
+                    int k = sm_find(st[i]);
+                    if (k < g_sm_nmod && !sm_system(k) && sm_is_call_return(st[i], k)) who = k;
+                }
+                g_sm_waitby[who]++;
+            }
+            DWORD cv = caller ? caller - g_sm_empire : 0;
+            for (unsigned h = ((unsigned)m * 2654435761u ^ cv * 40503u) & 4095, k = 0; k < 4096; k++, h = (h + 1) & 4095)
+                if (!g_sm_pair[h].n || (g_sm_pair[h].mod == m && g_sm_pair[h].caller == cv)) { g_sm_pair[h].mod = m; g_sm_pair[h].caller = cv; g_sm_pair[h].n++; break; }
+            if (m == g_sm_self && g_sm_self >= 0) {
+                DWORD off = (eip - g_sm_mod[m].lo) & ~15u;
+                for (unsigned h = (off >> 4) & 1023, k = 0; k < 1024; k++, h = (h + 1) & 1023)
+                    if (!g_sm_own[h].n || g_sm_own[h].off == off) { g_sm_own[h].off = off; g_sm_own[h].n++; break; }
+            }
+            QueryPerformanceCounter(&t);
+            double secs = (double)(t.QuadPart - t0.QuadPart) / f.QuadPart;
+            if (secs >= 30) { sm_report(g_sm_log, total, secs); total = 0; t0 = t; }
+        }
+        timeEndPeriod(1);
+    }
+    return 0;
+}
+static void sampler_start(HMODULE empire, const wchar_t *dir, void (*log)(const char *fmt, ...)) {
+    if (wcslen(dir) + 20 >= MAX_PATH) return;
+    swprintf(g_sm_flag, MAX_PATH, L"%ls\\sample_on.txt", dir);
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const BYTE *)empire + ((const IMAGE_DOS_HEADER *)empire)->e_lfanew);
+    const IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++)
+        if (s->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            g_sm_text_lo = (unsigned char *)empire + s->VirtualAddress;
+            g_sm_text_hi = g_sm_text_lo + s->Misc.VirtualSize;
+            break;
+        }
+    g_sm_empire = (DWORD)(UINT_PTR)empire;
+    g_sm_log = log;
+    HANDLE h = CreateThread(NULL, 0, sampler_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...)) {
     g_main_tid = GetCurrentThreadId();
     MEMORY_BASIC_INFORMATION mb;
@@ -265,4 +530,5 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
 
     AddVectoredExceptionHandler(0, on_exception);  // last in the chain; it only logs
     log("crash logging on: exceptions are recorded here as EXCEPTION lines");
+    sampler_start(empire, dir, log);
 }

@@ -195,6 +195,16 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.5: fixes for the Upscaling and Framegen add-on. With it, the
+           game no longer slows down when the camera looks at many soldiers
+           at once (a dense battle clump at 4K: 75 -> 155 fps, 120 with
+           per-object motion on; 140 without the add-on). Some battle maps
+           (settlement battles at the end of loading or at the first camera
+           move) no longer crash with per-object motion on. Leaving a battle
+           can no longer hang the game: a stuck DLSS helper is closed and
+           DLSS turns off until the next start. The 4K UI mod's F10 menu
+           takes clicks again. Without the add-on 6.5 works exactly like 6.4.
+
 Version 6.4: fixes for the Upscaling and Framegen add-on. With it,
            switching between fullscreen and windowed in game, alt-tabbing
            while a battle loads and the end of a battle no longer crash

@@ -68,13 +68,19 @@ void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT 
 // campaign run (AGENT_LOG 100): after a battle the list was full of the battle's freed buffers, so every campaign buffer
 // went untracked -> 32 entries, and a full list gives the entry mapped longest ago to the new buffer
 #define M_MAPS 32
-typedef struct { ID3D11Resource *res; unsigned char *base; UINT size; const void **items; unsigned maps; unsigned long long last; } MMap;
+// A slot is trusted only if written this frame and since the buffer's last DISCARD map (gen). 6.4 players' crashes in
+// fgm_draw (+0x16915 / +0x16AE2 / +0x16AF4, settlement battles at the end of loading or the first camera move): a slot
+// the game did not refill through the copy hook kept an item pointer from an earlier frame, whose unit had been freed.
+typedef struct { const void *item; unsigned gen; LONG frame; } MSlot;
+static LONG m_frame = 1;   // the frame being built (fgm_frame_end counts it)
+typedef struct { ID3D11Resource *res; unsigned char *base; UINT size; MSlot *items; unsigned gen; } MMap;
 static MMap m_maps[M_MAPS];
+static unsigned long long m_map_last[M_MAPS];   // apart from m_maps: written at every Map, which the copy hook's threads read
 static CRITICAL_SECTION m_map_lock;
 static unsigned m_maps_full;
 static volatile LONG m_copies, m_copies_unmapped, m_copies_misaligned;
 
-void fgm_mapped(ID3D11Resource *r, const D3D11_MAPPED_SUBRESOURCE *m) {
+void fgm_mapped(ID3D11Resource *r, D3D11_MAP type, const D3D11_MAPPED_SUBRESOURCE *m) {
     if (!m_on || !m || !m->pData) return;
     D3D11_RESOURCE_DIMENSION dim;
     ID3D11Resource_GetType(r, &dim);
@@ -89,36 +95,46 @@ void fgm_mapped(ID3D11Resource *r, const D3D11_MAPPED_SUBRESOURCE *m) {
     if (k < 0) {   // full: the entry mapped longest ago
         m_maps_full++;
         k = 0;
-        for (int i = 1; i < M_MAPS; i++) if (m_maps[i].last < m_maps[k].last) k = i;
+        for (int i = 1; i < M_MAPS; i++) if (m_map_last[i] < m_map_last[k]) k = i;
         m_maps[k].base = NULL;   // the copy hook stops matching it before it changes
-        m_maps[k].maps = 0;
     }
     // a buffer of another size: a new table; the old one is kept (a copy on a worker may still be writing to it; rare)
     if (m_maps[k].items && m_maps[k].size != bd.ByteWidth) m_maps[k].items = NULL;
-    if (!m_maps[k].items) m_maps[k].items = calloc(bd.ByteWidth / 120 + 1, sizeof(void *));
-    m_maps[k].size = bd.ByteWidth;
-    m_maps[k].res = r;
-    m_maps[k].maps++;
-    m_maps[k].last = ++clock;
+    if (!m_maps[k].items) m_maps[k].items = calloc(bd.ByteWidth / 120 + 1, sizeof(MSlot));
+    if (type == D3D11_MAP_WRITE_DISCARD || m_maps[k].res != r) m_maps[k].gen++;   // the buffer's earlier contents are gone
+    if (m_maps[k].size != bd.ByteWidth) m_maps[k].size = bd.ByteWidth;   // stores only on a change: the copy hook's threads read these
+    if (m_maps[k].res != r) m_maps[k].res = r;
+    m_map_last[k] = ++clock;
     if (m_maps[k].items) m_maps[k].base = m->pData;   // last: the copy hook looks for base
     LeaveCriticalSection(&m_map_lock);
 }
 
+// The copy counters are per thread, added to the shared ones every 1024 copies: the game's job threads all run this (~30,000
+// calls per frame on a clump), and a locked increment of one shared counter per call was 5-7% of the main thread alone
+// (AGENT_LOG 109: the cache line bounced between the threads)
+static __thread LONG t_copies, t_misaligned, t_unmapped;
+static void count(volatile LONG *shared, LONG *mine) {
+    if (++*mine == 1024) { InterlockedExchangeAdd(shared, 1024); *mine = 0; }
+}
 // the game's record copy (FUN_117dab80's memcpy call at +0x17DABAF), any thread: only note the item
 void *__cdecl fgm_copy(void *dst, const void *src, size_t n) {
     memcpy(dst, src, n);
     if (!m_on || !m_enabled || n != 120) return dst;
-    InterlockedIncrement(&m_copies);
+    count(&m_copies, &t_copies);
     for (int i = 0; i < M_MAPS; i++) {
         MMap *m = &m_maps[i];
         if (m->base && (unsigned char *)dst >= m->base && (unsigned char *)dst + 120 <= m->base + m->size) {
             UINT off = (UINT)((unsigned char *)dst - m->base);   // records start anywhere (64% not at a multiple of 120)
-            if (off % 120) InterlockedIncrement(&m_copies_misaligned);
-            if (m->items) m->items[off / 120] = (const unsigned char *)src - 0x74;   // records never overlap: one slot each
+            if (off % 120) count(&m_copies_misaligned, &t_misaligned);
+            if (m->items) {   // records never overlap: one slot each
+                m->items[off / 120].item = (const unsigned char *)src - 0x74;
+                m->items[off / 120].gen = m->gen;
+                m->items[off / 120].frame = m_frame;
+            }
             return dst;
         }
     }
-    InterlockedIncrement(&m_copies_unmapped);
+    count(&m_copies_unmapped, &t_unmapped);
     return dst;
 }
 
@@ -135,7 +151,7 @@ typedef struct { float x, y, z; int bones, tex, next; float rec[13]; } MEnt;
 static MEnt *m_ent[2];        // [frame & 1] this frame's models, [(frame - 1) & 1] the previous frame's
 static int m_nent[2];
 static int *m_bucket;         // previous frame: first entry per cell hash
-static LONG m_frame = 1, m_grid_frame;
+static LONG m_grid_frame;
 
 static unsigned cell_hash(int x, int y, int z) { return ((unsigned)x * 73856093u ^ (unsigned)y * 19349663u ^ (unsigned)z * 83492791u) & (M_BUCKETS - 1); }
 static int cell(float v) { return (int)floorf(v / M_CELL); }
@@ -157,8 +173,8 @@ static const MEnt *nearest(LONG f, float x, float y, float z, int bones) {
     int cx = cell(x), cy = cell(y), cz = cell(z);
     for (int dx = -1; dx <= 1; dx++)
         for (int dy = -1; dy <= 1; dy++)
-            for (int dz = -1; dz <= 1; dz++)
-                for (int k = m_bucket[cell_hash(cx + dx, cy + dy, cz + dz)]; k >= 0; k = e[k].next) {
+            for (int dz = -1; dz <= 1; dz++)   // at most 16 per cell: models piled at one place (zeroed / NaN) would make it n^2
+                for (int k = m_bucket[cell_hash(cx + dx, cy + dy, cz + dz)], c = 0; k >= 0 && c < 16; k = e[k].next, c++) {
                     if (e[k].bones != bones) continue;
                     float ax = e[k].x - x, ay = e[k].y - y, az = e[k].z - z, d = ax * ax + ay * ay + az * az;
                     if (d < bd) { bd = d; best = &e[k]; }
@@ -235,7 +251,7 @@ static DWORD WINAPI worker(void *arg) {
     return 0;
 }
 
-static void verify_draw(ID3D11Buffer *vb1, UINT off, const void *const *items, UINT inst);   // check (below)
+static void verify_draw(ID3D11Buffer *vb1, UINT off, const MSlot *items, UINT inst);   // check (below)
 
 static void wait_worker(void) {
     for (int i = 0; m_done != m_queued; i++) if (i > 64) Sleep(0); else YieldProcessor();
@@ -255,17 +271,22 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
     ID3D11Buffer *vb[2] = {0};
     UINT st[2], of[2];
     ID3D11DeviceContext_IAGetVertexBuffers(c, 0, 2, vb, st, of);
-    const void **items = NULL;
+    const MSlot *items = NULL;
     UINT size = 0, off = of[1] + start_inst * 120;
-    for (int i = 0; i < M_MAPS; i++) if (vb[1] && m_maps[i].res == (ID3D11Resource *)vb[1]) { items = m_maps[i].items; size = m_maps[i].size; }
+    unsigned gen = 0;
+    for (int i = 0; i < M_MAPS; i++)
+        if (vb[1] && m_maps[i].res == (ID3D11Resource *)vb[1]) { items = m_maps[i].items; size = m_maps[i].size; gen = m_maps[i].gen; }
     ID3D11ShaderResourceView *anim = NULL;
     ID3D11DeviceContext_VSGetShaderResources(c, 0, 1, &anim);
     int ok = vb[0] && vb[1] && st[1] == 120 && items && off + inst * 120 <= size && anim;
     if (!ok) m_skip_other++;
     else if (off + inst * 120 > size) m_skip_range++;
-    for (UINT k = 0; ok && k < inst; k++) ok = items[off / 120 + k] != NULL;   // every record's item is known
+    for (UINT k = 0; ok && k < inst; k++) {   // every record's item, copied this frame into this fill of the buffer
+        const MSlot *sl = &items[off / 120 + k];
+        ok = sl->item && sl->gen == gen && sl->frame == m_frame;
+    }
     if (!ok && items && off + inst * 120 <= size) m_skip_item++;
-    int tex = ok ? *(const int *)((const unsigned char *)items[off / 120] + 0x5C) : -1;
+    int tex = ok ? *(const int *)((const unsigned char *)items[off / 120].item + 0x5C) : -1;
     if (ok && tex >= 0 && tex < M_TEX) {   // the texture of this index; a new one (another battle) starts without history
         ID3D11Resource *res = NULL;
         ID3D11ShaderResourceView_GetResource(anim, &res);
@@ -299,7 +320,7 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
     d->first = (UINT)m_queued;
     for (UINT k = 0; k < inst; k++) {   // what the worker needs, copied now: the slots may be refilled later this frame, and
         // the game may free its records before the worker gets to them (6.3.2: end of a battle, the worker read a freed pose)
-        const unsigned char *item = items[off / 120 + k], *pose = *(const unsigned char *const *)(item + 0x60);
+        const unsigned char *item = items[off / 120 + k].item, *pose = *(const unsigned char *const *)(item + 0x60);
         MItem *mi = &m_items[d->first + k];
         memcpy(mi->cur, item + 0x74, sizeof mi->cur);   // this frame's record, as the game copied it
         mi->tex = *(const int *)(item + 0x5C);
@@ -330,7 +351,7 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
 #define M_VERIFY_INST 64
 static struct { ID3D11Buffer *stg; UINT n; const void *items[M_VERIFY_INST]; float at_draw[M_VERIFY_INST][13], at_pass[M_VERIFY_INST][13]; } m_ver[M_VERIFY_DRAWS];
 static int m_verify_left, m_nver, m_verify_report;
-static void verify_draw(ID3D11Buffer *vb1, UINT off, const void *const *items, UINT inst) {
+static void verify_draw(ID3D11Buffer *vb1, UINT off, const MSlot *items, UINT inst) {
     if (m_verify_left <= 0 || m_nver >= M_VERIFY_DRAWS) return;
     m_verify_left--;
     UINT n = inst < M_VERIFY_INST ? inst : M_VERIFY_INST;
@@ -341,8 +362,8 @@ static void verify_draw(ID3D11Buffer *vb1, UINT off, const void *const *items, U
     ID3D11DeviceContext_CopySubresourceRegion(m_ctx, (ID3D11Resource *)stg, 0, 0, 0, 0, (ID3D11Resource *)vb1, 0, &box);
     m_ver[m_nver].stg = stg; m_ver[m_nver].n = n;
     for (UINT k = 0; k < n; k++) {
-        m_ver[m_nver].items[k] = items[k];
-        memcpy(m_ver[m_nver].at_draw[k], (const unsigned char *)items[k] + 0x74, 52);
+        m_ver[m_nver].items[k] = items[k].item;
+        memcpy(m_ver[m_nver].at_draw[k], (const unsigned char *)items[k].item + 0x74, 52);
     }
     m_nver++;
 }

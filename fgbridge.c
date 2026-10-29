@@ -62,6 +62,8 @@ static float g_jx, g_jy;      // this frame's jitter (render pixels, x right, y 
 static unsigned g_sr_frames, g_sr_timeouts;
 static double g_sr_wait_ms, g_sr_wait_max;
 static void (*g_log)(const char *fmt, ...);
+static DWORD WINAPI watchdog(void *arg);
+static volatile DWORD g_present_tid;   // the thread that presents (the game's main thread), for the watchdog
 
 int fgb_active(void) { return g_live && g_sh && !g_sh->error && WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT; }
 
@@ -205,6 +207,8 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     for (int i = 0; i < 10000 && !g_sh->helper_ok && !g_sh->error && WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT; i++) Sleep(1);
     if (!g_sh->helper_ok) { log("frame bridge: helper did not start Streamline - off (see its log)"); return 0; }
     g_live = 1;
+    HANDLE wd = CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
+    if (wd) CloseHandle(wd);
     if (fg_frames > g_sh->fg_max) {   // NVIDIA's rules for this GPU (the helper asked Streamline)
         log("frame bridge: frame generation %ux asked, this GPU allows %ux at most - using that", fg_frames + 1, g_sh->fg_max + 1);
         g_sh->fg_frames = g_sh->fg_max;
@@ -250,11 +254,77 @@ void fgb_jitter(float *jx, float *jy) {
 UINT fgb_render_w(void) { return g_rw; }
 UINT fgb_render_h(void) { return g_rh; }
 
+// GPU time per frame (AGENT_LOG 109: 120-135 fps without the add-on, ~75 with it, zoomed in on a clump of soldiers, with
+// per-object motion on or off): timestamps around the wait for the helper, the HUD-less step, the Present step and the
+// frame end, read back 6 frames later without waiting (not ready = counted as not read).
+enum { TQ_DIS, TQ_W0, TQ_W1, TQ_H1, TQ_P0, TQ_END, TQ_N };
+static ID3D11Query *g_tq[8][TQ_N];
+static int g_tq_set[8], g_tq_failed;
+static UINT64 g_tq_prev_end;
+static uint32_t g_tq_prev_f = (uint32_t)-2;
+static double g_gpu_ms[4];   // frame interval, stalled waiting for the helper, HUD-less step, Present step
+static unsigned g_gpu_n[4], g_gpu_lost;
+static unsigned g_wait_queued, g_wait_frames;   // wait_previous: GPU waits queued, frames
+
+static void tq(int k) {
+    unsigned s = g_n % 8;
+    if (g_tq_failed) return;
+    if (!g_tq[s][k]) {
+        D3D11_QUERY_DESC d = {k == TQ_DIS ? D3D11_QUERY_TIMESTAMP_DISJOINT : D3D11_QUERY_TIMESTAMP, 0};
+        if (FAILED(ID3D11Device_CreateQuery(g_dev, &d, &g_tq[s][k]))) { g_tq_failed = 1; return; }
+    }
+    if (k == TQ_DIS) { ID3D11DeviceContext_Begin(g_ctx, (ID3D11Asynchronous *)g_tq[s][k]); g_tq_set[s] = 0; }
+    else ID3D11DeviceContext_End(g_ctx, (ID3D11Asynchronous *)g_tq[s][k]);
+    g_tq_set[s] |= 1 << k;
+}
+
+static void tq_read(uint32_t f) {
+    unsigned s = f % 8;
+    int set = g_tq_set[s];
+    g_tq_set[s] = 0;
+    if ((set & 1 << TQ_DIS) == 0 || (set & 1 << TQ_END) == 0) return;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+    UINT64 t[TQ_N] = {0};
+    int ok = ID3D11DeviceContext_GetData(g_ctx, (ID3D11Asynchronous *)g_tq[s][TQ_DIS], &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+             !dj.Disjoint && dj.Frequency;
+    for (int k = 1; k < TQ_N && ok; k++)
+        if (set & 1 << k) ok = ID3D11DeviceContext_GetData(g_ctx, (ID3D11Asynchronous *)g_tq[s][k], &t[k], 8, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+    if (!ok) { g_gpu_lost++; return; }
+    double ms = 1000.0 / (double)dj.Frequency;
+    if (g_tq_prev_f == f - 1) { g_gpu_ms[0] += (double)(t[TQ_END] - g_tq_prev_end) * ms; g_gpu_n[0]++; }
+    g_tq_prev_end = t[TQ_END];
+    g_tq_prev_f = f;
+    if ((set & 3 << TQ_W0) == 3 << TQ_W0) { g_gpu_ms[1] += (double)(t[TQ_W1] - t[TQ_W0]) * ms; g_gpu_n[1]++; }
+    if (set & 1 << TQ_H1) { g_gpu_ms[2] += (double)(t[TQ_H1] - t[TQ_W1]) * ms; g_gpu_n[2]++; }
+    if (set & 1 << TQ_P0) { g_gpu_ms[3] += (double)(t[TQ_END] - t[TQ_P0]) * ms; g_gpu_n[3]++; }
+}
+
+// per frame averages since the last call: GPU frame interval, stall on the helper, HUD-less step, Present step (ms)
+void fgb_gpu_stats(double ms[4], unsigned *frames, unsigned *lost) {
+    for (int i = 0; i < 4; i++) { ms[i] = g_gpu_n[i] ? g_gpu_ms[i] / g_gpu_n[i] : 0; g_gpu_ms[i] = 0; }
+    *frames = g_gpu_n[0]; *lost = g_gpu_lost;
+    memset(g_gpu_n, 0, sizeof g_gpu_n); g_gpu_lost = 0;
+}
+void fgb_wait_stats(unsigned *queued, unsigned *frames) {   // GPU waits for the helper queued / frames (wait_previous)
+    *queued = g_wait_queued; *frames = g_wait_frames;
+    g_wait_queued = g_wait_frames = 0;
+}
+
 // the GPU must not overwrite the shared textures before the helper has copied the previous frame (fence 2n)
+// AGENT_LOG 109: with a Wait in the game's queue every frame, the game ran ~75 fps where it ran 120-135 without the
+// add-on, its main thread blocked in D3D11 calls 3x as long, and the GPU was half idle: the driver holds the game's
+// commands behind the Wait. Usually the helper has read the frame long before: the Wait is only queued when it has not.
 static void wait_previous(void) {
     if (g_waited) return;
     g_waited = 1;
-    if (g_n) ID3D11DeviceContext4_Wait(g_ctx4, g_fdone, g_n);   // the helper has read frame n-1
+    tq(TQ_DIS);
+    if (!g_n) return;
+    g_wait_frames++;
+    if (ID3D11Fence_GetCompletedValue(g_fdone) >= g_n) { tq(TQ_W1); return; }   // the helper has read frame n-1 already
+    g_wait_queued++;
+    tq(TQ_W0);
+    ID3D11DeviceContext4_Wait(g_ctx4, g_fdone, g_n);
+    tq(TQ_W1);
 }
 
 // main-thread time of the bridge per frame (AGENT_LOG 102: the game ran at 40 fps with the bridge vs 110 without)
@@ -277,6 +347,7 @@ void fgb_hudless(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float 
     LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
     fgb_hudless_(backbuffer, depth, vp);
+    if (g_tq_set[g_n % 8] & 1 << TQ_W1) tq(TQ_H1);
     g_hud_ms += ms_since(t0);
 }
 static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]) {
@@ -478,11 +549,16 @@ void fgb_sr_stats(unsigned *frames, unsigned *timeouts, double *wait_avg_ms, dou
 
 void fgb_present(ID3D11Resource *backbuffer) {
     if (!fgb_active()) return;
+    g_present_tid = GetCurrentThreadId();
     LARGE_INTEGER t0, tp;
     QueryPerformanceCounter(&t0);
     wait_previous();
+    tq(TQ_P0);
     if (!g_hud_done) ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_hud, backbuffer);   // no HUD-less point this frame
     ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_final, backbuffer);
+    tq(TQ_END);
+    if (!g_tq_failed && g_tq[g_n % 8][TQ_DIS]) ID3D11DeviceContext_End(g_ctx, (ID3D11Asynchronous *)g_tq[g_n % 8][TQ_DIS]);
+    if (g_n >= 6) tq_read(g_n - 6);
     ID3D11DeviceContext4_Signal(g_ctx4, g_fence, 2ull * g_n + 2);
     ID3D11DeviceContext_Flush(g_ctx);
     g_sh->reset = !g_hud_done;
@@ -533,6 +609,72 @@ static void release_gpu_waits(void) {
     if (ad) IDXGIAdapter_Release(ad);
     if (xd) IDXGIDevice_Release(xd);
     g_log("frame bridge: %d of 2 helper fences released for the game's GPU", n);
+}
+
+// ---- Watchdog (AGENT_LOG 108: the game froze leaving a battle, Windows closed it as not responding). A helper that stops
+// finishing frames leaves the game's GPU waiting for it for good (wait_previous), and the game's next Present then blocks:
+// nothing on the main thread can notice. This thread does: a frame handed over and nothing finished for 3 s -> the
+// helper is stopped and its fences released, the game's GPU goes on, and its next Present finds the helper gone (bridge
+// off, fallback). It logs where the main thread is then, and once per stall when the game stops presenting for 5 s.
+static void log_thread_stack(DWORD tid, const char *what) {
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tid);
+    if (!t) return;
+    static unsigned stack[4096];
+    unsigned n = 0, eip = 0;
+    CONTEXT c = {.ContextFlags = CONTEXT_CONTROL};
+    // only a copy while it is suspended: it may hold the loader or heap lock (module lookups and logging come after)
+    if (SuspendThread(t) != (DWORD)-1) {
+        MEMORY_BASIC_INFORMATION mb;
+        if (GetThreadContext(t, &c) && VirtualQuery((void *)(UINT_PTR)c.Esp, &mb, sizeof mb) && mb.State == MEM_COMMIT) {
+            UINT_PTR end = (UINT_PTR)mb.BaseAddress + mb.RegionSize;
+            n = (unsigned)((end - c.Esp) / 4 < 4096 ? (end - c.Esp) / 4 : 4096);
+            memcpy(stack, (void *)(UINT_PTR)c.Esp, n * 4);
+            eip = c.Eip;
+        }
+        ResumeThread(t);
+    }
+    CloseHandle(t);
+    char out[1200];
+    int len = 0, found = 0;
+    out[0] = 0;
+    for (unsigned i = 0; i <= n && found < 24 && len < (int)sizeof out - 80; i++) {
+        unsigned v = i ? stack[i - 1] : eip;   // first where it is, then module pointers on its stack (likely return addresses)
+        HMODULE m = NULL;
+        char name[MAX_PATH];
+        if (v < 0x10000 || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                               (LPCSTR)(UINT_PTR)v, &m) || !GetModuleFileNameA(m, name, MAX_PATH))
+            continue;
+        const char *b = strrchr(name, '\\');
+        len += snprintf(out + len, sizeof out - len, " %s+0x%X", b ? b + 1 : name, v - (unsigned)(UINT_PTR)m);
+        found++;
+    }
+    g_log("frame bridge watchdog: %s; main thread at%s", what, n ? out : " ? (no context)");
+}
+static DWORD WINAPI watchdog(void *arg) {
+    (void)arg;
+    uint32_t done0 = 0, n0 = 0;
+    int stuck = 0, still = 0;
+    while (g_live && WaitForSingleObject(g_helper, 250) == WAIT_TIMEOUT) {   // every 250 ms while the helper runs
+        uint32_t f = __atomic_load_n(&g_sh->frames, __ATOMIC_ACQUIRE), d = __atomic_load_n(&g_sh->done, __ATOMIC_ACQUIRE);
+        uint32_t n = __atomic_load_n(&g_n, __ATOMIC_RELAXED);
+        if (f == FGB_QUIT) break;
+        stuck = f > d && d == done0 ? stuck + 1 : 0;   // counted in samples: a sleep / resume of the PC is one sample
+        still = n == n0 ? still + 1 : 0;
+        done0 = d; n0 = n;
+        if (still == 20 && g_present_tid) log_thread_stack(g_present_tid, "the game has not presented for 5 s");
+        if (stuck == 12) {
+            char what[160];
+            snprintf(what, sizeof what, "the helper has finished nothing for 3 s (frames handed over %u, finished %u, DLSS SR %u/%u) - helper stopped, DLSS off",
+                     f, d, g_sh->sr_frames, g_sh->sr_done);
+            TerminateProcess(g_helper, 1);
+            WaitForSingleObject(g_helper, 1000);
+            if (g_present_tid) log_thread_stack(g_present_tid, what);   // where it waits, before it can go on
+            else g_log("frame bridge watchdog: %s", what);
+            release_gpu_waits();   // the game's GPU goes on; it may have been all that held the main thread
+            break;
+        }
+    }
+    return 0;
 }
 
 void fgb_stop(void) {
@@ -609,6 +751,10 @@ void *fgb_unhooked(void *fn) {
 }
 
 void fgb_test_kill_helper(void) { if (g_helper) TerminateProcess(g_helper, 1); }   // bridgetest killhelper
+void fgb_test_freeze_helper(void) {   // bridgetest freezehelper: alive but finishing nothing (the 2026-10-28 hang)
+    LONG(NTAPI *suspend)(HANDLE) = (LONG(NTAPI *)(HANDLE))(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSuspendProcess");
+    if (g_helper && suspend) suspend(g_helper);
+}
 
 // ---- After the bridge, while the game's swapchain sits on a hidden window (the helper died, the back buffer changed
 // size, or a new swapchain after a settings change): each frame is copied into a swapchain of our own, so the game does
