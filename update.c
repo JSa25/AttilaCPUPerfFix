@@ -137,6 +137,13 @@ void update_check(HMODULE self, void (*log)(const char *fmt, ...)) {
     // Windows reports the name as the game imports it ("DINPUT8.dll"); the update would be saved under that casing
     wchar_t *fn = wcsrchr(me, L'\\');
     if (!fn || fn + 12 >= me + MAX_PATH) return;
+    // update_off.txt in the game folder: nothing is taken from the Workshop (a dev or other build installed by hand
+    // stays, whatever version the Workshop copies have)
+    wcscpy(fn + 1, L"update_off.txt");
+    if (GetFileAttributesW(me) != INVALID_FILE_ATTRIBUTES) {
+        log("update: update_off.txt found - no updates from the Steam Workshop (this DLL and the add-on stay as installed)");
+        return;
+    }
     wcscpy(fn + 1, L"dinput8.dll");
     wcscpy(ws, me);
     for (int up = 0; up < 3; up++) {  // strip dinput8.dll, <game>, common

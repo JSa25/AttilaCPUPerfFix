@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <intrin.h>
+#include "fgb_motion_api.h"
 
 extern unsigned g_pt_base;
 extern DWORD g_pt_main;
@@ -58,8 +59,11 @@ static void jit_frame_start(void), jit_frame_end(void);   // DLAA viewport jitte
 // per-object motion (fgmotion.c, AGENT_LOG 99): fgbridge_on.txt line 4 contains "motion"
 static int g_motion;              // the motion pass is set up (bridge mode); on / off: g_motion_on and the F11 panel
 static int g_motion_on;
+static int g_copy_patched;         // the game's instance record copy calls fgm_copy (stays patched for the session)
 // the F11 panel (fgpanel.c)
-typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); } FgpApply;
+typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*cap)(int choice); } FgpApply;
+void fgp_set_cap(int choice, unsigned fps);
+void fgb_set_frame_limit(unsigned us);
 int fgp_init(ID3D11Device *, ID3D11DeviceContext *, UINT bw, UINT bh, DXGI_FORMAT fmt, int sr, int fg, int motion, FgpApply apply);
 void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd);
 void fgp_set_fps(double game, double shown);
@@ -76,6 +80,9 @@ static int g_sr;                 // DLAA (defined with the jitter below)
 static void jit_install(void);
 void fgb_set_motion(void (*pass)(ID3D11Resource *depth, float jx, float jy));
 ID3D11Texture2D *fgb_mv_texture(void);
+int fgb_make_vectors(ID3D11Resource *depth, const float vp[16]);
+static ID3D11Resource *g_main_depth;   // the scene's depth buffer, seen at the HUD-less point
+static unsigned g_mvx_calls, g_mvx_frames, g_mvx_none, g_mvx_last = ~0u;   // fgb_motion_vectors(): other mods' calls
 int fgm_init(ID3D11Device *, ID3D11DeviceContext *, ID3D11Texture2D *mv, UINT w, UINT h, void (*log)(const char *fmt, ...));
 void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT n, unsigned long long sig);
 void fgm_mapped(ID3D11Resource *r, D3D11_MAP type, const D3D11_MAPPED_SUBRESOURCE *m);
@@ -264,6 +271,11 @@ __attribute__((force_align_arg_pointer)) static void bp_enter(unsigned id, const
         ID3D11Resource *depth = NULL, *bb = backbuffer();
         ID3D11DeviceContext_OMGetRenderTargets(g_ctx, 0, NULL, &dsv);
         if (dsv) { ID3D11DepthStencilView_GetResource(dsv, &depth); ID3D11DepthStencilView_Release(dsv); }
+        if (depth && depth != g_main_depth) {   // for fgb_motion_vectors(), called before this point in later frames
+            if (g_main_depth) ID3D11Resource_Release(g_main_depth);
+            g_main_depth = depth;
+            ID3D11Resource_AddRef(depth);
+        }
         if (!depth) g_br_nodepth++;
         else if (g_vp_frame != g_frame) g_br_novp++;
         else if (bb) {
@@ -1286,6 +1298,10 @@ static void sr_set(int mode) {
 // the add-on's settings.txt: one key=value per line, written back whenever the F11 panel changes something
 static const char *const SR_KEYS[6] = {"off", "dlaa", "quality", "balanced", "performance", "ultra_performance"};
 static const char *const FG_KEYS[4] = {"off", "2x", "3x", "4x"};
+// the frame cap: off, auto (default), or a fixed rendered-frame cap
+static const char *const CAP_KEYS[5] = {"off", "auto", "60", "90", "120"};
+static const unsigned CAP_FPS[5] = {0, 0, 60, 90, 120};
+static int g_fcap = 1;
 static void settings_save(void) {
     if (!g_settings[0]) return;
     FILE *f = _wfopen(g_settings, L"w");
@@ -1294,9 +1310,12 @@ static void settings_save(void) {
                "# super_resolution: off, dlaa, quality, balanced, performance, ultra_performance\n"
                "# frame_generation: off, 2x, 3x, 4x (limited to what your GPU allows)\n"
                "# motion_vectors: camera_only, per_object (cleaner frame generation on moving units, costs fps in big battles)\n"
+               "# frame_cap: off, auto, 60, 90, 120 (rendered frames; auto: the screen's refresh rate / the frames shown per\n"
+               "#            rendered frame with frame generation on, e.g. 120 at 2x on a 240 Hz screen)\n"
                "# addon: on, off (off: the add-on does nothing at all from the next game start; set on again to use it)\n"
-               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\naddon=on\nversion=2\n",
-            SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 1], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only");
+               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\naddon=on\nversion=2\n",
+            SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 1], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only",
+            CAP_KEYS[g_fcap >= 0 && g_fcap < 5 ? g_fcap : 1]);
     fclose(f);
 }
 static int settings_value(const char *text, const char *key, const char *const *names, int n, int fallback) {
@@ -1314,10 +1333,42 @@ static void panel_sr(int mode) {
     g_log("F11 panel: super resolution %s, render %ux%u", names[mode >= 0 && mode < 6 ? mode : 0], g_rw, g_rh);
     settings_save();
 }
+// The frame cap on rendered frames, through NVIDIA Reflex's limiter in the helper (from Rome 2's add-on). Auto (the
+// default): with frame generation on, the screen's refresh rate / the frames shown per rendered frame (240 Hz, 2x: 120
+// rendered, 240 shown), so every rendered frame gets its generated frames instead of the helper dropping them past the
+// screen's rate (Rome 2: 166 rendered fps at 2x showed 1.29 frames per present, capped 121 showed 2.00); no cap without
+// frame generation. Reflex counts shown frames.
+static unsigned g_refresh;   // the game window's screen, Hz (0 unknown: Auto does nothing)
+static unsigned g_cap_fps;   // the rendered-frame cap in effect (0 none)
+static unsigned refresh_hz(HWND w) {
+    MONITORINFOEXW mi;
+    DEVMODEW dm;
+    memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
+    memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
+    HMONITOR m = MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
+    if (!m || !GetMonitorInfoW(m, (MONITORINFO *)&mi) || !EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) return 0;
+    return dm.dmDisplayFrequency > 1 ? dm.dmDisplayFrequency : 0;   // 0 / 1: "the hardware's default"
+}
+static void cap_apply(void) {
+    unsigned per = g_fg + 1;
+    g_cap_fps = g_fcap == 1 ? (g_fg && g_refresh ? g_refresh / per : 0) : CAP_FPS[g_fcap];
+    // microseconds per shown frame, rounded up: never above the screen's rate (4167 us = 239.98 fps at 240 Hz)
+    fgb_set_frame_limit(g_cap_fps ? (1000000 + g_cap_fps * per - 1) / (g_cap_fps * per) : 0);
+    fgp_set_cap(g_fcap, g_cap_fps);
+    if (g_cap_fps) g_log("frame cap %s: %u rendered fps, %u shown (screen %u Hz, frame generation %ux)", CAP_KEYS[g_fcap], g_cap_fps,
+                         g_cap_fps * per, g_refresh, per);
+    else g_log("frame cap %s: none%s", CAP_KEYS[g_fcap], g_fcap == 1 ? (g_refresh ? " (frame generation off)" : " (screen rate unknown)") : "");
+}
+static void panel_cap(int choice) {
+    g_fcap = choice >= 0 && choice < 5 ? choice : 1;
+    cap_apply();
+    settings_save();
+}
 static void panel_fg(int n) {
     g_fg = (unsigned)n;
     fgb_set_fg((unsigned)n);
     g_log("F11 panel: frame generation %s", n ? (n == 1 ? "2x" : n == 2 ? "3x" : "4x") : "off");
+    cap_apply();   // Auto and the fixed caps depend on the frames shown per rendered frame
     settings_save();
 }
 static void panel_motion(int on) {
@@ -1402,6 +1453,8 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             }
             g_out_hwnd = d->OutputWindow;
             if (g_fg > fgb_fg_max()) g_fg = fgb_fg_max();   // NVIDIA's rules for this GPU (fgb_start logged it)
+            g_refresh = refresh_hz(d->OutputWindow);   // the frame cap's Auto (the screen the game window is on)
+            cap_apply();
             sr_set(g_sr);
             jit_install();   // passes viewports through unless DLAA is on (F11 panel)
             int no_fg = g_motion && !fgb_fg_max();
@@ -1422,11 +1475,12 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
                     VirtualProtect(call, 5, prot, &prot);
                     FlushInstructionCache(GetCurrentProcess(), call, 5);
                     fgb_set_motion(fgm_pass);
+                    g_copy_patched = 1;
                     fgm_set_enabled(g_motion_on);
                     mp_hook(NULL);
                 } else g_motion = 0;
             }
-            FgpApply ap = {panel_sr, panel_fg, panel_motion};
+            FgpApply ap = {panel_sr, panel_fg, panel_motion, panel_cap};
             if (!fgp_init(g_dev, g_ctx, g_live_w, g_live_h, d->BufferDesc.Format, g_sr, (int)g_fg, g_motion ? g_motion_on : no_fg ? -2 : -1, ap))
                 g_log("frame bridge: F11 panel not available (back buffer format %u)", d->BufferDesc.Format);
         }
@@ -1539,6 +1593,30 @@ static void hook_owners(void (*log)(const char *fmt, ...)) {
     log("  D3D11 context slots the add-on hooks, who is first in each now:%s", line);
 }
 
+// For other mods (fgb_motion_api.h; a UI / effects mod's temporal effects, so players do not pay for a second
+// per-object pass): this frame's motion vectors, made at the first call. NULL when the bridge is not running, this
+// frame has no 3D scene camera yet, or it is a native-size frame while DLSS SR is on (no vectors made for it).
+ID3D11Texture2D *__cdecl fgb_motion_vectors(FgbMotionInfo *info) {
+    if (!info || info->size < sizeof *info) return NULL;
+    info->version = FGB_MOTION_API_VERSION;
+    info->copy_hook = g_copy_patched;
+    if (GetCurrentThreadId() != g_pt_main) return NULL;
+    g_mvx_calls++;
+    if (g_mvx_last != g_frame) { g_mvx_last = g_frame; g_mvx_frames++; }
+    ID3D11Texture2D *t = fgb_mv_texture();
+    if (g_live_state != 1 || !fgb_active() || !g_main_depth || !t || g_vp_frame != g_frame || (g_sr && !g_frame_scaled) ||
+        !fgb_make_vectors(g_main_depth, g_vp)) { g_mvx_none++; return NULL; }
+    D3D11_TEXTURE2D_DESC d;
+    ID3D11Texture2D_GetDesc(t, &d);
+    info->frame = fgb_frames();
+    info->per_object = g_motion && g_motion_on;   // the player's choice in the F11 panel decides, for both mods
+    info->render_w = g_sr ? g_rw : d.Width; info->render_h = g_sr ? g_rh : d.Height;
+    info->tex_w = d.Width; info->tex_h = d.Height;
+    info->jitter_x = g_sr ? g_jx : 0; info->jitter_y = g_sr ? g_jy : 0;
+    ID3D11Texture2D_AddRef(t);
+    return t;
+}
+
 static void bp_report(void (*log)(const char *fmt, ...)) {
     log("bridge probe: %u presents (%u not on the main thread), sync interval 0/1/2/3/more: %u/%u/%u/%u/%u, captures %d%s",
         g_presents, g_present_other_thread, g_sync[0], g_sync[1], g_sync[2], g_sync[3], g_sync[4], g_captures,
@@ -1613,6 +1691,10 @@ static void bp_report(void (*log)(const char *fmt, ...)) {
         g_cam_calls = 0;
     }
     if (g_motion) fgm_report(log);
+    if (g_mvx_calls) {
+        log("  motion vectors for other mods: asked in %u frames (%u calls), none given %u times", g_mvx_frames, g_mvx_calls, g_mvx_none);
+        g_mvx_frames = g_mvx_calls = g_mvx_none = 0;
+    }
     for (int i = 0; i < 8 && g_callers[i].n; i++) {
         HMODULE mod = NULL;
         char name[MAX_PATH] = "?";
@@ -1715,12 +1797,13 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         g_motion_on = settings_value(text, "motion_vectors=", MV_KEYS, 2, 0);  // default camera only
         // per_object was the default before version=2 and every first start saved it, so those files are reset once
         // (players' reports: half the fps in big battles on 6-core CPUs; it mostly helps frame generation)
+        g_fcap = settings_value(text, "frame_cap=", CAP_KEYS, 5, 1);   // default auto
         int reset = sf && !strstr(text, "version=2") && g_motion_on;
         if (reset) g_motion_on = 0;
         g_live = 1;
         g_motion = 1;
-        log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s (%ls)", SR_KEYS[g_sr], FG_KEYS[g_fg],
-            MV_KEYS[g_motion_on], !sf ? L"defaults" : reset ? L"settings.txt; per_object was the old default, now camera_only" : L"settings.txt");
+        log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s (%ls)", SR_KEYS[g_sr],
+            FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], !sf ? L"defaults" : reset ? L"settings.txt; per_object was the old default, now camera_only" : L"settings.txt");
         if (!sf || reset) settings_save();
         g_dev_di8_created = fgp_di8_created;
     }

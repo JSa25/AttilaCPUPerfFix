@@ -41,6 +41,7 @@ with its 64-bit helper, is in the game folder. The helper's source is in its own
 | `fgbridge.c`, `fgb_proto.h` | Upscaling add-on: shares the frame's image, depth and motion vectors with the 64-bit helper (textures, fences and a small shared block, by name), starts the helper, puts the upscaled image back before the interface is drawn, and hands the finished frame over at Present. NVIDIA GPUs only |
 | `fgmotion.c`, `motionvs.h` | Upscaling add-on: motion vectors for soldiers, horses and campaign armies (the game's skinning repeated for this frame and the previous one) |
 | `fgpanel.c` | Upscaling add-on: the F11 settings panel |
+| `fgb_motion_api.h` | Upscaling add-on: `fgb_motion_vectors`, exported for other mods - this frame's motion vectors on the game's D3D11 device (the struct and what the values mean) |
 | `passtime.c`, `gputime.c` | Upscaling add-on: the hook on the render stage driver the bridge runs on, and the hook on the game's `GetProcAddress` import (D3D11 device and DXGI factory) |
 
 Every patch first compares the game's bytes at its address with what it expects, and skips itself

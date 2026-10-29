@@ -8,7 +8,13 @@
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
 
 static int g_logged;
-static void say(const char *fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); g_logged++; }
+static char g_last[256];
+static void say(const char *fmt, ...) {
+    va_list a;
+    va_start(a, fmt); vsnprintf(g_last, sizeof g_last, fmt, a); va_end(a);
+    puts(g_last);
+    g_logged++;
+}
 
 static wchar_t g_dir[MAX_PATH], g_self[MAX_PATH], g_ws[MAX_PATH];
 
@@ -120,6 +126,16 @@ int main(void) {
     CHECK(addon_update_from(gfb, wfb, say) == 0);   // Workshop copy without version.txt (the packages before it)
     CHECK(!strcmp(READ(mine), "my settings"));      // settings.txt is not in the package: kept
 #undef READ
+
+    // update_off.txt next to the module (this test's folder stands in for the game folder): nothing else is looked at
+    wchar_t off[MAX_PATH];
+    GetModuleFileNameW(NULL, off, MAX_PATH);
+    wcscpy(wcsrchr(off, L'\\') + 1, L"update_off.txt");
+    make(off, 0, "");
+    g_last[0] = 0;
+    update_check(NULL, say);
+    DeleteFileW(off);
+    CHECK(strstr(g_last, "update_off.txt found") != NULL);
 
     // The real binary carries its own marker (also checks the bare prefix in it is skipped).
     wchar_t me[MAX_PATH];

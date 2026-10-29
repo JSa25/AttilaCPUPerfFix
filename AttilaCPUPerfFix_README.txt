@@ -150,6 +150,8 @@ fix (useful if you suspect one of them):
   fileio_off.txt       loading: buffered save reads
   texfix_off.txt       battle loading: texture compressor
   uikeep_off.txt       menus: keep menu pictures loaded
+  update_off.txt       no automatic updates from the Steam Workshop (the mod and
+                       the add-on stay as you installed them)
 
 The STATUS lines in heapfix.log show which fixes are on, and why one is off.
 
@@ -195,6 +197,17 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.6: for the Upscaling and Framegen add-on. A frame cap in the F11
+           panel (Off / Auto / 60 / 90 / 120 rendered fps). Auto, the default,
+           only acts with frame generation on: it holds the game at the
+           screen's refresh rate divided by the frames shown per rendered
+           frame (120 rendered, 240 shown on a 240 Hz screen at 2x), so every
+           rendered frame gets its generated frames shown. Other mods can use
+           the add-on's motion vectors instead of making their own (one pass
+           for both). New switch update_off.txt: no automatic updates from
+           the Steam Workshop. Without the add-on 6.6 works exactly like
+           6.5.2.
+
 Version 6.5.2: changes for the Upscaling and Framegen add-on. The add-on
            now updates itself: when Steam updates it, this mod copies the
            new files into the game folder at the next start, so its

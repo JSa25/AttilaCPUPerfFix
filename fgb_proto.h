@@ -32,7 +32,10 @@ typedef struct {
     volatile uint32_t fg_max;      /* helper, before helper_ok: generated frames this GPU allows (NVIDIA's rules, from
                                       Streamline: 0 = no frame generation (RTX 20 / 30), 1 = 2x (RTX 40), 3 = up to 4x) */
     uint32_t fg_test_limit;        /* game, dev test only: 0 = none, else the GPU is treated as allowing limit - 1 */
-    uint32_t pad1[9];
+    volatile uint32_t frame_limit_us;   /* game: NVIDIA Reflex frame limit in microseconds per frame as Reflex counts
+                                           them (shown frames, generated ones included); 0 = none. Was padding: a game
+                                           side that does not know it leaves it 0 */
+    uint32_t pad1[8];
     float vp[16], prev_vp[16];     /* game: view-projection of frame n and n-1 (row-major, clip = M x [x y z 1]) */
 } FgbShared;
 _Static_assert(sizeof(FgbShared) == 256, "bridge block layout");

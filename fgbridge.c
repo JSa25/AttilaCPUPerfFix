@@ -226,6 +226,7 @@ unsigned fgb_fg_max(void) { return g_sh ? g_sh->fg_max : 0; }   // generated fra
 static void (*g_motion_pass)(ID3D11Resource *depth, float jx, float jy);
 void fgb_set_motion(void (*pass)(ID3D11Resource *depth, float jx, float jy)) { g_motion_pass = pass; }
 ID3D11Texture2D *fgb_mv_texture(void) { return g_mv; }
+void fgb_set_frame_limit(uint32_t us) { if (g_sh) g_sh->frame_limit_us = us; }   // NVIDIA Reflex frame limit (0 none)
 unsigned fgb_shown(void) { return g_sh ? g_sh->shown : 0; }   // frames the helper has shown (generated ones included)
 
 // DLSS SR on / off and the render size (<= the output size; equal = DLAA). Takes effect from the next frame.
@@ -350,15 +351,18 @@ void fgb_hudless(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float 
     if (g_tq_set[g_n % 8] & 1 << TQ_W1) tq(TQ_H1);
     g_hud_ms += ms_since(t0);
 }
-static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]) {
-    if (!fgb_active()) return;
+// This frame's depth copy for DLSS and motion vectors (camera, then the per-object pass): once per frame, at the first
+// call - fgb_motion_vectors() (another mod's early effects, right after the scene's geometry) or the HUD-less point.
+// Returns 1 if they are made. Before writing, the GPU waits until the helper has read the previous frame's.
+static unsigned g_mv_frame = ~0u;
+int fgb_make_vectors(ID3D11Resource *depth, const float vp[16]) {
+    if (!fgb_active()) return 0;
+    if (g_mv_frame == g_n) return 1;
     wait_previous();
     int sr = g_sr;
     UINT rw = sr ? g_rw : g_w, rh = sr ? g_rh : g_h;
     float jx = sr ? g_jx : 0, jy = sr ? g_jy : 0;
-    D3D11_BOX box = {0, 0, 0, rw, rh, 1};
-    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)g_hud, 0, 0, 0, 0, backbuffer, 0, &box);
-    // depth: own copy (the game's depth is bound as the depth target right now), read as R24 by the compute pass
+    // depth: own copy (the game's depth may be bound as the depth target right now), read as R24 by the compute pass
     D3D11_TEXTURE2D_DESC dd;
     ID3D11Texture2D_GetDesc((ID3D11Texture2D *)depth, &dd);
     if (!g_dcopy || dd.Width != g_dw || dd.Height != g_dh) {
@@ -371,15 +375,15 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
         if (dd.Format != DXGI_FORMAT_R24G8_TYPELESS || FAILED(ID3D11Device_CreateTexture2D(g_dev, &dd, NULL, &g_dcopy)) ||
             FAILED(ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)g_dcopy, &sd, &g_dcopy_srv))) {
             g_log("frame bridge: depth format %u not supported - no motion vectors", dd.Format);
-            return;
+            return 0;
         }
         g_dw = dd.Width; g_dh = dd.Height;
     }
     ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_dcopy, depth);
     float inv[16];
-    if (!inverse4(vp, inv)) return;
+    if (!inverse4(vp, inv)) return 0;
     D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    if (FAILED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
     float *c = m.pData;
     memcpy(c, inv, 64);
     memcpy(c + 16, g_have_prev ? g_prev_vp : vp, 64);
@@ -412,6 +416,19 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
     memcpy(g_sh->prev_vp, g_have_prev ? g_prev_vp : vp, 64);
     memcpy(g_prev_vp, vp, 64);
     g_have_prev = 1;
+    g_mv_frame = g_n;
+    return 1;
+}
+
+static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]) {
+    if (!fgb_active()) return;
+    wait_previous();
+    int sr = g_sr;
+    UINT rw = sr ? g_rw : g_w, rh = sr ? g_rh : g_h;
+    float jx = sr ? g_jx : 0, jy = sr ? g_jy : 0;
+    D3D11_BOX box = {0, 0, 0, rw, rh, 1};
+    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)g_hud, 0, 0, 0, 0, backbuffer, 0, &box);
+    if (!fgb_make_vectors(depth, vp)) return;
     g_hud_done = 1;
     if (!sr) return;
     // DLSS SR round trip: inputs ready (2n+1) -> the helper's DLSS output n % 2 (SR fence n+1) -> into the back buffer, then the UI
