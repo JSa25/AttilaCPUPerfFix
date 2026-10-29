@@ -324,7 +324,9 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
         MItem *mi = &m_items[d->first + k];
         memcpy(mi->cur, item + 0x74, sizeof mi->cur);   // this frame's record, as the game copied it
         mi->tex = *(const int *)(item + 0x5C);
-        mi->bones = pose ? *(const int *)(pose + 4) : -1;
+        // a pose field holding a small number, not a pointer (players' 6.4 crashes at +0x16AE2 read addresses 5, 0x204,
+        // 6 on some maps): no skeleton, as for none. The lowest 64 KB of the address space is never mapped.
+        mi->bones = (UINT_PTR)pose >= 0x10000 ? *(const int *)(pose + 4) : -1;
     }
     verify_draw(vb[1], off, &items[off / 120], inst);
     InterlockedExchangeAdd(&m_queued, (LONG)inst);

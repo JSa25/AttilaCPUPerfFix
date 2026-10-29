@@ -195,6 +195,11 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.5.1: with the add-on's per-object motion on, some battle maps
+           no longer crash at the end of loading or around the battle start
+           (dinput8.dll+0x16AE2 in the log). Without the add-on 6.5.1 works
+           exactly like 6.5.
+
 Version 6.5: fixes for the Upscaling and Framegen add-on. With it, the
            game no longer slows down when the camera looks at many soldiers
            at once (a dense battle clump at 4K: 75 -> 155 fps, 120 with
