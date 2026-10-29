@@ -1313,8 +1313,8 @@ static void settings_save(void) {
                "# frame_cap: off, auto, 60, 90, 120 (rendered frames; auto: the screen's refresh rate / the frames shown per\n"
                "#            rendered frame with frame generation on, e.g. 120 at 2x on a 240 Hz screen)\n"
                "# addon: on, off (off: the add-on does nothing at all from the next game start; set on again to use it)\n"
-               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\naddon=on\nversion=2\n",
-            SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 1], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only",
+               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\naddon=on\nversion=3\n",
+            SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 2], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only",
             CAP_KEYS[g_fcap >= 0 && g_fcap < 5 ? g_fcap : 1]);
     fclose(f);
 }
@@ -1792,19 +1792,23 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         FILE *sf = _wfopen(g_settings, L"r");
         if (sf) { fread(text, 1, sizeof text - 1, sf); fclose(sf); }
         static const char *const MV_KEYS[2] = {"camera_only", "per_object"};
-        g_sr = settings_value(text, "super_resolution=", SR_KEYS, 6, 1);       // default DLAA
+        g_sr = settings_value(text, "super_resolution=", SR_KEYS, 6, 2);       // default Quality (faster big battles)
         g_fg = (unsigned)settings_value(text, "frame_generation=", FG_KEYS, 4, 1);   // default 2x (limited to the GPU later)
         g_motion_on = settings_value(text, "motion_vectors=", MV_KEYS, 2, 0);  // default camera only
-        // per_object was the default before version=2 and every first start saved it, so those files are reset once
-        // (players' reports: half the fps in big battles on 6-core CPUs; it mostly helps frame generation)
         g_fcap = settings_value(text, "frame_cap=", CAP_KEYS, 5, 1);   // default auto
-        int reset = sf && !strstr(text, "version=2") && g_motion_on;
-        if (reset) g_motion_on = 0;
+        // Every first start saved the defaults, so a changed default is applied once to files from before it: per_object
+        // before version=2 (players' reports: half the fps in big battles on 6-core CPUs; it mostly helps frame
+        // generation), DLAA before version=3 (Quality renders smaller: faster big battles)
+        int ver = !sf ? 3 : strstr(text, "version=3") ? 3 : strstr(text, "version=2") ? 2 : 1;
+        int reset_mv = ver < 2 && g_motion_on, reset_sr = ver < 3 && g_sr == 1;
+        if (reset_mv) g_motion_on = 0;
+        if (reset_sr) g_sr = 2;
         g_live = 1;
         g_motion = 1;
-        log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s (%ls)", SR_KEYS[g_sr],
-            FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], !sf ? L"defaults" : reset ? L"settings.txt; per_object was the old default, now camera_only" : L"settings.txt");
-        if (!sf || reset) settings_save();
+        log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s (%ls%s%s)", SR_KEYS[g_sr],
+            FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], sf ? L"settings.txt" : L"defaults",
+            reset_mv ? "; per_object was the old default, now camera_only" : "", reset_sr ? "; dlaa was the old default, now quality" : "");
+        if (!sf || ver < 3) settings_save();
         g_dev_di8_created = fgp_di8_created;
     }
     if (f) {

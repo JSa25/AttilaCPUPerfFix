@@ -197,6 +197,12 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.6.1: the Upscaling and Framegen add-on now starts on DLSS
+           Quality instead of DLAA (Quality renders the 3D scene smaller:
+           faster big battles). If your saved setting was DLAA, the old
+           default, it switches to Quality once; any other choice stays.
+           Without the add-on 6.6.1 works exactly like 6.6.
+
 Version 6.6: for the Upscaling and Framegen add-on. A frame cap in the F11
            panel (Off / Auto / 60 / 90 / 120 rendered fps). Auto, the default,
            only acts with frame generation on: it holds the game at the
