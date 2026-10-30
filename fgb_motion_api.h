@@ -38,4 +38,33 @@ typedef struct FgbMotionInfo {
 
 typedef ID3D11Texture2D *(__cdecl *FgbMotionVectorsFn)(FgbMotionInfo *info);
 
+// The add-on's state, without making motion vectors: GetProcAddress(..., "fgb_state"). Returns 1 and fills *state
+// (size set by the caller, as above); 0 if size is too small. Any thread; the values are this frame's on the render
+// thread. With DLSS below native size the 3D scene is drawn into the top-left render_w x render_h of the game's
+// screen-size targets from the frame's start until the unit banners (scaled = 1 meanwhile); the UI is full size.
+#define FGB_STATE_VERSION 1
+
+typedef struct FgbState {
+    unsigned size;                 // set by the caller: sizeof(FgbState)
+    unsigned version;              // filled in: FGB_STATE_VERSION of the dll (newer versions only add fields)
+    unsigned running;              // 1: the add-on presents the game's frames this session
+    unsigned sr_mode;              // 0 off, 1 DLAA, 2 Quality, 3 Balanced, 4 Performance, 5 Ultra Performance
+    unsigned render_w, render_h;   // the 3D scene's size (= tex_w x tex_h with DLAA or super resolution off)
+    unsigned tex_w, tex_h;         // the game's back buffer size
+    unsigned scaled;               // 1: the game is drawing the 3D scene at render_w x render_h right now
+    float jitter_x, jitter_y;      // this frame's sub-pixel offset of the scene, render pixels (x right, y down)
+    unsigned frame_generation;     // generated frames per rendered frame: 0 off, 1 = 2x, 2 = 3x, 3 = 4x
+    unsigned per_object;           // 1: per-object motion on (the F11 choice), 0: camera only
+    unsigned frame;                // the add-on's frame counter
+} FgbState;
+
+typedef int(__cdecl *FgbStateFn)(FgbState *state);
+
+// D3D11's own function for a slot of the game's immediate context vtable (index into ID3D11DeviceContextVtbl):
+// GetProcAddress(..., "fgb_d3d11_original"). For the slots the add-on hooks it is what the add-on's hook calls, so a
+// mod that hooks that function inside d3d11.dll sees the game's calls whenever it loads. NULL until the game's context
+// is known, or if the slot holds a function from another module. Calls the add-on makes itself (its motion pass,
+// depth write-back, F11 panel) also go through d3d11's functions.
+typedef void *(__cdecl *FgbD3D11OriginalFn)(unsigned slot);
+
 #endif

@@ -197,6 +197,12 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.6.3:
+-Added two functions other mods can use with the Upscaling and Framegen
+ add-on (fgb_state, fgb_d3d11_original).
+-The add-on's helper log now names the DLSS mode in use (DLAA was logged
+ as Quality).
+
 Version 6.6.2:
 -Fixed ship selection markers and wake foam showing away from the ship in
  naval battles with the Upscaling and Framegen add-on.

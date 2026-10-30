@@ -1604,6 +1604,16 @@ static void hook_owners(void (*log)(const char *fmt, ...)) {
         len += snprintf(line + len, sizeof line - len, "%s %s: %s", i ? "," : "", h[i].name, *h[i].slot == h[i].ours ? "ours" : module_name(*h[i].slot, buf));
     }
     log("  D3D11 context slots the add-on hooks, who is first in each now:%s", line);
+    int __cdecl fgb_state(FgbState *s);
+    void *__cdecl fgb_d3d11_original(unsigned slot);
+    FgbState st = {0};
+    st.size = sizeof st;
+    fgb_state(&st);
+    unsigned ok = 0;
+    for (unsigned i = 9; i < sizeof h / sizeof *h; i++) ok += fgb_d3d11_original((unsigned)(h[i].slot - vt)) != NULL;   // the 4 draws
+    log("  for other mods: fgb_state running %u, mode %u, render %ux%u of %ux%u, frame generation %u; fgb_d3d11_original: "
+        "d3d11's own function for %u of 4 draw slots", st.running, st.sr_mode, st.render_w, st.render_h, st.tex_w, st.tex_h,
+        st.frame_generation, ok);
 }
 
 // For other mods (fgb_motion_api.h; a UI / effects mod's temporal effects, so players do not pay for a second
@@ -1628,6 +1638,42 @@ ID3D11Texture2D *__cdecl fgb_motion_vectors(FgbMotionInfo *info) {
     info->jitter_x = g_sr ? g_jx : 0; info->jitter_y = g_sr ? g_jy : 0;
     ID3D11Texture2D_AddRef(t);
     return t;
+}
+
+// For other mods (fgb_motion_api.h): the state above without making vectors (the 4K UI mod's passes need the render size)
+int __cdecl fgb_state(FgbState *s) {
+    if (!s || s->size < sizeof *s) return 0;
+    s->version = FGB_STATE_VERSION;
+    s->running = g_live_state == 1 && fgb_active();
+    s->sr_mode = s->running ? (unsigned)g_sr : 0;
+    s->tex_w = g_live_w; s->tex_h = g_live_h;
+    s->render_w = s->running && g_sr ? g_rw : g_live_w; s->render_h = s->running && g_sr ? g_rh : g_live_h;
+    s->scaled = s->running && g_jit_on && (g_rw != g_live_w || g_rh != g_live_h);
+    s->jitter_x = s->running && g_sr ? g_jx : 0; s->jitter_y = s->running && g_sr ? g_jy : 0;
+    s->frame_generation = s->running ? g_fg : 0;
+    s->per_object = g_motion && g_motion_on;
+    s->frame = fgb_frames();
+    return 1;
+}
+
+// For other mods (fgb_motion_api.h): d3d11's own function for a context vtable slot - what the add-on's hook there calls
+void *__cdecl fgb_d3d11_original(unsigned slot) {
+    if (!g_ctx || slot >= sizeof(ID3D11DeviceContextVtbl) / sizeof(void *)) return NULL;
+#define HK(m, w, r) {offsetof(ID3D11DeviceContextVtbl, m) / sizeof(void *), (void *)w, (void **)&r}
+    static const struct { size_t slot; void *ours; void **orig; } hooked[] = {
+        HK(RSSetViewports, w_rsvp, r_rsvp), HK(RSGetViewports, w_rsgetvp, r_rsgetvp), HK(OMSetRenderTargets, w_omrt, r_omrt),
+        HK(OMSetRenderTargetsAndUnorderedAccessViews, w_omrtuav, r_omrtuav), HK(OMSetDepthStencilState, w_omdss, r_omdss),
+        HK(PSSetConstantBuffers, w_pscb, r_pscb), HK(Map, w_map, r_map), HK(Unmap, w_unmap, r_unmap),
+        HK(UpdateSubresource, w_updsub, r_updsub), HK(DrawIndexedInstanced, w_dii, r_dii), HK(DrawIndexed, w_di, r_di),
+        HK(DrawInstanced, w_dinst, r_dinst), HK(Draw, w_draw, r_draw)};
+#undef HK
+    void *fn = (*(void ***)g_ctx)[slot];
+    for (unsigned i = 0; i < sizeof hooked / sizeof *hooked; i++)
+        if (hooked[i].slot == slot && fn == hooked[i].ours) fn = *hooked[i].orig;
+    HMODULE owner = NULL, d3d = GetModuleHandleW(L"d3d11.dll");
+    if (!fn || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)fn, &owner))
+        return NULL;
+    return owner == d3d ? fn : NULL;
 }
 
 static void bp_report(void (*log)(const char *fmt, ...)) {

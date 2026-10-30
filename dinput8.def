@@ -6,3 +6,5 @@ DllGetClassObject=stub_DllGetClassObject@12 PRIVATE
 DllRegisterServer=stub_DllRegisterServer@0 PRIVATE
 DllUnregisterServer=stub_DllUnregisterServer@0 PRIVATE
 fgb_motion_vectors
+fgb_state
+fgb_d3d11_original
