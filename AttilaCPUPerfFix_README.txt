@@ -197,6 +197,11 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.6.2:
+-Fixed ship selection markers and wake foam showing away from the ship in
+ naval battles with the Upscaling and Framegen add-on.
+-Removed a test-only function from the DLL.
+
 Version 6.6.1: the Upscaling and Framegen add-on now starts on DLSS
            Quality instead of DLAA (Quality renders the 3D scene smaller:
            faster big battles). If your saved setting was DLAA, the old

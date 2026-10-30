@@ -771,10 +771,6 @@ void *fgb_unhooked(void *fn) {
 }
 
 void fgb_test_kill_helper(void) { if (g_helper) TerminateProcess(g_helper, 1); }   // bridgetest killhelper
-void fgb_test_freeze_helper(void) {   // bridgetest freezehelper: alive but finishing nothing (the 2026-10-28 hang)
-    LONG(NTAPI *suspend)(HANDLE) = (LONG(NTAPI *)(HANDLE))(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSuspendProcess");
-    if (g_helper && suspend) suspend(g_helper);
-}
 
 // ---- After the bridge, while the game's swapchain sits on a hidden window (the helper died, the back buffer changed
 // size, or a new swapchain after a settings change): each frame is copied into a swapchain of our own, so the game does

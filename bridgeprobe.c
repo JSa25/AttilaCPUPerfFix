@@ -656,11 +656,17 @@ static int screen_part(UINT tw, UINT th) {   // tw x th = screen / k for k = 1, 
     return 0;
 }
 
+// AGENT_LOG 128: in water battles stage +0x1CA0858 draws the selection markers and the wake foam into two screen-size
+// targets that only the ocean shader reads, at full-screen coordinates from its vertex shader (game camera): shrunk,
+// markers and foam showed at 2/3 size towards the top-left corner, away from the ships. That stage stays full size.
+static unsigned mp_stage_vt(void);
+static int overlay_stage(void) { return mp_stage_vt() == 0x1CA0858; }
+
 // the viewports the game set, as they should be now: shrunk and / or jittered (see above), else as set
 static int vp_adjust(D3D11_VIEWPORT *v) {
     int changed = 0;
     memcpy(v, g_gvp, g_ngvp * sizeof *v);
-    if (!g_jit_on) return 0;   // set from the frame start to the HUD-less point when DLSS is on
+    if (!g_jit_on || overlay_stage()) return 0;   // set from the frame start to the HUD-less point when DLSS is on
     int k = screen_part(g_rt_w, g_rt_h);
     for (UINT i = 0; i < g_ngvp; i++) {
         D3D11_VIEWPORT *x = &v[i];
@@ -776,7 +782,7 @@ static void cam_write(CamBuf *e, const void *src) {
 }
 
 static void ps_cb_apply(ID3D11DeviceContext *c) {
-    CamBuf *e = g_ps_cb0 && g_jit_on && (g_rw != g_live_w || g_rh != g_live_h) && screen_part(g_rt_w, g_rt_h)
+    CamBuf *e = g_ps_cb0 && g_jit_on && (g_rw != g_live_w || g_rh != g_live_h) && screen_part(g_rt_w, g_rt_h) && !overlay_stage()
                     ? cam_find((ID3D11Resource *)g_ps_cb0, 1) : NULL;
     ID3D11Buffer *want = e && e->valid ? e->ours : g_ps_cb0;
     if (want != g_ps_bound && r_pscb) { r_pscb(c, 0, 1, &want); g_ps_bound = want; }
@@ -1133,6 +1139,13 @@ static void mp_draw(ID3D11DeviceContext *c, const char *kind, UINT count, UINT i
         desc_of((ID3D11View *)dsv, t, sizeof t, bbr);
         n += snprintf(line + n, sizeof line - n, " ds[%s]", t);
         if (bbr) ID3D11Resource_Release(bbr);
+    }
+    if (r_rsgetvp) {   // the viewport the GPU uses (shrunk / jittered by the render scale) and the one the game set
+        D3D11_VIEWPORT v;
+        UINT nv = 1;
+        r_rsgetvp(c, &nv, &v);
+        if (nv) n += snprintf(line + n, sizeof line - n, " vp[%.2f,%.2f %.0fx%.0f game %.0fx%.0f%s]", v.TopLeftX, v.TopLeftY, v.Width,
+                              v.Height, g_ngvp ? g_gvp[0].Width : 0.f, g_ngvp ? g_gvp[0].Height : 0.f, g_jit_on ? " scaled" : "");
     }
 #undef snprintf
     fprintf(g_cap, "%s%s\n", line, anim >= 0 ? " ANIM" : "");
