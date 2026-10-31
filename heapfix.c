@@ -1,8 +1,9 @@
 // dinput8.dll proxy for Total War: ATTILA 1.6.0 (empire.retail.dll of 2026-09-19).
 // The game routes every allocation over 80 bytes through one global dlmalloc heap guarded by a
 // single spinlock, so its worker threads and the main thread spend most of their time waiting on
-// it. This sends blocks up to 16 KB (all but ~0.02% of the calls, measured) to mimalloc, which does not serialize
-// threads, and keeps larger ones on the game's own dlmalloc, called through copies of its first instructions.
+// it. This sends blocks up to 16 KB (all but ~0.02% of the calls, measured) to 8 dlmalloc pools with the game's own
+// settings (pools.c), which take address space like the game's heap but do not serialize threads, and keeps larger
+// ones on the game's own dlmalloc, called through copies of its first instructions.
 // dlmalloc gives big blocks' address space back (the game trims it), which the 32-bit game needs: a separate
 // Windows heap for them kept ~700 MB more reserved and crashed heavy mods (Mk1212) out of address space.
 // empire.retail.dll imports DINPUT8.dll, so this loads before the game's own startup code runs,
@@ -55,21 +56,19 @@ static void log_failure(const char *what, size_t n) {
          (unsigned)n, (unsigned)(free_total >> 20), (unsigned)(largest >> 20));
 }
 
-// mimalloc for small blocks: per-thread free lists, no lock on the common path; much faster than
-// the Windows heap for the millions of small allocations per second the game makes.
-#include <mimalloc.h>
+// Blocks up to this size go to the pools (pools.c).
 #define SMALL_MAX 16384
 
 // The game's dlmalloc (set by install_into): trampolines that run its first instructions, then the rest of it.
 static void *(__cdecl *dl_malloc)(size_t);
 static void(__cdecl *dl_free)(void *);
 static void *(__cdecl *dl_realloc)(void *, size_t);
+static int(__cdecl *dl_trim)(size_t);
 
 #ifdef HEAPFIX_MEMSTATS
 // Dev builds: bytes live on dlmalloc (from its chunk headers) and a log line every 20 s, to see where address space goes.
-#include <mimalloc-stats.h>
 static volatile LONG g_dl_live, g_dl_calls, g_spill_calls;
-static volatile LONG g_small_mb;  // defined below
+unsigned pool_mb(void);
 static size_t dl_chunk(void *p) { return p ? (((size_t *)p)[-1] & ~(size_t)7) : 0; }
 static void *dl_malloc_c(size_t n) { InterlockedIncrement(&g_dl_calls); if (n <= SMALL_MAX) InterlockedIncrement(&g_spill_calls); void *p = dl_malloc(n); InterlockedExchangeAdd(&g_dl_live, (LONG)dl_chunk(p)); return p; }
 static void dl_free_c(void *p) { InterlockedIncrement(&g_dl_calls); InterlockedExchangeAdd(&g_dl_live, -(LONG)dl_chunk(p)); dl_free(p); }
@@ -85,16 +84,12 @@ static DWORD WINAPI memstats(LPVOID a) {
     (void)a;
     for (;;) {
         Sleep(20000);
-        mi_stats_t st;
-        mi_stats_init(&st);
-        mi_stats_get(&st);
         size_t fr, big;
         address_space(&fr, &big);
         LONG calls = InterlockedExchange(&g_dl_calls, 0), spills = InterlockedExchange(&g_spill_calls, 0);
-        wlog("memstats: mimalloc %ld MB reserved, committed %u MB, live small %u MB; dlmalloc live %u MB, %ld calls/s "
-             "(%ld small spills/s); address space free %u MB, largest %u MB", g_small_mb,
-             (unsigned)(st.committed.current >> 20), (unsigned)(st.malloc_normal.current >> 20),
-             (unsigned)(g_dl_live >> 20), calls / 20, spills / 20, (unsigned)(fr >> 20), (unsigned)(big >> 20));
+        wlog("memstats: pools %u MB; dlmalloc live %u MB, %ld calls/s (%ld small spills/s); address space free %u MB, "
+             "largest %u MB", pool_mb(), (unsigned)(g_dl_live >> 20), calls / 20, spills / 20, (unsigned)(fr >> 20),
+             (unsigned)(big >> 20));
     }
     return 0;
 }
@@ -107,76 +102,48 @@ static DWORD WINAPI memstats(LPVOID a) {
 #define DL_REALLOC dl_realloc
 #endif
 
-// mimalloc gets its own reservations (install_into): 512 MB, grown in 32 MB steps up to 768 MB when full. Past that,
-// small blocks go to dlmalloc as well. A full mimalloc searches its whole reservation before failing (~400x slower
-// than a normal allocation, measured), so after a failure it is skipped for 50 ms; frees keep returning space to it.
-#define SMALL_HEAP_MB 512
-#define SMALL_STEP_MB 32   // the smallest piece mimalloc can use on 32-bit (page info every 32 MiB)
-#define SMALL_LIMIT_MB 768
-static volatile LONG g_small_mb;  // reserved for mimalloc so far; 0 = no cap (the first reservation failed)
-static LONG g_small_limit_mb = SMALL_LIMIT_MB;  // heapfix.ini [memory] small_heap_limit_mb: 256..768 in 32 MB steps
-static volatile DWORD g_mi_full_until;
-static SRWLOCK g_grow_lock = SRWLOCK_INIT;
-static int reserve_small_heap(size_t size);
-static int grow_small_heap_step(void);
-static void wlog(const char *fmt, ...);
-
-// Called after mimalloc returned NULL: 1 if it has more room now (this thread or another one added a step).
-static int grow_small_heap(LONG seen) {
-    if (seen == 0 || seen >= g_small_limit_mb) return 0;
-    AcquireSRWLockExclusive(&g_grow_lock);
-    int ok = g_small_mb != seen;
-    if (!ok && g_small_mb < g_small_limit_mb) {
-        ok = grow_small_heap_step();
-        g_small_mb = ok ? g_small_mb + SMALL_STEP_MB : g_small_limit_mb;  // no room for a step: stop trying
-        wlog(ok ? "memory: the mod's small-block heap grew to %ld MB (normal with big mods; the limit is %ld MB)"
-                : "memory: the mod's small-block heap is full at %ld MB and found no room to grow - small blocks also "
-                  "use the game's own heap from now on (works, a little slower)", g_small_mb, g_small_limit_mb);
-    }
-    ReleaseSRWLockExclusive(&g_grow_lock);
-    return ok;
-}
-
-// The clock is only read while a skip window is set (g_mi_full_until != 0), not on every allocation.
-static int mi_skipped(void) {
-    DWORD until = g_mi_full_until;
-    if (!until) return 0;
-    if ((LONG)(GetTickCount() - until) < 0) return 1;
-    g_mi_full_until = 0;  // window over: try mimalloc again
-    return 0;
-}
-
-static void mi_full(void) { g_mi_full_until = (GetTickCount() + 50) | 1; }  // | 1: never 0
+// pools.c: 8 dlmalloc mspaces with the game's own settings and a per-thread cache (AGENT_LOG 143)
+int pools_init(void);
+int pool_owns(const void *p);
+unsigned pool_mb(void);
+void *pool_alloc(size_t n);
+void pool_free(void *p);
+void *pool_realloc(void *p, size_t n);
+size_t pool_usable(const void *p);
+void pool_thread_exit(void);
+void pool_trim(void);
 
 static void *h_alloc(size_t n) {
-    if (n <= SMALL_MAX && !mi_skipped()) {
-        LONG seen = g_small_mb;
-        void *p = mi_malloc(n);
-        if (p || (grow_small_heap(seen) && (p = mi_malloc(n)))) return p;
-        mi_full();
+    if (n <= SMALL_MAX) {
+        void *p = pool_alloc(n);
+        if (p) return p;
     }
     return DL_MALLOC(n);
 }
 
 static void h_free(void *p) {
-    if (mi_is_in_heap_region(p)) mi_free(p);
+    if (pool_owns(p)) pool_free(p);
     else DL_FREE(p);
 }
 
 static void *h_realloc(void *p, size_t n) {
-    if (!mi_is_in_heap_region(p)) return DL_REALLOC(p, n);  // large blocks stay with dlmalloc, even when shrinking
-    if (n <= SMALL_MAX && !mi_skipped()) {
-        LONG seen = g_small_mb;
-        void *q = mi_realloc(p, n);
-        if (q || (grow_small_heap(seen) && (q = mi_realloc(p, n)))) return q;
-        mi_full();  // mimalloc is full: p is still valid, move it to dlmalloc
+    if (!pool_owns(p)) return DL_REALLOC(p, n);   // large blocks stay with the game's heap, even when shrinking
+    if (n <= SMALL_MAX) {
+        void *q = pool_realloc(p, n);
+        if (q) return q;
     }
-    void *q = DL_MALLOC(n);  // grew past the small limit (or mimalloc is full): move to dlmalloc
-    if (!q) return NULL;                // like dlrealloc: the old block stays valid
-    size_t old = mi_usable_size(p);
+    void *q = DL_MALLOC(n);   // grew past the small limit (or the pools are out of address space): move it
+    if (!q) return NULL;      // like dlrealloc: the old block stays valid
+    size_t old = pool_usable(p);
     memcpy(q, p, old < n ? old : n);
-    mi_free(p);
+    pool_free(p);
     return q;
+}
+
+static int __cdecl hf_trim(size_t pad) {   // the game's trim: its own heap, then the pools
+    int r = dl_trim(pad);
+    pool_trim();
+    return r;
 }
 
 static void *__cdecl hf_malloc(size_t n) {
@@ -206,7 +173,7 @@ struct patch {
     DWORD rva;
     unsigned char expect[12];
     int reloc;      // offset of an absolute address inside expect, or -1
-    void *to;       // NULL: only checked (dlmalloc's trim keeps running as is)
+    void *to;       // the replacement
     unsigned copy;  // whole instructions moved into the trampoline (nothing jumps into them; checked in the disassembly)
     void **orig;    // gets the trampoline: the original function
 };
@@ -215,70 +182,9 @@ static struct patch g_patches[] = {
     {"dlmalloc",  0x112D80, {0x83,0xEC,0x08,0x83,0x3D,0xBC,0x0B,0xF2,0x11,0x00,0x75,0x05}, 5,  (void *)hf_malloc, 10, (void **)&dl_malloc},
     {"dlfree",    0x112730, {0x83,0xEC,0x1C,0x56,0x8B,0x74,0x24,0x24,0x85,0xF6,0x0F,0x84}, -1, (void *)hf_free, 8, (void **)&dl_free},
     {"dlrealloc", 0x113040, {0x53,0x8B,0x5C,0x24,0x08,0x85,0xDB,0x75,0x0E,0xFF,0x74,0x24}, -1, (void *)hf_realloc, 5, (void **)&dl_realloc},
-    {"dltrim",    0x1126E0, {0x83,0x3D,0xBC,0x0B,0xF2,0x11,0x00,0x75,0x05,0xE8,0x32,0xE8}, 2,  NULL, 0, NULL},
+    {"dltrim",    0x1126E0, {0x83,0x3D,0xBC,0x0B,0xF2,0x11,0x00,0x75,0x05,0xE8,0x32,0xE8}, 2,  (void *)hf_trim, 7, (void **)&dl_trim},
 };
 #define NPATCH (sizeof g_patches / sizeof g_patches[0])
-
-// mimalloc's one reservation, 32 MiB aligned as mimalloc wants on 32-bit. Taken bottom-up, while the address space is
-// still empty: placed at the top instead, the largest free block left in a 4K Mk1212 battle fell from 377 to 142 MB,
-// too small for the ~220 MB block the game needs on "exit to main menu".
-static int reserve_small_heap(size_t size) {
-    const size_t align = 32u << 20;
-    unsigned char *p = VirtualAlloc(NULL, size + align, MEM_RESERVE, PAGE_NOACCESS);
-    if (!p) return 0;
-    unsigned char *a = (unsigned char *)(((UINT_PTR)p + align - 1) & ~(UINT_PTR)(align - 1));
-    VirtualFree(p, 0, MEM_RELEASE);
-    if (VirtualAlloc(a, size, MEM_RESERVE, PAGE_NOACCESS) != a) return 0;
-    if (mi_manage_os_memory(a, size, false, false, true, -1)) return 1;
-    VirtualFree(a, 0, MEM_RELEASE);
-    return 0;
-}
-
-// A growth step comes late in a session, when the address space is already in pieces. A plain reservation takes the
-// lowest gap with room, i.e. it cuts into the big free gaps the game needs for its large blocks (a player's MK1212
-// campaign: grown to 768 MB in 128 MB steps, then a 36 MB allocation failed with 488 MB free in pieces of <= 32 MB).
-// So each 32 MB step goes into the smallest free gap that holds an aligned 32 MB piece, at the end of that gap that
-// leaves the larger part free.
-static unsigned char *best_fit_piece(size_t size) {
-    const UINT_PTR align = 32u << 20;
-    MEMORY_BASIC_INFORMATION m;
-    unsigned char *best = NULL;
-    size_t best_gap = ~(size_t)0, best_left = 0;
-    for (unsigned char *a = (unsigned char *)0x10000; VirtualQuery(a, &m, sizeof m) == sizeof m; a = (unsigned char *)m.BaseAddress + m.RegionSize) {
-        if (m.State == MEM_FREE) {
-            UINT_PTR lo = (UINT_PTR)m.BaseAddress, hi = lo + m.RegionSize;
-            UINT_PTR first = (lo + align - 1) & ~(align - 1), last = (hi - size) & ~(align - 1);
-            if (hi >= size && first >= lo && last >= first && last + size <= hi) {
-                // the larger free part left over: below the first piece or above the last one
-                size_t keep_first = hi - (first + size) > first - lo ? hi - (first + size) : first - lo;
-                size_t keep_last = last - lo > hi - (last + size) ? last - lo : hi - (last + size);
-                UINT_PTR at = keep_last > keep_first ? last : first;
-                size_t left = keep_last > keep_first ? keep_last : keep_first;
-                if (m.RegionSize < best_gap || (m.RegionSize == best_gap && left > best_left)) {
-                    best = (unsigned char *)at;
-                    best_gap = m.RegionSize;
-                    best_left = left;
-                }
-            }
-        }
-        if ((unsigned char *)m.BaseAddress + m.RegionSize < a) break;  // wrapped past the top
-    }
-    return best;
-}
-
-// One growth step for mimalloc: 1 when it got another 32 MB.
-static int grow_small_heap_step(void) {
-    const size_t size = (size_t)SMALL_STEP_MB << 20;
-    for (int tries = 0; tries < 4; tries++) {  // another thread may take the gap between the search and the reservation
-        unsigned char *p = best_fit_piece(size);
-        if (!p) return 0;
-        if (VirtualAlloc(p, size, MEM_RESERVE, PAGE_NOACCESS) != p) continue;
-        if (mi_manage_os_memory(p, size, false, false, true, -1)) return 1;
-        VirtualFree(p, 0, MEM_RELEASE);
-        return 0;
-    }
-    return 0;
-}
 
 // Returns the number of functions patched: all of them, or 0 if anything does not match.
 static int install_into(HMODULE m) {
@@ -319,27 +225,10 @@ static int install_into(HMODULE m) {
         *g_patches[i].orig = t;
     }
     FlushInstructionCache(GetCurrentProcess(), tramp, 4096);
-    // mimalloc only keeps space for small blocks, and after 8 arenas it doubles each new reservation (built for
-    // 64-bit): with heavy mods it held 1,088 MB for 557 MB of blocks and the game ran out of address space. So it
-    // gets its own reservations instead, the first made now while the address space is empty: 512 MB keeps the big
-    // free block the game needs (~220 MB on "exit to main menu"); heavy mods grow it in 32 MB steps (best fit, see above) up to 768 MB
-    // (Mk1212 at 4K peaked at ~600 MB committed), and only past that do small blocks spill to dlmalloc, which is
-    // ~100x slower under contention (measured). A fixed 768 MB left a 142 MB largest free block in that battle.
-    mi_option_set(mi_option_retry_on_oom, 0);  // a full cap must fail fast, not wait 400 ms
-    mi_option_set(mi_option_max_errors, 0);
-    mi_option_set(mi_option_max_warnings, 0);
-    unsigned cap_mb = SMALL_HEAP_MB < g_small_limit_mb ? SMALL_HEAP_MB : (unsigned)g_small_limit_mb;
-    while (cap_mb >= 256 && !reserve_small_heap((size_t)cap_mb << 20)) cap_mb -= 128;
-    if (cap_mb >= 256) {
-        g_small_mb = (LONG)cap_mb;
-        mi_option_enable(mi_option_disallow_os_alloc);
-    } else {
-        cap_mb = 0;
-        mi_option_set(mi_option_arena_reserve, 32 * 1024);  // KiB: no cap, but small arenas at least
+    if (!pools_init()) {
+        wlog("the small-block pools could not be set up - nothing patched");
+        return 0;
     }
-#define HEAP_NAME "mimalloc " MI_STR(MI_MALLOC_VERSION) " (blocks <= 16 KB, %u MB reserved, grows to %u MB in 32 MB steps if needed; 0 = no cap); larger blocks stay on the game's heap"
-#define MI_STR(x) MI_STR2(x)
-#define MI_STR2(x) #x
     for (size_t i = 0; i < NPATCH; i++) {
         if (!g_patches[i].to) continue;
         unsigned char *site = base + g_patches[i].rva;
@@ -356,11 +245,12 @@ static int install_into(HMODULE m) {
         VirtualProtect(site, 5, old, &old);
         FlushInstructionCache(GetCurrentProcess(), site, 5);
     }
-    wlog("empire.retail.dll at %p: game heap replaced by " HEAP_NAME, base, cap_mb, (unsigned)g_small_limit_mb);
+    wlog("empire.retail.dll at %p: game heap replaced by 8 dlmalloc pools with the game's own settings (blocks <= 16 KB, "
+         "nothing reserved up front, grown in 64 KB pieces like the game's heap); larger blocks stay on the game's heap", base);
 #ifdef HEAPFIX_MEMSTATS
     CloseHandle(CreateThread(NULL, 0, memstats, NULL, 0, NULL));
 #endif
-    return (int)NPATCH - 1;
+    return (int)NPATCH;
 }
 
 // ---- dinput8 forwarding (the real DLL is loaded on first use, never inside DllMain)
@@ -509,9 +399,6 @@ static const char INI_DEFAULTS[] =
     "[tuning]\r\n"
     "; how many closed menus keep their textures (1-1024; fewer uses less memory)\r\n"
     "menu_textures_kept=1024\r\n"
-    "; the most memory the fast allocator takes, in MB (256-768). Lower leaves more room for the game's big blocks\r\n"
-    "; with heavy mods; a little slower once it is full\r\n"
-    "small_heap_limit_mb=768\r\n"
     "\r\n"
     "; The DLSS add-on has its own settings: FrameBridge\\settings.txt (F11 in game).\r\n";
 static void ini_create(void) {
@@ -587,10 +474,6 @@ static void install_all(HMODULE m) {
         update_check(g_self, wlog);     // a newer Workshop copy replaces this DLL for the next launch
     else
         wlog("self-update off (self_update=0 in heapfix.ini)");
-    g_small_limit_mb = ini_int(L"tuning", L"small_heap_limit_mb", SMALL_LIMIT_MB);
-    if (g_small_limit_mb < 256) g_small_limit_mb = 256;
-    if (g_small_limit_mb > SMALL_LIMIT_MB) g_small_limit_mb = SMALL_LIMIT_MB;
-    g_small_limit_mb &= ~(SMALL_STEP_MB - 1);  // whole growth steps
     wchar_t off[MAX_PATH];
     wcscpy(off, g_log_path);
     wchar_t *sl = wcsrchr(off, L'\\');
@@ -691,8 +574,9 @@ static int wait_for_game(void) {
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     (void)r;
+    if (reason == DLL_THREAD_DETACH) pool_thread_exit();   // the thread's cached blocks go back to their pools
     if (reason == DLL_PROCESS_ATTACH) {
-        set_log_path(h);  // thread notifications stay on: mimalloc cleans up per-thread state
+        set_log_path(h);  // thread notifications stay on: the pools take a thread's cached blocks back when it ends
         if (g_log_path[0]) log_header();
         g_self = h;
         HMODULE m = GetModuleHandleW(L"empire.retail.dll");

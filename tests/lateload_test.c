@@ -17,7 +17,7 @@ static char g_log[1 << 20];
 static int has(const char *s) { return strstr(g_log, s) != NULL; }
 
 // Through the game's patched entry points: blocks over 16 KB go to the game's own dlmalloc (its imports are resolved
-// here, unlike in heapfix_test), small ones to mimalloc, and the two must hand blocks over intact.
+// here, unlike in heapfix_test), small ones to the pools, and the two must hand blocks over intact.
 static void *(__cdecl *g_malloc)(size_t);
 static void(__cdecl *g_free)(void *);
 static void *(__cdecl *g_realloc)(void *, size_t);
@@ -109,8 +109,8 @@ static void heap_checks(unsigned char *b) {
     CHECK(free2 + (16u << 20) >= free1);    // the second round reused it
 
     // growth placement: with the address space in pieces (a 224 MB gap at the top, four 32 MB gaps below it, a 16 MB
-    // scrap gap at the bottom for other small reservations, everything else taken), filling mimalloc past its 512 MB
-    // must put its 32 MB growth steps into the small gaps and leave the big one whole
+    // scrap gap at the bottom for other small reservations, everything else taken), filling the pools must put their
+    // growth into the small gaps and leave the big one whole
     {
         enum { MAXB = 8192, NSMALL = 4, BIGN = 14 };  // pieces of 16 MB
         static unsigned char *blk[MAXB];
@@ -190,9 +190,9 @@ static void heap_checks(unsigned char *b) {
         }
     }
 
-    // more small blocks than mimalloc's fixed reservation holds: the rest must spill to dlmalloc, intact
+    // ~950 MB of small blocks (more than 6.7.0's capped heap held), intact, and threads started then still get memory
     {
-        enum { M = 950000, SZ = 1000 };  // ~950 MB, over the 768 MB cap
+        enum { M = 950000, SZ = 1000 };
         static unsigned char *sm[M];
         size_t f0 = free_space(&big0);
         for (int i = 0; i < M; i++) {
@@ -201,11 +201,11 @@ static void heap_checks(unsigned char *b) {
             sm[i][0] = sm[i][SZ - 1] = (unsigned char)i;
         }
         size_t f1 = free_space(&big0);
-        unsigned char *grown = g_realloc(sm[0], 4000);  // a small block growing while mimalloc is full
+        unsigned char *grown = g_realloc(sm[0], 4000);  // a small block growing with the address space nearly full
         CHECK(grown && grown[0] == 0);
         sm[0] = grown;
         sm[0][SZ - 1] = 0;
-        HANDLE nt[4];  // threads started after the cap is full still get memory
+        HANDLE nt[4];
         for (int i = 0; i < 4; i++) nt[i] = CreateThread(NULL, 0, mixed, (LPVOID)(UINT_PTR)(100 + i), 0, NULL);
         WaitForMultipleObjects(4, nt, TRUE, INFINITE);
         CHECK(g_errors == 0);
@@ -224,8 +224,8 @@ static void heap_checks(unsigned char *b) {
     CHECK(g_errors == 0);
 }
 
-// heapfix.ini given by the test (argv[3] "ini"): a switch, a clamped limit, a count; the DLL must obey it and keep it
-static const char INI_TEST[] = "[fixes]\r\nsmall_object_pools=0\r\n[mod]\r\nself_update=0\r\n[tuning]\r\nsmall_heap_limit_mb=800\r\nmenu_textures_kept=7\r\n";
+// heapfix.ini given by the test (argv[3] "ini"): a switch and a count; the DLL must obey it and keep it
+static const char INI_TEST[] = "[fixes]\r\nsmall_object_pools=0\r\n[mod]\r\nself_update=0\r\n[tuning]\r\nmenu_textures_kept=7\r\n";
 
 int main(int argc, char **argv) {
     CHECK(argc == 3 || argc == 4);
@@ -305,7 +305,7 @@ int main(int argc, char **argv) {
         if (own_ini) {
             CHECK(!strcmp(ini, INI_TEST) && has("self-update off (self_update=0 in heapfix.ini)"));
             CHECK(has("pool free lookup switched off (heapfix.ini or pool_off.txt) - not replaced") && !has("pool free lookup replaced"));
-            CHECK(has("grows to 768 MB") && has("menu textures: the last 7 closed ones stay loaded"));
+            CHECK(has("dlmalloc pools") && has("menu textures: the last 7 closed ones stay loaded"));
             CHECK(has("OFF  FPS: small-object pools (switched off in heapfix.ini, or by its _off.txt file)"));
         } else {
             CHECK(strstr(ini, "[fixes]") && strstr(ini, "small_object_pools=1") && strstr(ini, "self_update=1") && strstr(ini, "crash_logging=1"));
@@ -331,9 +331,12 @@ int main(int argc, char **argv) {
         unsigned char *to = site + 5 + rel;
         CHECK(site[0] == 0xE9 && to >= lo && to < hi);
     }
-    DWORD trim_abs;
-    memcpy(&trim_abs, b + 0x1126E0 + 2, 4);
-    CHECK(b[0x1126E0] == 0x83 && trim_abs == 0x11F20BBC - 0x10000000 + (DWORD)(UINT_PTR)b);
+    {   // the game's trim is hooked too (it also trims the pools)
+        DWORD rel;
+        memcpy(&rel, b + 0x1126E0 + 1, 4);
+        unsigned char *to = b + 0x1126E0 + 5 + rel;
+        CHECK(b[0x1126E0] == 0xE9 && to >= lo && to < hi);
+    }
     // the loading fixes hook the game's imports: the loader must not have overwritten them after the notification
     CHECK(has("file I/O fix installed") && has("attribute cache installed") && has("texture compression replaced"));
     IMAGE_NT_HEADERS *gnt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);

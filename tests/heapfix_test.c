@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
     CHECK(m != NULL);
     printf("mapped empire.retail.dll at %p\n", (void *)m);
 
-    CHECK(install_into(m) == (int)NPATCH - 1);
+    CHECK(install_into(m) == (int)NPATCH);
     for (size_t i = 0; i < NPATCH; i++) {
         if (!g_patches[i].to) continue;  // dltrim: checked only
         unsigned char *site = (unsigned char *)m + g_patches[i].rva;
@@ -191,7 +191,7 @@ int main(int argc, char **argv) {
         size_t during = pm.PrivateUsage - before;
         for (int i = 0; i < LIVE; i++) hf_free(live[i]);
         free(live);
-        mi_collect(true);
+        pool_trim();   // what the game's trim does (hooked)
         K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm);
         size_t after = pm.PrivateUsage > before ? pm.PrivateUsage - before : 0;
         printf("memory: ~%zu MB requested live, %zu MB private while live (%.2fx), %zu MB left after freeing\n",

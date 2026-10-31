@@ -19,10 +19,11 @@ What it fixes
   through one shared heap with a single lock. With many threads, they spend
   most of their time waiting on that lock instead of working. In profiling,
   about 85% of the game's CPU time was threads spinning on it, keeping around
-  19 cores busy for nothing. The heap is replaced with mimalloc plus a fast
-  small-block pool: the game drops to about 3.5 busy cores and FPS more than
-  doubles from this fix alone. It also removes the stutter that builds up over
-  a long session.
+  19 cores busy for nothing. Small blocks now go to 8 separate heaps of the
+  game's own kind (same settings, each with its own lock, so memory is used
+  just like in the unmodded game), plus a fast small-block pool: the game
+  drops to about 3.5 busy cores and FPS more than doubles from this fix alone.
+  It also removes the stutter that builds up over a long session.
 - Thread count: after the lock fix, waking 31 worker threads every frame cost
   the main thread about a third of its time. That's why 8 threads is
   recommended below.
@@ -145,10 +146,6 @@ save, and restart the game.
             crash_logging=0: no EXCEPTION lines in heapfix.log
   [tuning]  menu_textures_kept: how many closed menus keep their textures
             (1-1024, fewer uses less memory)
-            small_heap_limit_mb: the most memory the fast allocator takes
-            (256-768). Lower leaves more room for the game's big blocks with
-            heavy mods like MK1212, a little slower once it's full. Leave it at
-            768 unless you get out-of-memory crashes.
 
 The mod never changes your heapfix.ini. Delete it to get the defaults back.
 The old *_off.txt files (heapfix_off.txt, uikeep_off.txt, update_off.txt, ...)
@@ -199,6 +196,16 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.8.0:
+-New memory allocator for small blocks. It is built like the game's own heap
+ (the same allocator with the game's settings), split into 8 heaps so threads
+ still don't wait on one lock. It takes memory the same way the unmodded game
+ does and no longer reserves 512 MB at startup, which leaves more room for
+ heavy mods like MK1212 and fewer out-of-memory crashes when a battle loads.
+ FPS is the same as 6.7.0.
+-small_heap_limit_mb is gone from heapfix.ini (nothing to limit any more). An
+ older heapfix.ini that still has it works as before.
+
 Version 6.7.0:
 -Settings are now in heapfix.ini in the game folder (created on the first
  start): every fix can be switched on or off there, plus self-update, crash
@@ -367,8 +374,7 @@ Version 1: first release.
 Credits and licenses
 --------------------
 Built with AI assistance (Claude by Anthropic). Tested in game by the author.
-mimalloc (c) Microsoft Corporation and Daan Leijen, MIT license; see
-LICENSE-mimalloc.txt.
+dlmalloc by Doug Lea, released to the public domain (CC0 1.0).
 
 The DLSS add-on's sharpening (in dinput8.dll) follows AMD FidelityFX Robust
 Contrast Adaptive Sharpening (RCAS), used under the MIT licence:

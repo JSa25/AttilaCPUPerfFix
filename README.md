@@ -20,7 +20,8 @@ with its 64-bit helper, is in the game folder. The helper's source is in its own
 
 | File | Fix |
 |---|---|
-| `heapfix.c` | Entry point (`DllMain`, or a DLL load notification when something loaded `dinput8.dll` before the game DLL), dinput8 forwarding, `heapfix.log`, and the main fix: replaces the game's single-lock dlmalloc heap with mimalloc for blocks up to 16 KB (its own 512-768 MB reservation); larger blocks stay on the game's dlmalloc |
+| `heapfix.c` | Entry point (`DllMain`, or a DLL load notification when something loaded `dinput8.dll` before the game DLL), dinput8 forwarding, `heapfix.log`, and the main fix: replaces the game's single-lock dlmalloc heap for blocks up to 16 KB; larger blocks stay on the game's dlmalloc |
+| `pools.c`, `dlmalloc/` | The heap for those blocks: 8 dlmalloc 2.8.6 heaps with the game's own settings (64 KB growth, 2 MB trim, nothing reserved up front), each with its own lock, and a small per-thread cache, so threads do not wait on one lock but the address space is used like the game's own heap |
 | `pool.c` | Faster free lookup for the engine's small-object pools |
 | `sortfix.c` | The two render-list sorts (by +0x6C/+0x68 and +0x4C/+0x48): key extraction plus radix sort, same order as the game's sorts |
 | `batchfix.c` | Battle draw batching: items with the same material and equal variant values share a batch |
@@ -51,7 +52,6 @@ Every patch first compares the game's bytes at its address with what it expects,
 
 You need:
 - [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (the release used: 20261006, UCRT, x86_64 host), with its `bin` folder on `PATH`
-- the [mimalloc](https://github.com/microsoft/mimalloc) **v3.5.3** source, in a folder named `mimalloc` next to `build.bat` (or set `MIMALLOC` to its path)
 
 Then run:
 
@@ -59,15 +59,15 @@ Then run:
 build.bat
 ```
 
-The DLL lands in `build\dinput8.dll`. The build is reproducible: with the same llvm-mingw and
-mimalloc versions you should get exactly the same file as the one on Nexus. Compare the SHA-256
+The DLL lands in `build\dinput8.dll`. The build is reproducible: with the same llvm-mingw
+version you should get exactly the same file as the one on Nexus. Compare the SHA-256
 (`certutil -hashfile build\dinput8.dll SHA256`) with the one given for each release.
 
 ### Automated builds
 
 Every commit is also built on GitHub's own machines by
-[.github/workflows/build.yml](.github/workflows/build.yml), with the compiler and mimalloc
-downloaded from their official releases (checksums pinned). Open the latest run under **Actions**:
+[.github/workflows/build.yml](.github/workflows/build.yml), with the compiler
+downloaded from its official release (checksum pinned). Open the latest run under **Actions**:
 its summary shows the SHA-256 of the DLL, which matches the Nexus download for the same version,
 and the DLL itself can be downloaded there. Builds also carry a signed build attestation
 (`gh attestation verify dinput8.dll -R JSa25/AttilaCPUPerfFix`).
@@ -84,5 +84,5 @@ build.bat test "C:\...\steamapps\common\Total War Attila\empire.retail.dll"
 
 ## License
 
-See [LICENSE](LICENSE). mimalloc is (c) Microsoft Corporation and Daan Leijen, MIT license
-([third_party/mimalloc-LICENSE.txt](third_party/mimalloc-LICENSE.txt)).
+See [LICENSE](LICENSE). `dlmalloc/malloc-2.8.6.c` is dlmalloc by Doug Lea, released to the public domain
+([CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)), unchanged.

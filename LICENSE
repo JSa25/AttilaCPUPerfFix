@@ -17,6 +17,6 @@ You may NOT, without written permission from the author:
 This software is provided "as is", without warranty of any kind. The author is not liable for any
 damage or data loss arising from its use.
 
-Files from third parties keep their own licenses: mimalloc is (c) Microsoft Corporation and Daan
-Leijen, under the MIT license (see third_party/mimalloc-LICENSE.txt). Total War: ATTILA and its code belong to
+Files from third parties keep their own licenses: dlmalloc/malloc-2.8.6.c is dlmalloc by Doug Lea,
+released to the public domain (CC0 1.0), and is not covered by the terms above. Total War: ATTILA and its code belong to
 their owners; this repository contains none of the game's files.

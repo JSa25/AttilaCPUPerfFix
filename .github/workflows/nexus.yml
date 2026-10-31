@@ -1,7 +1,7 @@
 # Uploads a new version of the Nexus Mods file (mod page 168, API file ID 8207127) from a build made on GitHub's own machine.
 # Run it by hand: Actions -> "Upload to Nexus Mods" -> Run workflow, with a changelog line.
 # It builds dinput8.dll, refuses to continue unless the SHA-256 equals dinput8.dll.sha256 (the released DLL), zips it
-# with the player README and the mimalloc license and adds it to the Nexus file as a new version (the old one goes to
+# with the player README and adds it to the Nexus file as a new version (the old one goes to
 # Old Files). Needs the repository secret NEXUSMODS_API_KEY (your Nexus API key, Settings -> Secrets and variables -> Actions).
 name: Upload to Nexus Mods
 
@@ -21,15 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download the compiler (llvm-mingw 20261006) and mimalloc 3.5.3
+      - name: Download the compiler (llvm-mingw 20261006)
         shell: pwsh
         run: |
-          # pinned versions and checksums, the same as build.yml
+          # pinned version and checksum, the same as build.yml
           $files = @(
             @{ url = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip'
-               sha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'; out = 'llvm.zip' },
-            @{ url = 'https://github.com/microsoft/mimalloc/archive/refs/tags/v3.5.3.zip'
-               sha = '97e672db18c36093378e30cc234f4625ad37b95ca9a270336752d3f3011323e9'; out = 'mimalloc.zip' }
+               sha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'; out = 'llvm.zip' }
           )
           foreach ($f in $files) {
             Invoke-WebRequest $f.url -OutFile $f.out
@@ -37,8 +35,6 @@ jobs:
             if ($got -ne $f.sha) { throw "$($f.out): checksum $got does not match $($f.sha)" }
           }
           Expand-Archive llvm.zip "$env:RUNNER_TEMP\llvm"
-          Expand-Archive mimalloc.zip "$env:RUNNER_TEMP\mi"
-          Move-Item "$env:RUNNER_TEMP\mi\mimalloc-3.5.3" mimalloc
           Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\llvm\llvm-mingw-20261006-ucrt-x86_64\bin"
 
       - name: Build
@@ -56,7 +52,6 @@ jobs:
           if (-not $ver) { throw "no version in version.h" }
           New-Item -ItemType Directory pkg\AttilaCPUPerfFix | Out-Null
           Copy-Item build\dinput8.dll, AttilaCPUPerfFix_README.txt pkg\AttilaCPUPerfFix\
-          Copy-Item third_party\mimalloc-LICENSE.txt pkg\AttilaCPUPerfFix\LICENSE-mimalloc.txt
           Compress-Archive pkg\AttilaCPUPerfFix AttilaCPUPerfFix.zip
           "version=$ver" >> $env:GITHUB_OUTPUT
           "sha=$h" >> $env:GITHUB_OUTPUT

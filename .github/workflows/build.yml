@@ -22,15 +22,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download the compiler (llvm-mingw 20261006) and mimalloc 3.5.3
+      - name: Download the compiler (llvm-mingw 20261006)
         shell: pwsh
         run: |
-          # pinned versions and checksums, so the build always uses exactly these files
+          # pinned version and checksum, so the build always uses exactly this compiler
           $files = @(
             @{ url = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip'
-               sha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'; out = 'llvm.zip' },
-            @{ url = 'https://github.com/microsoft/mimalloc/archive/refs/tags/v3.5.3.zip'
-               sha = '97e672db18c36093378e30cc234f4625ad37b95ca9a270336752d3f3011323e9'; out = 'mimalloc.zip' }
+               sha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'; out = 'llvm.zip' }
           )
           foreach ($f in $files) {
             Invoke-WebRequest $f.url -OutFile $f.out
@@ -38,8 +36,6 @@ jobs:
             if ($got -ne $f.sha) { throw "$($f.out): checksum $got does not match $($f.sha)" }
           }
           Expand-Archive llvm.zip "$env:RUNNER_TEMP\llvm"
-          Expand-Archive mimalloc.zip "$env:RUNNER_TEMP\mi"
-          Move-Item "$env:RUNNER_TEMP\mi\mimalloc-3.5.3" mimalloc
           Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\llvm\llvm-mingw-20261006-ucrt-x86_64\bin"
 
       - name: Build
