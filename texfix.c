@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <emmintrin.h>
 #include <string.h>
+#include "gamerva.h"
 
 #define RVA_COMPRESS 0x18E8390u
 #define LEN_COMPRESS 0x342u   // through the ret 8
@@ -18,6 +19,7 @@
 #define LEN_INDICES 0x22Au    // through the ret 10h
 #define FNV_COMPRESS 0xB8BB6EFEu
 #define FNV_INDICES 0xDD4A6D59u
+#define FNV_COMPRESS_GOG 0x46F4FD6Eu   // GOG 6A4F4723: the same code, its call to the index function moved
 
 // The game's source description: [0] first pixel, [2] width, [4] row pitch, [6] bytes per pixel (DWORDs).
 typedef void(__attribute__((thiscall)) * compress_fn)(const DWORD *src, const DWORD *rows, unsigned char **out);
@@ -122,18 +124,13 @@ void __attribute__((thiscall, force_align_arg_pointer)) tf_compress(const DWORD 
     }
 }
 
-static DWORD fnv1a(const unsigned char *b, DWORD n) {
-    DWORD h = 0x811C9DC5u;
-    while (n--) h = (h ^ *b++) * 0x01000193u;
-    return h;
-}
-
 #ifndef TEXFIX_TEST
 
 // verify (dev builds): run the game's function and compare. Returns 1 when installed.
 int install_texfix(HMODULE m, int verify, void (*log)(const char *fmt, ...)) {
-    unsigned char *b = (unsigned char *)m, *site = b + RVA_COMPRESS;
-    if (fnv1a(site, LEN_COMPRESS) != FNV_COMPRESS || fnv1a(b + RVA_INDICES, LEN_INDICES) != FNV_INDICES) {
+    unsigned char *b = (unsigned char *)m, *site = b + game_rva(b, RVA_COMPRESS);
+    DWORD hc = fnv1a(site, LEN_COMPRESS);
+    if ((hc != FNV_COMPRESS && hc != FNV_COMPRESS_GOG) || fnv1a(b + game_rva(b, RVA_INDICES), LEN_INDICES) != FNV_INDICES) {
         log("texture compression (+0x%X) differs from this game version - not replaced", RVA_COMPRESS);
         return 0;
     }

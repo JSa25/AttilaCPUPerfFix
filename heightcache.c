@@ -13,6 +13,7 @@
 // always run the original. Counters: g_hq[0] calls, [1] main-thread calls, [2] hits, [3] mismatches.
 #include <windows.h>
 #include <string.h>
+#include "gamerva.h"
 
 #define RVA_HEIGHTQ 0x18F9150
 static const unsigned char HEIGHTQ_PROLOGUE[6] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8};  // push ebp; mov ebp,esp; and esp,-8
@@ -38,13 +39,13 @@ typedef char(__thiscall *vbool_fn)(void *);
 // (vtable +0x2C4 true and this+0x128 set) also uses a global map scale (FUN_118ee960) not checked here.
 static unsigned hq_state(void *terrain) {
     unsigned char *b = g_hq_base;
-    unsigned char early = AT(b + 0x2A78008, 0x48, unsigned char);  // FUN_100c0130(0x12A78008)
+    unsigned char early = AT(b + game_rva(b, 0x2A78008), 0x48, unsigned char);  // FUN_100c0130(0x12A78008)
     void *td = AT(terrain, 0x794, void *);
     if (!td) return 1;
     void *mode_obj = AT(td, 0x18, void *);                          // FUN_10161660(td)
     unsigned char mode = mode_obj ? AT(mode_obj, 0x7C, unsigned char) : 0xEE;  // FUN_1059d310
-    unsigned ydiv = AT(b + 0x2A77BF8, 0x48, unsigned);              // FUN_100c0100(0x12A77BF8)
-    void *game = AT(b + 0x2A21D18, 0, void *);                      // DAT_12a21d18
+    unsigned ydiv = AT(b + game_rva(b, 0x2A77BF8), 0x48, unsigned);              // FUN_100c0100(0x12A77BF8)
+    void *game = AT(b + game_rva(b, 0x2A21D18), 0, void *);                      // DAT_12a21d18
     char sw = ((vbool_fn)(*(void ***)game)[0x2C4 / 4])(game);
     void *water = AT(terrain, 0x128, void *);
     if (sw && water) return 0;
@@ -98,7 +99,7 @@ __attribute__((naked)) static void heightq_stub(void) {
 
 // mode 1 verify, 2 cache. Must run on the game's main thread. Returns 1 if installed.
 int install_heightcache(HMODULE m, int mode, void (*log)(const char *fmt, ...)) {
-    unsigned char *site = (unsigned char *)m + RVA_HEIGHTQ;
+    unsigned char *site = (unsigned char *)m + game_rva(m, RVA_HEIGHTQ);
     if (memcmp(site, HEIGHTQ_PROLOGUE, 6) != 0) { log("height cache: code differs from this game version - not installed"); return 0; }
     g_hq_mode = mode;
     g_hq_main = GetCurrentThreadId();

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../gamerva.h"
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
 
@@ -223,14 +224,45 @@ static void heap_checks(unsigned char *b) {
     CHECK(g_errors == 0);
 }
 
+// heapfix.ini given by the test (argv[3] "ini"): a switch, a clamped limit, a count; the DLL must obey it and keep it
+static const char INI_TEST[] = "[fixes]\r\nsmall_object_pools=0\r\n[mod]\r\nself_update=0\r\n[tuning]\r\nsmall_heap_limit_mb=800\r\nmenu_textures_kept=7\r\n";
+
 int main(int argc, char **argv) {
-    CHECK(argc == 3);
-    char logp[MAX_PATH];
+    CHECK(argc == 3 || argc == 4);
+    int own_ini = argc == 4 && !strcmp(argv[3], "ini");
+    char logp[MAX_PATH], inip[MAX_PATH];
     strcpy(logp, argv[1]);
     char *sl = strrchr(logp, '\\');
     CHECK(sl);
     strcpy(sl + 1, "heapfix.log");
     DeleteFileA(logp);
+    strcpy(inip, logp);
+    strcpy(inip + (sl + 1 - logp), "heapfix.ini");
+    DeleteFileA(inip);
+    if (own_ini) {
+        FILE *fi = fopen(inip, "wb");
+        CHECK(fi && fwrite(INI_TEST, 1, sizeof INI_TEST - 1, fi) == sizeof INI_TEST - 1);
+        fclose(fi);
+    }
+    // the DLSS add-on present but switched off, its settings.txt past 1 KB as the add-on writes it since dlss_preset /
+    // sharpness (AGENT_LOG 141: a 1024-byte read missed addon=off at the end; the add-on came back on)
+    char fb[MAX_PATH], fbf[MAX_PATH];
+    strcpy(fb, logp);
+    strcpy(fb + (sl + 1 - logp), "FrameBridge");
+    if (own_ini) {   // the release run (build.sh): the dev DLL has no add-on switch
+        CreateDirectoryA(fb, NULL);
+        snprintf(fbf, sizeof fbf, "%s\\helper64.exe", fb);
+        FILE *fh = fopen(fbf, "wb");
+        CHECK(fh);
+        fclose(fh);
+        snprintf(fbf, sizeof fbf, "%s\\settings.txt", fb);
+        fh = fopen(fbf, "wb");
+        CHECK(fh);
+        for (int i = 0; i < 24; i++) fputs("# a comment line as long as the add-on's own ones, to push the switch past 1 KB\r\n", fh);
+        fputs("super_resolution=quality\r\naddon=off\r\nversion=3\r\n", fh);
+        CHECK(ftell(fh) > 1200);
+        fclose(fh);
+    }
 
     void *taken = VirtualAlloc((void *)0x10000000, 0x100000, MEM_RESERVE, PAGE_NOACCESS);
     CHECK(taken == (void *)0x10000000);
@@ -253,9 +285,34 @@ int main(int argc, char **argv) {
     g_log[fread(g_log, 1, sizeof g_log - 1, f)] = 0;
     fclose(f);
     fputs(g_log, stdout);
+    if (own_ini) {
+        snprintf(fbf, sizeof fbf, "%s\\settings.txt", fb);
+        DeleteFileA(fbf);
+        snprintf(fbf, sizeof fbf, "%s\\helper64.exe", fb);
+        DeleteFileA(fbf);
+        RemoveDirectoryA(fb);
+        CHECK(has("DLSS add-on found but switched off (addon=off in FrameBridge\\settings.txt)"));
+    }
     CHECK(has("was loaded before empire.retail.dll"));
     CHECK(has("empire.retail.dll is loading now - installing the fixes"));
     CHECK(has("game heap replaced"));
+    {   // heapfix.ini: obeyed and left as it was, or created with the defaults when missing
+        static char ini[4096];
+        FILE *fi = fopen(inip, "rb");
+        CHECK(fi);
+        ini[fread(ini, 1, sizeof ini - 1, fi)] = 0;
+        fclose(fi);
+        if (own_ini) {
+            CHECK(!strcmp(ini, INI_TEST) && has("self-update off (self_update=0 in heapfix.ini)"));
+            CHECK(has("pool free lookup switched off (heapfix.ini or pool_off.txt) - not replaced") && !has("pool free lookup replaced"));
+            CHECK(has("grows to 768 MB") && has("menu textures: the last 7 closed ones stay loaded"));
+            CHECK(has("OFF  FPS: small-object pools (switched off in heapfix.ini, or by its _off.txt file)"));
+        } else {
+            CHECK(strstr(ini, "[fixes]") && strstr(ini, "small_object_pools=1") && strstr(ini, "self_update=1") && strstr(ini, "crash_logging=1"));
+            CHECK(!has("self-update off") && has("crash logging on"));
+            CHECK(has("pool free lookup replaced") && has("menu textures: the last 1024 closed ones stay loaded"));
+        }
+    }
     CHECK(has("battle draw-list sort replaced") && has("render-list sort (+0x4C/+0x48) replaced"));
     CHECK(has("batch fix installed") && has("campaign fix: 4 of 4") && has("x87 fix: 1277 of 1277"));
     CHECK(has("height cache installed") && has("memcpy fast path installed"));
@@ -306,8 +363,8 @@ int main(int argc, char **argv) {
         memset(o1, 0xCD, sizeof o1);
         memset(o2, 0xCD, sizeof o2);
         unsigned char *p1 = o1, *p2 = o2;
-        ((comp_fn)(void *)(b + 0x18E8390))(src, rows, &p1);
-        ((comp_fn)(void *)(b + 0x18E8390))(src, rows, &p2);
+        ((comp_fn)(void *)(b + game_rva(b, 0x18E8390)))(src, rows, &p1);
+        ((comp_fn)(void *)(b + game_rva(b, 0x18E8390)))(src, rows, &p2);
         CHECK(p1 == o1 + 256 * 8 && p2 == o2 + 256 * 8 && !memcmp(o1, o2, sizeof o1) && o1[256 * 8] == 0xCD);
     }
     printf("late install: game DLL relocated to %p, all fixes installed from the load notification\n", (void *)game);

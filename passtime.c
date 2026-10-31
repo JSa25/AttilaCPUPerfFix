@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
+#include "gamerva.h"
 
 // Frame budget (AGENT_LOG 50): the battle frame's subsystem roots (not FUN_100c1950 itself: fps.c hooks it). Copy lengths are whole instructions with no
 // relative operands that no jump lands inside (checked against the full disassembly). The pass-loop table of
@@ -361,7 +362,7 @@ int install_passtime(HMODULE m, void (*log)(const char *fmt, ...)) {
     g_pt_frame0 = g_geo_frame;
     int n = 0;
     for (unsigned i = 0; i < PT_N; i++) {
-        unsigned char *site = base + PT_FUNCS[i].rva;
+        unsigned char *site = base + game_rva(base, PT_FUNCS[i].rva);
         // the set-camera gets the bridge's own jump hook (bridgeprobe.c cam_hook): timed through here it cost ~9 ms per frame
         if (bridge_mode && !bridge_full && PT_FUNCS[i].rva != 0x176A450) continue;
         if (site[0] == 0xE9) {  // already hooked by another fix: leave it
@@ -437,7 +438,7 @@ void nodeprobe_report(void (*log)(const char *fmt, ...), long frames) {
 
 int install_nodeprobe(HMODULE m, void (*log)(const char *fmt, ...)) {
     static const unsigned char PRO[7] = {0x56, 0x57, 0x8B, 0xF9, 0x8B, 0x77, 0x1C};  // push esi; push edi; mov edi,ecx; mov esi,[edi+1Ch]
-    unsigned char *site = (unsigned char *)m + 0x1722420;
+    unsigned char *site = (unsigned char *)m + game_rva(m, 0x1722420);
     if (memcmp(site, PRO, 7) != 0) { log("scene node probe: code differs - skipped"); return 0; }
     g_np_tramp = VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!g_np_tramp) return 0;

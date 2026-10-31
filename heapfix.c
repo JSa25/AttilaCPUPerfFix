@@ -114,6 +114,7 @@ static DWORD WINAPI memstats(LPVOID a) {
 #define SMALL_STEP_MB 32   // the smallest piece mimalloc can use on 32-bit (page info every 32 MiB)
 #define SMALL_LIMIT_MB 768
 static volatile LONG g_small_mb;  // reserved for mimalloc so far; 0 = no cap (the first reservation failed)
+static LONG g_small_limit_mb = SMALL_LIMIT_MB;  // heapfix.ini [memory] small_heap_limit_mb: 256..768 in 32 MB steps
 static volatile DWORD g_mi_full_until;
 static SRWLOCK g_grow_lock = SRWLOCK_INIT;
 static int reserve_small_heap(size_t size);
@@ -122,15 +123,15 @@ static void wlog(const char *fmt, ...);
 
 // Called after mimalloc returned NULL: 1 if it has more room now (this thread or another one added a step).
 static int grow_small_heap(LONG seen) {
-    if (seen == 0 || seen >= SMALL_LIMIT_MB) return 0;
+    if (seen == 0 || seen >= g_small_limit_mb) return 0;
     AcquireSRWLockExclusive(&g_grow_lock);
     int ok = g_small_mb != seen;
-    if (!ok && g_small_mb < SMALL_LIMIT_MB) {
+    if (!ok && g_small_mb < g_small_limit_mb) {
         ok = grow_small_heap_step();
-        g_small_mb = ok ? g_small_mb + SMALL_STEP_MB : SMALL_LIMIT_MB;  // no room for a step: stop trying
-        wlog(ok ? "memory: the mod's small-block heap grew to %ld MB (normal with big mods; the limit is 768 MB)"
+        g_small_mb = ok ? g_small_mb + SMALL_STEP_MB : g_small_limit_mb;  // no room for a step: stop trying
+        wlog(ok ? "memory: the mod's small-block heap grew to %ld MB (normal with big mods; the limit is %ld MB)"
                 : "memory: the mod's small-block heap is full at %ld MB and found no room to grow - small blocks also "
-                  "use the game's own heap from now on (works, a little slower)", g_small_mb);
+                  "use the game's own heap from now on (works, a little slower)", g_small_mb, g_small_limit_mb);
     }
     ReleaseSRWLockExclusive(&g_grow_lock);
     return ok;
@@ -327,7 +328,7 @@ static int install_into(HMODULE m) {
     mi_option_set(mi_option_retry_on_oom, 0);  // a full cap must fail fast, not wait 400 ms
     mi_option_set(mi_option_max_errors, 0);
     mi_option_set(mi_option_max_warnings, 0);
-    unsigned cap_mb = SMALL_HEAP_MB;
+    unsigned cap_mb = SMALL_HEAP_MB < g_small_limit_mb ? SMALL_HEAP_MB : (unsigned)g_small_limit_mb;
     while (cap_mb >= 256 && !reserve_small_heap((size_t)cap_mb << 20)) cap_mb -= 128;
     if (cap_mb >= 256) {
         g_small_mb = (LONG)cap_mb;
@@ -336,7 +337,7 @@ static int install_into(HMODULE m) {
         cap_mb = 0;
         mi_option_set(mi_option_arena_reserve, 32 * 1024);  // KiB: no cap, but small arenas at least
     }
-#define HEAP_NAME "mimalloc " MI_STR(MI_MALLOC_VERSION) " (blocks <= 16 KB, %u MB reserved, grows to 768 MB in 32 MB steps if needed; 0 = no cap); larger blocks stay on the game's heap"
+#define HEAP_NAME "mimalloc " MI_STR(MI_MALLOC_VERSION) " (blocks <= 16 KB, %u MB reserved, grows to %u MB in 32 MB steps if needed; 0 = no cap); larger blocks stay on the game's heap"
 #define MI_STR(x) MI_STR2(x)
 #define MI_STR2(x) #x
     for (size_t i = 0; i < NPATCH; i++) {
@@ -355,7 +356,7 @@ static int install_into(HMODULE m) {
         VirtualProtect(site, 5, old, &old);
         FlushInstructionCache(GetCurrentProcess(), site, 5);
     }
-    wlog("empire.retail.dll at %p: game heap replaced by " HEAP_NAME, base, cap_mb);
+    wlog("empire.retail.dll at %p: game heap replaced by " HEAP_NAME, base, cap_mb, (unsigned)g_small_limit_mb);
 #ifdef HEAPFIX_MEMSTATS
     CloseHandle(CreateThread(NULL, 0, memstats, NULL, 0, NULL));
 #endif
@@ -427,6 +428,8 @@ int install_texfix(HMODULE m, int verify, void (*log)(const char *fmt, ...));   
 int install_uikeep(HMODULE m, void (*log)(const char *fmt, ...));                // uikeep.c
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...));  // diag.c
 void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
+extern unsigned g_uikeep_keep;                                       // uikeep.c: closed menus kept (heapfix.ini)
+extern int g_crash_logging;                                          // diag.c (heapfix.ini [mod] crash_logging)
 extern void (*g_frame_check)(void);                                  // fps.c
 // release (6.3, AGENT_LOG 104): the frame bridge (bridgeprobe.c, fgbridge.c, ...) for the upscaling add-on runs on passtime's
 // stage-driver hook in its lean bridge mode; it starts only when the add-on folder holds the helper
@@ -443,24 +446,94 @@ static int g_campfix_on, g_x87fix_on;
 static void frame_checks(void) {
     if (g_campfix_on) campfix_frame();
     if (g_x87fix_on) x87fix_frame();
-    if (g_passtime_on) {   // the frame bridge's frame counter and its 30 s report in heapfix.log
+    if (g_passtime_on)   // release: the frame bridge's frame counter
+    {
         g_geo_frame++;
-        if (g_gt_frame) g_gt_frame();
+        if (g_gt_frame) g_gt_frame();  // gputime.c: close the GPU frame, open the next
+    }
+    if (g_passtime_on) {  // the game exits without DLL_PROCESS_DETACH: report every 30 s
         static DWORD last;
         DWORD now = GetTickCount();
         if (!last) last = now;
-        if (now - last >= 30000) { passtime_report(wlog); last = now; }
+        if (now - last >= 30000) {
+            passtime_report(wlog);
+            last = now;
+        }
     }
 }
 
+static wchar_t g_ini[MAX_PATH];
 static void set_log_path(HINSTANCE h) {
     DWORD n = GetModuleFileNameW(h, g_log_path, MAX_PATH);
     wchar_t *slash = wcsrchr(g_log_path, L'\\');
-    if (n == 0 || n >= MAX_PATH || !slash || slash - g_log_path > MAX_PATH - 20) {
+    if (n == 0 || n >= MAX_PATH || !slash || slash - g_log_path > MAX_PATH - 40) {  // room for FrameBridge\settings.txt
         g_log_path[0] = 0;
         return;
     }
     wcscpy(slash + 1, L"heapfix.log");
+    wcscpy(g_ini, g_log_path);
+    wcscpy(g_ini + (slash + 1 - g_log_path), L"heapfix.ini");
+}
+
+// heapfix.ini in the game folder (as Rome 2's rome2fix.ini): written once with the defaults when missing, never
+// changed by the mod after that.
+static const char INI_DEFAULTS[] =
+    "; Attila Engine Performance Fix settings. 1 = on, 0 = off. Restart the game after a change.\r\n"
+    "; The mod writes this file once with the defaults and never changes it. Delete it to get the defaults back.\r\n"
+    "; (The older way still works too: an empty <name>_off.txt file in the game folder switches that fix off.)\r\n"
+    "\r\n"
+    "[fixes]\r\n"
+    "; FPS\r\n"
+    "memory_allocator=1\r\n"
+    "small_object_pools=1\r\n"
+    "render_list_sorts=1\r\n"
+    "battle_draw_batching=1\r\n"
+    "campaign_rounding=1\r\n"
+    "x87_rounding=1\r\n"
+    "terrain_height_cache=1\r\n"
+    "small_memory_copies=1\r\n"
+    "render_loop_prefetch=1\r\n"
+    "; loading\r\n"
+    "file_reading=1\r\n"
+    "missing_file_cache=1\r\n"
+    "battle_textures=1\r\n"
+    "; menus\r\n"
+    "menu_textures=1\r\n"
+    "\r\n"
+    "[mod]\r\n"
+    "; copy a newer version from the Steam Workshop into the game folder at startup\r\n"
+    "self_update=1\r\n"
+    "; record crashes in heapfix.log (EXCEPTION lines)\r\n"
+    "crash_logging=1\r\n"
+    "\r\n"
+    "[tuning]\r\n"
+    "; how many closed menus keep their textures (1-1024; fewer uses less memory)\r\n"
+    "menu_textures_kept=1024\r\n"
+    "; the most memory the fast allocator takes, in MB (256-768). Lower leaves more room for the game's big blocks\r\n"
+    "; with heavy mods; a little slower once it is full\r\n"
+    "small_heap_limit_mb=768\r\n"
+    "\r\n"
+    "; The DLSS add-on has its own settings: FrameBridge\\settings.txt (F11 in game).\r\n";
+static void ini_create(void) {
+    if (!g_ini[0]) return;
+    HANDLE f = CreateFileW(g_ini, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);  // only when missing
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    WriteFile(f, INI_DEFAULTS, sizeof INI_DEFAULTS - 1, &w, NULL);
+    CloseHandle(f);
+}
+static int ini_int(const wchar_t *section, const wchar_t *key, int def) {
+    return g_ini[0] ? (int)GetPrivateProfileIntW(section, key, def, g_ini) : def;
+}
+// 1 when a fix is switched off: <key>=0 in [fixes] of heapfix.ini, or the older <name>_off.txt in the game folder.
+static int fix_off(const wchar_t *key, const wchar_t *old_file, const char *name, const char *then) {
+    wchar_t p[MAX_PATH];
+    wcscpy(p, g_log_path);
+    wchar_t *sl = wcsrchr(p, L'\\');
+    int file = sl && wcslen(old_file) + (sl + 1 - p) < MAX_PATH && (wcscpy(sl + 1, old_file), GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES);
+    if (ini_int(L"fixes", key, 1) && !file) return 0;
+    wlog("%s switched off (heapfix.ini or %ls) - %s", name, old_file, then);
+    return 1;
 }
 
 static HINSTANCE g_self;
@@ -496,7 +569,7 @@ static void log_status(const int st[S_N]) {
         wlog("STATUS: %d of %d fixes are on", on, S_N);
     for (int i = 0; i < S_N; i++)
         wlog("  %-4s %s%s", st[i] == FIX_ON ? "on" : st[i] == FIX_PARTLY ? "part" : "OFF", g_fix_names[i],
-             st[i] == FIX_SWITCHED_OFF ? " (switched off by its _off.txt file in the game folder)"
+             st[i] == FIX_SWITCHED_OFF ? " (switched off in heapfix.ini, or by its _off.txt file)"
              : st[i] == FIX_PARTLY ? " (only part of it fits this game version)"
              : st[i] == FIX_INACTIVE ? " (does not fit this game version, so it stays off; details above)" : "");
 }
@@ -507,115 +580,62 @@ static void install_all(HMODULE m) {
     if (done) return;
     done = 1;
     int st[S_N] = {0};
+    ini_create();
+    g_crash_logging = ini_int(L"mod", L"crash_logging", 1) != 0;
     diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
-    update_check(g_self, wlog);  // a newer Workshop copy replaces this DLL for the next launch
+    if (ini_int(L"mod", L"self_update", 1))
+        update_check(g_self, wlog);     // a newer Workshop copy replaces this DLL for the next launch
+    else
+        wlog("self-update off (self_update=0 in heapfix.ini)");
+    g_small_limit_mb = ini_int(L"tuning", L"small_heap_limit_mb", SMALL_LIMIT_MB);
+    if (g_small_limit_mb < 256) g_small_limit_mb = 256;
+    if (g_small_limit_mb > SMALL_LIMIT_MB) g_small_limit_mb = SMALL_LIMIT_MB;
+    g_small_limit_mb &= ~(SMALL_STEP_MB - 1);  // whole growth steps
     wchar_t off[MAX_PATH];
     wcscpy(off, g_log_path);
     wchar_t *sl = wcsrchr(off, L'\\');
-    // heapfix_off.txt / pool_off.txt: the game keeps its own heap / pool lookup (to tell whether a crash depends on
-    // them). This runs before the game's first allocation, so leaving the heap alone is always safe.
-    if (sl) wcscpy(sl + 1, L"heapfix_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("heapfix_off.txt found - the game keeps its own heap");
-        st[S_HEAP] = FIX_SWITCHED_OFF;
-    } else
-        st[S_HEAP] = install_into(m) > 0;
-    if (sl) wcscpy(sl + 1, L"pool_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("pool_off.txt found - pool free lookup not replaced");
-        st[S_POOL] = FIX_SWITCHED_OFF;
-    } else
-        st[S_POOL] = install_pool(m, wlog) > 0;
+    // Switching the heap or the pool lookup off tells whether a crash depends on them. This runs before the game's
+    // first allocation, so leaving the heap alone is always safe.
+    st[S_HEAP] = fix_off(L"memory_allocator", L"heapfix_off.txt", "memory allocator", "the game keeps its own heap") ? FIX_SWITCHED_OFF : install_into(m) > 0;
+    st[S_POOL] = fix_off(L"small_object_pools", L"pool_off.txt", "pool free lookup", "not replaced") ? FIX_SWITCHED_OFF : install_pool(m, wlog) > 0;
     int sorts = 0, camp = 0, x87 = 0;
-    // sortfix_off.txt in the game folder skips the draw-list sort fix (for A/B FPS tests).
-    if (sl) wcscpy(sl + 1, L"sortfix_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("sortfix_off.txt found - draw-list sort fix not installed");
-        st[S_SORTS] = FIX_SWITCHED_OFF;
-    } else
-        sorts = install_sortfix(m, wlog);
-    // batchfix_off.txt in the game folder skips the battle batch fix (for A/B tests).
-    if (sl) wcscpy(sl + 1, L"batchfix_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("batchfix_off.txt found - batch fix not installed");
-        st[S_BATCH] = FIX_SWITCHED_OFF;
-    } else
-        st[S_BATCH] = install_batchfix(m, wlog) > 0;
-    // campfix_off.txt in the game folder skips the campaign x87 rounding fixes (for A/B tests).
-    if (sl) wcscpy(sl + 1, L"campfix_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("campfix_off.txt found - campaign rounding fixes not installed");
-        camp = -1;
-    } else {
-        camp = install_campfix(m, 0, wlog);
-        g_campfix_on = camp > 0;
-    }
-    // x87fix_off.txt skips the remaining x87 rounding-mode blocks (all of empire.retail.dll).
-    if (sl) wcscpy(sl + 1, L"x87fix_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("x87fix_off.txt found - x87 rounding fix not installed");
-        st[S_X87] = FIX_SWITCHED_OFF;
-    } else {
-        x87 = install_x87fix(m, wlog);
-        g_x87fix_on = x87 > 0;
-    }
+    if (fix_off(L"render_list_sorts", L"sortfix_off.txt", "render-list sorts", "not replaced")) st[S_SORTS] = FIX_SWITCHED_OFF;
+    else sorts = install_sortfix(m, wlog);
+    st[S_BATCH] = fix_off(L"battle_draw_batching", L"batchfix_off.txt", "batch fix", "not installed") ? FIX_SWITCHED_OFF : install_batchfix(m, wlog) > 0;
+    if (fix_off(L"campaign_rounding", L"campfix_off.txt", "campaign rounding fixes", "not installed")) camp = -1;
+    else g_campfix_on = (camp = install_campfix(m, 0, wlog)) > 0;
+    if (fix_off(L"x87_rounding", L"x87fix_off.txt", "x87 rounding fix", "not installed")) st[S_X87] = FIX_SWITCHED_OFF;
+    else g_x87fix_on = (x87 = install_x87fix(m, wlog)) > 0;
     if (g_campfix_on || g_x87fix_on) g_frame_check = frame_checks;
-    // Terrain height cache: counters builds verify it; normal builds cache (verified in game: 7.5 M
-    // queries over map, end turn, save load and battle, 0 mismatches). heightcache_off.txt disables.
-    if (sl) wcscpy(sl + 1, L"heightcache_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("heightcache_off.txt found - height cache not installed");
-        st[S_HEIGHT] = FIX_SWITCHED_OFF;
-    } else
-        st[S_HEIGHT] = install_heightcache(m, 2, wlog) > 0;
-    // memcpy small-copy fast path (the counters build counts sizes on the same function instead).
-    if (sl) wcscpy(sl + 1, L"memfast_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("memfast_off.txt found - memcpy fast path not installed");
-        st[S_COPY] = FIX_SWITCHED_OFF;
-    } else
-        st[S_COPY] = install_memfast(m, wlog) > 0;
-    // Battle render loops prefetch the next items' data (loopfetch.c). loopfetch_off.txt disables.
-    if (sl) wcscpy(sl + 1, L"loopfetch_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("loopfetch_off.txt found - render loop prefetch not installed");
-        st[S_PREFETCH] = FIX_SWITCHED_OFF;
-    } else {
+    // Terrain height cache: verified in game: 7.5 M queries over map, end turn, save load and battle, 0 mismatches.
+    st[S_HEIGHT] = fix_off(L"terrain_height_cache", L"heightcache_off.txt", "height cache", "not installed") ? FIX_SWITCHED_OFF
+                                                                                                    : install_heightcache(m, 2, wlog) > 0;
+    st[S_COPY] = fix_off(L"small_memory_copies", L"memfast_off.txt", "memcpy fast path", "not installed") ? FIX_SWITCHED_OFF : install_memfast(m, wlog) > 0;
+    // Battle render loops prefetch the next items' data (loopfetch.c).
+    if (fix_off(L"render_loop_prefetch", L"loopfetch_off.txt", "render loop prefetch", "not installed")) st[S_PREFETCH] = FIX_SWITCHED_OFF;
+    else {
         int n = install_loopfetch(m, wlog);
         st[S_PREFETCH] = n >= 6 ? FIX_ON : n ? FIX_PARTLY : FIX_INACTIVE;
     }
     // Loading: packs through the file cache, buffered small reads of the save (fileio.c), then the missing-folder
-    // cache for loose-file checks and opens (attrcache.c), whose open hook calls fileio's. Off switches for each.
-    if (sl) wcscpy(sl + 1, L"fileio_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("fileio_off.txt found - file I/O fix not installed");
-        st[S_FILES] = FIX_SWITCHED_OFF;
-    } else
-        st[S_FILES] = install_fileio(m, wlog) > 0;
-    if (sl) wcscpy(sl + 1, L"attrcache_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("attrcache_off.txt found - attribute cache not installed");
-        st[S_MISSING] = FIX_SWITCHED_OFF;
-    } else {
+    // cache for loose-file checks and opens (attrcache.c), whose open hook calls fileio's.
+    st[S_FILES] = fix_off(L"file_reading", L"fileio_off.txt", "file I/O fix", "not installed") ? FIX_SWITCHED_OFF : install_fileio(m, wlog) > 0;
+    if (fix_off(L"missing_file_cache", L"attrcache_off.txt", "missing-file cache", "not installed")) st[S_MISSING] = FIX_SWITCHED_OFF;
+    else {
         int verify = 0;
         st[S_MISSING] = install_attrcache(m, verify, wlog) > 0;
     }
     // Battle loading: the DXT1 texture compressor with SSE2, same output (texfix.c).
-    if (sl) wcscpy(sl + 1, L"texfix_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("texfix_off.txt found - texture compression not replaced");
-        st[S_TEXTURES] = FIX_SWITCHED_OFF;
-    } else {
+    if (fix_off(L"battle_textures", L"texfix_off.txt", "texture compression", "not replaced")) st[S_TEXTURES] = FIX_SWITCHED_OFF;
+    else {
         int verify = 0;
         st[S_TEXTURES] = install_texfix(m, verify, wlog) > 0;
     }
     // Menus: closed panels' textures stay loaded, so reopening does not load them again (uikeep.c).
-    if (sl) wcscpy(sl + 1, L"uikeep_off.txt");
-    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) {
-        wlog("uikeep_off.txt found - menu textures freed when closed, as the game does");
-        st[S_MENUS] = FIX_SWITCHED_OFF;
-    } else
-        st[S_MENUS] = install_uikeep(m, wlog) > 0;
+    int keep = ini_int(L"tuning", L"menu_textures_kept", 1024);
+    g_uikeep_keep = keep < 1 ? 1 : keep > 1024 ? 1024 : (unsigned)keep;
+    st[S_MENUS] = fix_off(L"menu_textures", L"uikeep_off.txt", "menu textures fix", "freed when closed, as the game does") ? FIX_SWITCHED_OFF
+                                                                                                                     : install_uikeep(m, wlog) > 0;
     if (st[S_SORTS] != FIX_SWITCHED_OFF) st[S_SORTS] = sorts == 2 ? FIX_ON : sorts ? FIX_PARTLY : FIX_INACTIVE;
     if (st[S_X87] != FIX_SWITCHED_OFF)  // the 4 campaign blocks (campfix) and the general x87 fix together
         st[S_X87] = x87 > 0 && camp == 4 ? FIX_ON : x87 > 0 || camp > 0 ? FIX_PARTLY : FIX_INACTIVE;
@@ -630,7 +650,7 @@ static void install_all(HMODULE m) {
     if (sl) wcscpy(sl + 1, L"FrameBridge\\helper64.exe");
     int addon = sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES;
     if (addon) {   // addon=off in its settings.txt: the add-on does nothing at all (no hooks), as if it were not installed
-        char text[1024] = {0};
+        char text[4096] = {0};   // settings.txt is past 1 KB since dlss_preset / sharpness: addon=off sat beyond 1024 bytes
         wcscpy(sl + 1, L"FrameBridge\\settings.txt");
         FILE *sf = _wfopen(off, L"r");
         if (sf) { fread(text, 1, sizeof text - 1, sf); fclose(sf); }

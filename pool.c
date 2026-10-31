@@ -7,6 +7,7 @@
 // of its list. A stale cache entry only costs a full search, never a wrong answer.
 #include <windows.h>
 #include <string.h>
+#include "gamerva.h"
 
 struct node { char *base; struct node *next; };
 struct cls { void *freelist; struct node *chunks; unsigned count; };
@@ -68,12 +69,6 @@ static const struct { DWORD rva, len, fnv; } POOL_FUNCS[] = {
     {0x7B6A80, 310, 0x88DAD0F2u}, {0x7B7070, 311, 0xCFCF782Du}, {0x7B6BC0, 311, 0xB6AABF0Fu},
     {0x7B6D00, 309, 0xCD52FD71u}, {0x7B6940, 309, 0xAEA56E55u},
 };
-
-static DWORD fnv1a(const unsigned char *b, DWORD n) {
-    DWORD h = 0x811C9DC5u;
-    while (n--) h = (h ^ *b++) * 0x01000193u;
-    return h;
-}
 
 static int write_jmp(unsigned char *site, void *to) {
     DWORD old;

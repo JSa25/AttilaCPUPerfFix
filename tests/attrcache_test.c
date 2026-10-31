@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <wchar.h>
 
-static wchar_t g_base[MAX_PATH];
+static wchar_t g_base[MAX_PATH], g_base_raw[MAX_PATH];  // raw: the same as a \\?\ path, for deleting
 static unsigned g_rng = 2463534242u;
 static unsigned rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5; return g_rng; }
 
@@ -92,6 +92,7 @@ static long run(int queries, int mutate_every) {
     return bad;
 }
 
+// dir must be a "\\?\\" path: the tree holds names like nul and Com1.txt, which a plain path cannot delete
 static void del_tree(const wchar_t *dir) {
     wchar_t pat[MAX_PATH];
     swprintf(pat, MAX_PATH, L"%ls\\*", dir);
@@ -110,7 +111,7 @@ static void del_tree(const wchar_t *dir) {
 }
 
 static void make_tree(void) {
-    del_tree(g_base);
+    del_tree(g_base_raw);
     CreateDirectoryW(g_base, NULL);
     for (int r = 0; r < 15; r++) {
         wchar_t p[MAX_PATH];
@@ -137,6 +138,7 @@ int main(void) {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
     swprintf(g_base, MAX_PATH, L"%lsattrcache_test_%lu", tmp, GetCurrentProcessId());
+    swprintf(g_base_raw, MAX_PATH, L"\\\\?\\%ls", g_base);
     if (!attrcache_init(0, NULL)) { puts("init failed"); return 1; }
     int fail = 0;
 
@@ -187,7 +189,7 @@ int main(void) {
     printf("missing-file opens: cache %.2f us, Windows %.2f us per call (%.1fx)\n", us_c, us_w, us_w / us_c);
 
     reset_cache();
-    del_tree(g_base);
+    del_tree(g_base_raw);
     puts(fail ? "attrcache test FAILED" : "attrcache test passed");
     return fail;
 }

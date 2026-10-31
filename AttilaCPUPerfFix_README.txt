@@ -132,26 +132,28 @@ Set both of these in this file (back it up first):
       for stability on cards with 4 GB or more.
 
 
-Turning single fixes off
-------------------------
-Create an empty file with one of these names in the game folder to disable that
-fix (useful if you suspect one of them):
+Settings (heapfix.ini)
+----------------------
+The first time the game starts with this version, the mod creates heapfix.ini
+in the game folder, next to heapfix.log. Open it with Notepad, change a number,
+save, and restart the game.
 
-  heapfix_off.txt      memory allocator (the game keeps its own heap)
-  pool_off.txt         small-object pool lookup
-  sortfix_off.txt      render-list sorts (both)
-  batchfix_off.txt     battle draw batching
-  campfix_off.txt      campaign map fixes
-  x87fix_off.txt       x87 rounding
-  heightcache_off.txt  terrain height cache
-  memfast_off.txt      small memory copy fast path
-  loopfetch_off.txt    battle render loop prefetch
-  attrcache_off.txt    loading: missing-folder cache
-  fileio_off.txt       loading: buffered save reads
-  texfix_off.txt       battle loading: texture compressor
-  uikeep_off.txt       menus: keep menu pictures loaded
-  update_off.txt       no automatic updates from the Steam Workshop (the mod and
-                       the add-on stay as you installed them)
+  [fixes]   one line per fix, 1 = on, 0 = off (useful if you suspect one of
+            them)
+  [mod]     self_update=0: no automatic updates from the Steam Workshop (the
+            mod and the add-on stay as you installed them)
+            crash_logging=0: no EXCEPTION lines in heapfix.log
+  [tuning]  menu_textures_kept: how many closed menus keep their textures
+            (1-1024, fewer uses less memory)
+            small_heap_limit_mb: the most memory the fast allocator takes
+            (256-768). Lower leaves more room for the game's big blocks with
+            heavy mods like MK1212, a little slower once it's full. Leave it at
+            768 unless you get out-of-memory crashes.
+
+The mod never changes your heapfix.ini. Delete it to get the defaults back.
+The old *_off.txt files (heapfix_off.txt, uikeep_off.txt, update_off.txt, ...)
+still work. The DLSS add-on keeps its own settings in FrameBridge\settings.txt
+(F11 in game).
 
 The STATUS lines in heapfix.log show which fixes are on, and why one is off.
 
@@ -197,6 +199,23 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.7.0:
+-Settings are now in heapfix.ini in the game folder (created on the first
+ start): every fix can be switched on or off there, plus self-update, crash
+ logging and two tuning values. The old *_off.txt files still work.
+-Upscaling and Framegen add-on: sharper DLAA and DLSS (the game's lighting,
+ shadows and fog now follow DLSS's sub-pixel jitter), and sharper textures
+ below native resolution.
+-Add-on: new Sharpness setting (Off / Low / Medium / High, default Medium) and
+ DLSS Preset choice (Default / J / K / L / M) in the F11 panel.
+-Add-on: fixed screen tearing, also on G-Sync screens.
+-Add-on: no more darker bloom at the right and bottom edges of the view below
+ native resolution.
+-Add-on: the helper now handles game folders with non-English characters in
+ the path.
+-A few small robustness fixes (crash logging, file buffering, add-on start,
+ very long game folder paths).
+
 Version 6.6.3:
 -Added two functions other mods can use with the Upscaling and Framegen
  add-on (fgb_state, fgb_d3d11_original).
@@ -350,3 +369,25 @@ Credits and licenses
 Built with AI assistance (Claude by Anthropic). Tested in game by the author.
 mimalloc (c) Microsoft Corporation and Daan Leijen, MIT license; see
 LICENSE-mimalloc.txt.
+
+The DLSS add-on's sharpening (in dinput8.dll) follows AMD FidelityFX Robust
+Contrast Adaptive Sharpening (RCAS), used under the MIT licence:
+
+Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

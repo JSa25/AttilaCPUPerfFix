@@ -33,6 +33,7 @@ static void load_text(const char *path) {
     fclose(f);
     CHECK(n > 0x1000);
     g_text = calloc(1, 0x2000000);
+    memcpy(g_text, d, 0x400);  // the headers: game_rva() reads the build from them
     unsigned pe = *(unsigned *)(d + 0x3C), nsec = *(unsigned short *)(d + pe + 6), opt = *(unsigned short *)(d + pe + 20);
     for (unsigned i = 0; i < nsec; i++) {
         const unsigned *s = (const unsigned *)(d + pe + 24 + opt + 40 * i + 8);
@@ -47,13 +48,18 @@ static conv_fn build(unsigned char *code, const struct spec *sp, int replaced) {
     unsigned char *p = code;
     memcpy(p, sp->load_xmm1 ? "\xF3\x0F\x10\x4C\x24\x04" : "\xF3\x0F\x10\x44\x24\x04", 6); p += 6;  // movss xmmN,[esp+4]
     memcpy(p, "\x81\xEC\x80\x00\x00\x00", 6); p += 6;                                               // sub esp,80h
-    memcpy(p, g_text + sp->prefix_rva, 6); p += 6;                                                  // the game's store
+    memcpy(p, g_text + game_rva(g_text, sp->prefix_rva + 6) - 6, 6); p += 6;                                                  // the game's store
     if (replaced) { memcpy(p, st->repl, st->repl_len); memset(p + st->repl_len, 0x90, st->len - st->repl_len); }
-    else memcpy(p, g_text + st->rva, st->len);
+    else memcpy(p, g_text + game_rva(g_text, st->rva), st->len);
     p += st->len;
     *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = sp->slot;                                         // mov eax,[esp+slot]
     memcpy(p, "\x81\xC4\x80\x00\x00\x00\xC3", 7);                                                   // add esp,80h; ret
     return (conv_fn)(void *)code;
+}
+
+static DWORD WINAPI run_at(LPVOID p) {   // runs the code at p (a "jmp $" inside the height block)
+    ((void (*)(void))p)();
+    return 0;
 }
 
 static unsigned rng = 12345;
@@ -62,7 +68,7 @@ static unsigned rnd(void) { rng = rng * 1664525u + 1013904223u; return rng; }
 int main(int argc, char **argv) {
     CHECK(argc == 2);
     load_text(argv[1]);
-    for (int i = 0; i < NSITES; i++) CHECK(memcmp(g_text + SITES[i].rva, SITES[i].orig, SITES[i].len) == 0);
+    for (int i = 0; i < NSITES; i++) CHECK(memcmp(g_text + game_rva(g_text, SITES[i].rva), SITES[i].orig, SITES[i].len) == 0);
     CHECK((fpu_cw() & 0xC00) == 0);  // the default rounding mode, as in the game
     unsigned char *code = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     CHECK(code);
@@ -113,9 +119,20 @@ int main(int argc, char **argv) {
     CHECK(memcmp(img + 0xD79AC8, FOG1_REPL, sizeof FOG1_REPL) == 0 && img[0xD79AC8 + 35] == 0x90);
     campfix_frame();
     CHECK(SITES[2].installed);
+    // another game thread parked inside the height block (jmp $ at its first byte): nothing written while it is there
+    img[0x189B363] = 0xEB;
+    img[0x189B363 + 1] = 0xFE;
+    FlushInstructionCache(GetCurrentProcess(), img + 0x189B363, 2);
+    HANDLE parked = CreateThread(NULL, 0, run_at, img + 0x189B363, 0, NULL);
+    CHECK(parked);
+    Sleep(200);
     unsigned short cw = fpu_cw(), up = cw | 0xC00;
     __asm__ volatile("fldcw %0" ::"m"(up));
     campfix_frame();
+    CHECK(SITES[2].installed && img[0x189B363] == 0xEB);
+    TerminateThread(parked, 0);
+    WaitForSingleObject(parked, INFINITE);
+    campfix_frame();   // the next frame, the block empty
     __asm__ volatile("fldcw %0" ::"m"(cw));
     CHECK(!SITES[2].installed && memcmp(img + 0x189B363, HEIGHT_ORIG, 36) == 0);
     printf("all campfix tests passed\n");

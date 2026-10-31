@@ -16,6 +16,7 @@
 // following code reloads; see notes in AGENT_LOG.md section 18.
 #include <windows.h>
 #include <string.h>
+#include "gamerva.h"
 
 struct site {
     const char *name;
@@ -70,13 +71,17 @@ static unsigned short fpu_cw(void) {
     return cw;
 }
 
-// Called by fps.c at the start of every frame, on the main thread (outside the patched functions).
+// The terrain height block is also run off the main thread (heightcache.c): it goes back while the other game threads
+// are suspended and none stands inside it (paused_write, gamerva.h), else next frame.
+static unsigned char *height_at(void) { return g_campfix_base + game_rva(g_campfix_base, SITES[2].rva); }
+static int height_busy(UINT_PTR eip) { return eip - (UINT_PTR)height_at() < SITES[2].len; }
+static void height_restore(void) { write_code(height_at(), SITES[2].orig, SITES[2].len, SITES[2].len); }
+
 // Called by fps.c at the start of every frame, on the main thread (outside the patched functions),
-// so this is also the one safe place to switch the patches on and off for A/B runs.
+// so this is also the one safe place to switch the patches on and off for A/B runs (dev only: not paused).
 void campfix_frame(void) {
     struct site *h = &SITES[2];
-    if (h->installed && (fpu_cw() & 0xC00) != 0) {
-        write_code(g_campfix_base + h->rva, h->orig, h->len, h->len);
+    if (h->installed && (fpu_cw() & 0xC00) != 0 && paused_write((HMODULE)g_campfix_base, height_busy, height_restore)) {
         h->installed = 0;
         g_height_disabled = 1;
         g_campfix_log("campaign fix: the game changed the FPU rounding mode - terrain height patch removed");
@@ -87,11 +92,11 @@ void campfix_frame(void) {
     for (int i = 0; i < NSITES; i++) {
         struct site *s = &SITES[i];
         if (i == 2 && g_height_disabled) continue;
-        if (want && !s->installed && memcmp(g_campfix_base + s->rva, s->orig, s->len) == 0) {
-            write_code(g_campfix_base + s->rva, s->repl, s->repl_len, s->len);
+        if (want && !s->installed && memcmp(g_campfix_base + game_rva(g_campfix_base, s->rva), s->orig, s->len) == 0) {
+            write_code(g_campfix_base + game_rva(g_campfix_base, s->rva), s->repl, s->repl_len, s->len);
             s->installed = 1;
         } else if (!want && s->installed) {
-            write_code(g_campfix_base + s->rva, s->orig, s->len, s->len);
+            write_code(g_campfix_base + game_rva(g_campfix_base, s->rva), s->orig, s->len, s->len);
             s->installed = 0;
         }
     }
@@ -107,9 +112,9 @@ int install_campfix(HMODULE m, int ab, void (*log)(const char *fmt, ...)) {
     int n = 0;
     for (int i = 0; i < NSITES; i++) {
         struct site *s = &SITES[i];
-        if (memcmp(b + s->rva, s->orig, s->len) != 0) { log("campaign fix: %s differs from this game version - skipped", s->name); continue; }
+        if (memcmp(b + game_rva(b, s->rva), s->orig, s->len) != 0) { log("campaign fix: %s differs from this game version - skipped", s->name); continue; }
         if (i == 2 && (fpu_cw() & 0xC00) != 0) { log("campaign fix: FPU rounding mode is not the default - terrain height skipped"); continue; }
-        write_code(b + s->rva, s->repl, s->repl_len, s->len);
+        write_code(b + game_rva(b, s->rva), s->repl, s->repl_len, s->len);
         s->installed = 1;
         n++;
     }

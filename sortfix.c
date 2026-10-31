@@ -6,6 +6,7 @@
 // equal keys keep their input order; the originals left their order unspecified) and writes the pointers back.
 #include <windows.h>
 #include <string.h>
+#include "gamerva.h"
 
 #define RVA_DRAWSORT 0x17AD5D0  // VA 0x117AD5D0 at the preferred base 0x10000000
 #define DRAWSORT_LEN 630
@@ -18,13 +19,14 @@ static __thread unsigned t_cap;
 typedef void(__cdecl *sort_fn)(void **, void **, int, void *);
 
 static struct sort_site {
-    DWORD rva, fnv;            // FNV-1a of the whole 630-byte function in the 2026-09-19 build (no relocations)
+    DWORD rva, fnv, fnv_gog;   // FNV-1a of the whole 630-byte function in the 2026-09-19 build (no relocations); GOG 6A4F4723:
+                               // the same code, one call target moved (wip/gog)
     unsigned hi, lo;           // key offsets: compared as (hi, lo)
     const char *name;
     unsigned char tramp[16];   // the overwritten prologue + jmp back: the original sort
 } g_sorts[2] = {
-    {0x17AD5D0, 0xD811EF5Au, 0x6C, 0x68, "battle draw-list sort", {0}},
-    {0x17ACB50, 0xC33528C2u, 0x4C, 0x48, "render-list sort (+0x4C/+0x48)", {0}},
+    {0x17AD5D0, 0xD811EF5Au, 0x3A3DA72Au, 0x6C, 0x68, "battle draw-list sort", {0}},
+    {0x17ACB50, 0xC33528C2u, 0x1193F5A9u, 0x4C, 0x48, "render-list sort (+0x4C/+0x48)", {0}},
 };
 
 static unsigned long long key_at(const void *p, const struct sort_site *s) {
@@ -89,20 +91,15 @@ static void sort_by_keys(void **first, void **last, int ideal, void *ctx, const 
 void __cdecl draw_sort(void **first, void **last, int ideal, void *ctx) { sort_by_keys(first, last, ideal, ctx, &g_sorts[0]); }
 void __cdecl list_sort(void **first, void **last, int ideal, void *ctx) { sort_by_keys(first, last, ideal, ctx, &g_sorts[1]); }
 
-static DWORD fnv1a(const unsigned char *b, DWORD n) {
-    DWORD h = 0x811C9DC5u;
-    while (n--) h = (h ^ *b++) * 0x01000193u;
-    return h;
-}
-
 // Returns how many of the two sorts were redirected (each is independent: either one alone is correct).
 int install_sortfix(HMODULE m, void (*log)(const char *fmt, ...)) {
     void *repl[2] = {(void *)draw_sort, (void *)list_sort};
     int n = 0;
     for (int i = 0; i < 2; i++) {
         struct sort_site *s = &g_sorts[i];
-        unsigned char *site = (unsigned char *)m + s->rva;
-        if (fnv1a(site, DRAWSORT_LEN) != s->fnv) {
+        unsigned char *site = (unsigned char *)m + game_rva(m, s->rva);
+        DWORD h = fnv1a(site, DRAWSORT_LEN);
+        if (h != s->fnv && h != s->fnv_gog) {
             log("%s at +0x%X does not match this game version - not patched", s->name, s->rva);
             continue;
         }

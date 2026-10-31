@@ -6,6 +6,7 @@
 // Each site is a loop top that is the target of exactly one jb back-edge, with no jump into the patched bytes.
 #include <windows.h>
 #include <string.h>
+#include "gamerva.h"
 
 volatile unsigned char g_loopfetch_on = 1;  // dev A/B flips it; the original instructions run either way
 
@@ -105,7 +106,7 @@ int install_loopfetch(HMODULE m, void (*log)(const char *fmt, ...)) {
         const struct site *t = &SITES[i];
         if (!t->on) continue;
         want++;
-        unsigned char *site = (unsigned char *)m + t->rva, *s = code + 128 * i;
+        unsigned char *site = (unsigned char *)m + game_rva(m, t->rva), *s = code + 128 * i;
         if (memcmp(site, t->orig, t->len) != 0) {
             log("loop prefetch: %s differs from this game version - skipped", t->name);
             continue;

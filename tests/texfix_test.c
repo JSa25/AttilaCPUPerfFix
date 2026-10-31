@@ -60,8 +60,9 @@ int main(int argc, char **argv) {
     HMODULE m = LoadLibraryExW(w, NULL, DONT_RESOLVE_DLL_REFERENCES);
     CHECK(m != NULL);
     unsigned char *b = (unsigned char *)m;
-    CHECK(fnv1a(b + RVA_COMPRESS, LEN_COMPRESS) == FNV_COMPRESS && fnv1a(b + RVA_INDICES, LEN_INDICES) == FNV_INDICES);
-    compress_fn orig = (compress_fn)(void *)(b + RVA_COMPRESS);
+    DWORD hc = fnv1a(b + game_rva(b, RVA_COMPRESS), LEN_COMPRESS);
+    CHECK((hc == FNV_COMPRESS || hc == FNV_COMPRESS_GOG) && fnv1a(b + game_rva(b, RVA_INDICES), LEN_INDICES) == FNV_INDICES);
+    compress_fn orig = (compress_fn)(void *)(b + game_rva(b, RVA_COMPRESS));
 
     long cases = 0, blocks = 0;
     for (int iter = 0; iter < 20000; iter++) {

@@ -13,6 +13,7 @@
 
 #define FGB_PROTO 4
 #define FGB_QUIT 0xFFFFFFFFu
+#define FGB_CAP_PRESET 1u   /* sr_preset is applied (add-on version 5) */
 
 typedef struct {
     uint32_t proto, width, height, format, hwnd, luid_lo;
@@ -35,7 +36,12 @@ typedef struct {
     volatile uint32_t frame_limit_us;   /* game: NVIDIA Reflex frame limit in microseconds per frame as Reflex counts
                                            them (shown frames, generated ones included); 0 = none. Was padding: a game
                                            side that does not know it leaves it 0 */
-    uint32_t pad1[8];
+    volatile uint32_t sr_preset;   /* game: DLSS preset for every mode, NVIDIA's number (10..13 = J..M); 0 = NVIDIA's
+                                      default per mode. Was padding: an older game side leaves it 0, an older helper
+                                      ignores it (same place as in Rome 2's block) */
+    volatile uint32_t helper_caps; /* helper, before helper_ok: what it supports (FGB_CAP_*). Was padding: an older helper
+                                      leaves it 0, so the game can tell the player to update the add-on */
+    uint32_t pad1[6];
     float vp[16], prev_vp[16];     /* game: view-projection of frame n and n-1 (row-major, clip = M x [x y z 1]) */
 } FgbShared;
 _Static_assert(sizeof(FgbShared) == 256, "bridge block layout");

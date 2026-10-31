@@ -9,6 +9,7 @@
 // by a stored pointer.
 #include <windows.h>
 #include <string.h>
+#include "gamerva.h"
 
 #define RVA_STEP 0x174CCA0u         // the queue step, checked through its delete call
 #define LEN_STEP 0xEDu
@@ -20,6 +21,10 @@
 #define RVA_ACQUIRE 0x175D5D0u      // checked only: its count-of-0 handling is what this relies on
 #define LEN_ACQUIRE 0xECu
 #define FNV_ACQUIRE 0x26B7C51Fu
+// GOG 6A4F4723: the same code, only call targets moved (wip/gog)
+#define FNV_STEP_GOG 0xD7A32215u
+#define FNV_DELETE_GOG 0xFE10A9F6u
+#define FNV_ACQUIRE_GOG 0x3A9B918Fu
 #define RVA_TEX_FIND 0x174B470u     // thiscall(manager, name) -> picture (name at +4)
 #define RVA_REFS_FIND 0x174D880u    // thiscall(table, name) -> entry: count +0x38, pinned +0x3C
 #define RVA_REFS 0x2A3669Cu
@@ -36,6 +41,7 @@ volatile unsigned char g_uikeep_on;  // heapfix.c: off with uikeep_ab.txt in the
 
 extern volatile DWORD g_uikeep_tid;  // diag.c: a crash record says when it happened inside this fix's work
 static struct { DWORD len; char *text; } g_ring[KEEP];
+unsigned g_uikeep_keep = KEEP;  // how many are kept, 1..KEEP (heapfix.ini [menus] kept_closed)
 static unsigned g_head, g_count;
 static volatile LONG g_kept, g_again, g_freed, g_gone;  // volatile: only read by the dev log
 
@@ -55,7 +61,7 @@ static void free_kept(void *mgr, DWORD len, char *text) {
 
 static void free_all(void *mgr) {
     for (; g_count; g_count--) {
-        unsigned k = (g_head + KEEP - g_count) % KEEP;  // oldest
+        unsigned k = (g_head + g_uikeep_keep - g_count) % g_uikeep_keep;  // oldest
         free_kept(mgr, g_ring[k].len, g_ring[k].text);
     }
 }
@@ -76,7 +82,7 @@ static void uk_delete_body(void *mgr, const gname *name) {
     }
     unsigned i = 0;
     for (; i < g_count; i++) {  // kept before, used again, queued again: already in the ring
-        unsigned k = (g_head + KEEP - 1 - i) % KEEP;
+        unsigned k = (g_head + g_uikeep_keep - 1 - i) % g_uikeep_keep;
         if (g_ring[k].len == name->len && !memcmp(g_ring[k].text, name->text, name->len)) break;
     }
     if (i < g_count) {
@@ -87,13 +93,13 @@ static void uk_delete_body(void *mgr, const gname *name) {
     if (!copy) { g_delete(mgr, name); return; }
     memcpy(copy, name->text, name->len);
     g_kept++;
-    if (g_count == KEEP)
+    if (g_count == g_uikeep_keep)
         free_kept(mgr, g_ring[g_head].len, g_ring[g_head].text);
     else
         g_count++;
     g_ring[g_head].len = name->len;
     g_ring[g_head].text = copy;
-    g_head = (g_head + 1) % KEEP;
+    g_head = (g_head + 1) % g_uikeep_keep;
 }
 
 #ifndef UIKEEP_TEST
@@ -117,22 +123,21 @@ static DWORD uk_fnv(const unsigned char *b, DWORD rva, DWORD n) {
         }
         off += r->SizeOfBlock;
     }
-    DWORD h = 0x811C9DC5u;
-    for (DWORD i = 4; i < n + 4; i++) h = (h ^ buf[i]) * 0x01000193u;
-    return h;
+    return fnv1a(buf + 4, n);
 }
 
 int install_uikeep(HMODULE m, void (*log)(const char *fmt, ...)) {
-    unsigned char *b = (unsigned char *)m, *site = b + RVA_CALL;
-    if (uk_fnv(b, RVA_STEP, LEN_STEP) != FNV_STEP || uk_fnv(b, RVA_DELETE, LEN_DELETE) != FNV_DELETE ||
-        uk_fnv(b, RVA_ACQUIRE, LEN_ACQUIRE) != FNV_ACQUIRE) {
+    unsigned char *b = (unsigned char *)m, *site = b + game_rva(b, RVA_CALL);
+    DWORD hs = uk_fnv(b, game_rva(b, RVA_STEP), LEN_STEP), hd = uk_fnv(b, game_rva(b, RVA_DELETE), LEN_DELETE),
+          ha = uk_fnv(b, game_rva(b, RVA_ACQUIRE), LEN_ACQUIRE);
+    if ((hs != FNV_STEP && hs != FNV_STEP_GOG) || (hd != FNV_DELETE && hd != FNV_DELETE_GOG) || (ha != FNV_ACQUIRE && ha != FNV_ACQUIRE_GOG)) {
         log("menu textures (+0x%X) differ from this game version - not kept", RVA_STEP);
         return 0;
     }
-    g_refs_find = (find_fn)(b + RVA_REFS_FIND);
-    g_tex_find = (find_fn)(b + RVA_TEX_FIND);
-    g_delete = (delete_fn)(b + RVA_DELETE);
-    g_refs = (char *)b + RVA_REFS;
+    g_refs_find = (find_fn)(b + game_rva(b, RVA_REFS_FIND));
+    g_tex_find = (find_fn)(b + game_rva(b, RVA_TEX_FIND));
+    g_delete = (delete_fn)(b + game_rva(b, RVA_DELETE));
+    g_refs = (char *)b + game_rva(b, RVA_REFS);
     g_uikeep_on = 1;
     DWORD old;
     if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old)) {
@@ -143,7 +148,7 @@ int install_uikeep(HMODULE m, void (*log)(const char *fmt, ...)) {
     memcpy(site + 1, &rel, 4);  // the call stays a call, to uk_delete
     VirtualProtect(site, 5, old, &old);
     FlushInstructionCache(GetCurrentProcess(), site, 5);
-    log("menu textures: the last %d closed ones stay loaded (faster reopening)", KEEP);
+    log("menu textures: the last %d closed ones stay loaded (faster reopening)", g_uikeep_keep);
     return 1;
 }
 #endif

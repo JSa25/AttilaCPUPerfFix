@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <psapi.h>
+#include "gamerva.h"
 
 #define RVA_FRAME 0x0C1950
 static const unsigned char FRAME_PROLOGUE[10] = {0x56, 0x8B, 0xF1, 0x80, 0xBE, 0xC8, 0x00, 0x00, 0x00, 0x00};
@@ -35,7 +36,7 @@ __attribute__((naked)) static void fps_stub(void) {
 
 // Returns 1 if the frame hook was installed.
 int install_fps(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...)) {
-    unsigned char *site = (unsigned char *)m + RVA_FRAME;
+    unsigned char *site = (unsigned char *)m + game_rva(m, RVA_FRAME);
     if (memcmp(site, FRAME_PROLOGUE, sizeof FRAME_PROLOGUE) != 0) {
         log("frame function at +0x%X does not match this game version - FPS logging off", RVA_FRAME);
         return 0;

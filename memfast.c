@@ -8,6 +8,7 @@
 // changes flags, as the original does.
 #include <windows.h>
 #include <string.h>
+#include "gamerva.h"
 
 #define RVA_MEMCPY_FN 0x1A27CA0
 static const unsigned char MEMFAST_PROLOGUE[6] = {0x57, 0x56, 0x8B, 0x74, 0x24, 0x10};  // push edi; push esi; mov esi,[esp+10h]
@@ -84,7 +85,7 @@ __attribute__((naked)) void memfast_stub(void) {
 
 // Returns 1 if installed.
 int install_memfast(HMODULE m, void (*log)(const char *fmt, ...)) {
-    unsigned char *site = (unsigned char *)m + RVA_MEMCPY_FN;
+    unsigned char *site = (unsigned char *)m + game_rva(m, RVA_MEMCPY_FN);
     if (memcmp(site, MEMFAST_PROLOGUE, 6) != 0) { log("memcpy fast path: code differs from this game version - not installed"); return 0; }
     DWORD old;
     if (!VirtualProtect(g_memfast_tramp, sizeof g_memfast_tramp, PAGE_EXECUTE_READWRITE, &old)) return 0;

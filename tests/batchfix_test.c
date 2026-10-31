@@ -17,6 +17,7 @@ static unsigned char *load_text(const char *path, unsigned char *img) {  // maps
     size_t n = fread(d, 1, sizeof d, f);
     fclose(f);
     CHECK(n > 0x1000);
+    memcpy(img, d, 0x400);  // the headers: game_rva() reads the build from them
     unsigned pe = *(unsigned *)(d + 0x3C), nsec = *(unsigned short *)(d + pe + 6), opt = *(unsigned short *)(d + pe + 20);
     for (unsigned i = 0; i < nsec; i++) {
         const unsigned *s = (const unsigned *)(d + pe + 24 + opt + 40 * i + 8);  // vsize, va, rawsize, rawptr
@@ -64,11 +65,11 @@ int main(int argc, char **argv) {
     load_text(argv[1], orig);
     load_text(argv[1], img);
     for (int i = 0; i < 4; i++) {  // end each copy right after the AL test with a ret
-        orig[SITES[i].reset_rva + 9] = 0xC3;
-        img[SITES[i].reset_rva + 9] = 0xC3;
+        orig[game_rva(orig, SITES[i].reset_rva) + 9] = 0xC3;
+        img[game_rva(img, SITES[i].reset_rva) + 9] = 0xC3;
     }
     CHECK(install_batchfix((HMODULE)img, say) == 4);
-    CHECK(img[SITES[0].cmp_rva] == 0xE9 && img[SITES[0].reset_rva] == 0xE9);
+    CHECK(img[game_rva(img, SITES[0].cmp_rva)] == 0xE9 && img[game_rva(img, SITES[0].reset_rva)] == 0xE9);
 
     unsigned ecs[] = {0, 5, 7};
     int changed = 0, cases = 0;
@@ -91,10 +92,10 @@ int main(int argc, char **argv) {
                     b = a;
                     unsigned char st_a[0x100], st_b[0x100];
                     memset(state, 0, sizeof state); *(unsigned *)(state + 0x14) = ecs[cur]; *(unsigned *)(state + 0x64) = limit;
-                    run_site(orig + SITES[i].cmp_rva, &a);
+                    run_site(orig + game_rva(orig, SITES[i].cmp_rva), &a);
                     memcpy(st_a, state, sizeof state);
                     memset(state, 0, sizeof state); *(unsigned *)(state + 0x14) = ecs[cur]; *(unsigned *)(state + 0x64) = limit;
-                    run_site(img + SITES[i].cmp_rva, &b);
+                    run_site(img + game_rva(img, SITES[i].cmp_rva), &b);
                     memcpy(st_b, state, sizeof state);
                     cases++;
                     int same_nonzero = ecs[cur] != 0 && ecs[cur] == ecs[it];

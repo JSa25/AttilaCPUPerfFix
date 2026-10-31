@@ -13,6 +13,7 @@
 // values. The batch still ends on texture, mesh, bone, size or flag changes, as for zero-valued items.
 #include <windows.h>
 #include <string.h>
+#include "gamerva.h"
 
 struct site {
     unsigned cmp_rva;    // cmp dword [esi+14h],0 ; jnz +0Dh
@@ -46,8 +47,8 @@ static void put_rel(unsigned char *at, const unsigned char *target) {  // at = t
 }
 
 static int site_matches(const unsigned char *b, const struct site *s) {
-    const unsigned char *c = b + s->cmp_rva, *r = b + s->reset_rva;
-    return memcmp(b + s->load_rva, s->load, 3) == 0 && memcmp(b + s->field_rva, s->field_load, s->field_load_len) == 0 &&
+    const unsigned char *c = b + game_rva(b, s->cmp_rva), *r = b + game_rva(b, s->reset_rva);
+    return memcmp(b + game_rva(b, s->load_rva), s->load, 3) == 0 && memcmp(b + game_rva(b, s->field_rva), s->field_load, s->field_load_len) == 0 &&
            memcmp(c, CMP_BYTES, 6) == 0 &&
            memcmp(c + 6, SAME_BYTES, 5) == 0 && memcmp(c + 0x13, DIFF_BYTES, 4) == 0 &&
            memcmp(r, RESET_BYTES, 7) == 0 && memcmp(r + 7, TEST_AL, 2) == 0;
@@ -94,7 +95,7 @@ int install_batchfix(HMODULE m, void (*log)(const char *fmt, ...)) {
     unsigned char *code = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!code) return 0;
     for (int i = 0; i < 4; i++) {
-        unsigned char *c = b + SITES[i].cmp_rva, *r = b + SITES[i].reset_rva, *st = code + 64 * i;
+        unsigned char *c = b + game_rva(b, SITES[i].cmp_rva), *r = b + game_rva(b, SITES[i].reset_rva), *st = code + 64 * i;
         build_stubs(st, c, r, SITES[i].item_modrm, SITES[i].field);
         jump_to(c, 6, st);
         jump_to(r, 7, st + 32);

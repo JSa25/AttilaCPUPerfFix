@@ -59,6 +59,36 @@ static unsigned g_pace_timeouts;
 static int g_sr;              // DLSS SR on
 static UINT g_rw, g_rh;       // render size (the top-left of the targets)
 static float g_jx, g_jy;      // this frame's jitter (render pixels, x right, y down)
+static uint32_t g_preset;     // DLSS preset (NVIDIA's number, 0 = its default per mode)
+// Sharpening of the DLSS output (games with DLSS built in ship one: NVIDIA took it out of DLSS; Rome 2 DLSS_LOG 45 / 46):
+// AMD FidelityFX's RCAS (robust contrast-adaptive sharpening, MIT licence) as a compute pass, from the output into
+// g_sharp, then into the back buffer and back into the shared output (frame generation tells the UI from the scene by
+// comparing that with the final image: a sharpened final against an unsharpened copy would look like UI everywhere).
+// g_sharpness: RCAS's con.x (exp2(-stops)), 0 off.
+static ID3D11ComputeShader *g_sharp_cs;
+static ID3D11Texture2D *g_sharp;
+static ID3D11UnorderedAccessView *g_sharp_uav;
+static ID3D11ShaderResourceView *g_srout_srv[2];
+static ID3D11Buffer *g_sharp_cb;
+static float g_sharpness;
+static unsigned g_sharp_frames;
+static const char sharp_src[] =
+    "Texture2D<float4> src : register(t0);\n"
+    "RWTexture2D<float4> dst : register(u0);\n"
+    "cbuffer c : register(b0) { float4 k; }\n"
+    "float3 at(int2 p, int2 m) { return src[clamp(p, int2(0, 0), m)].rgb; }\n"
+    "[numthreads(8, 8, 1)] void cs(uint3 id : SV_DispatchThreadID) {\n"
+    "  uint w, h; src.GetDimensions(w, h);\n"
+    "  if (id.x >= w || id.y >= h) return;\n"
+    "  int2 p = int2(id.xy), m = int2(w - 1, h - 1);\n"
+    "  float3 b = at(p + int2(0, -1), m), d = at(p + int2(-1, 0), m), f = at(p + int2(1, 0), m), hh = at(p + int2(0, 1), m);\n"
+    "  float4 e4 = src[p];\n"
+    "  float3 mn4 = min(min(b, d), min(f, hh)), mx4 = max(max(b, d), max(f, hh));\n"
+    "  float3 hitMin = min(mn4, e4.rgb) / (4.0 * mx4 + 1e-6), hitMax = (1.0 - max(mx4, e4.rgb)) / (4.0 * mn4 - 4.0 - 1e-6);\n"
+    "  float3 lobeRGB = max(-hitMin, hitMax);\n"
+    "  float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * k.x;\n"
+    "  dst[p] = float4((lobe * (b + d + f + hh) + e4.rgb) / (4.0 * lobe + 1.0), e4.a);\n"
+    "}\n";
 static unsigned g_sr_frames, g_sr_timeouts;
 static double g_sr_wait_ms, g_sr_wait_max;
 static void (*g_log)(const char *fmt, ...);
@@ -167,6 +197,20 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     g_rw = w; g_rh = h;
     D3D11_BUFFER_DESC cbd = {144, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
     if (FAILED(ID3D11Device_CreateBuffer(dev, &cbd, NULL, &g_cb))) return 0;
+    {   // the sharpening pass: without it the output goes out as DLSS made it
+        D3D11_TEXTURE2D_DESC sd = {w, h, 1, 1, fmt, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, 0, 0};
+        D3D11_BUFFER_DESC sbd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        ID3DBlob *sb = NULL;
+        int sok = SUCCEEDED(comp(sharp_src, strlen(sharp_src), "fgbsharp", NULL, NULL, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &sb, NULL)) &&
+                  SUCCEEDED(ID3D11Device_CreateComputeShader(dev, ID3D10Blob_GetBufferPointer(sb), ID3D10Blob_GetBufferSize(sb), NULL, &g_sharp_cs)) &&
+                  SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &sd, NULL, &g_sharp)) &&
+                  SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)g_sharp, NULL, &g_sharp_uav)) &&
+                  SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)g_srout[0], NULL, &g_srout_srv[0])) &&
+                  SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)g_srout[1], NULL, &g_srout_srv[1])) &&
+                  SUCCEEDED(ID3D11Device_CreateBuffer(dev, &sbd, NULL, &g_sharp_cb));
+        if (sb) ID3D10Blob_Release(sb);
+        if (!sok) { g_sharp_cs = NULL; log("frame bridge: sharpening not available (back buffer format %u)", fmt); }
+    }
 
     // each named object must be new: one made first by another process under our name would be read and written by us
     int taken = 0;
@@ -186,7 +230,7 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     g_hwnd = hwnd;
     g_sh->luid_lo = adesc.AdapterLuid.LowPart; g_sh->luid_hi = adesc.AdapterLuid.HighPart;
     g_sh->fg_frames = fg_frames;
-    g_sh->render_w = g_rw; g_sh->render_h = g_rh; g_sh->sr_on = g_sr;
+    g_sh->render_w = g_rw; g_sh->render_h = g_rh; g_sh->sr_on = g_sr; g_sh->sr_preset = g_preset;
     g_sh->fg_test_limit = g_fg_test_limit;
     g_sh->proto = FGB_PROTO;
 
@@ -199,13 +243,21 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) { log("frame bridge: helper not started (%lu) - off", GetLastError()); return 0; }
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) { log("frame bridge: helper not started (%lu) - off", GetLastError()); CloseHandle(job); return 0; }
     AssignProcessToJobObject(job, pi.hProcess);
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
     g_helper = pi.hProcess;
-    for (int i = 0; i < 10000 && !g_sh->helper_ok && !g_sh->error && WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT; i++) Sleep(1);
-    if (!g_sh->helper_ok) { log("frame bridge: helper did not start Streamline - off (see its log)"); return 0; }
+    // 10 s by the clock (Sleep(1) lasts 15.6 ms at Windows' default timer, so counting sleeps could take ~2.5 min)
+    for (ULONGLONG t0 = GetTickCount64(); !g_sh->helper_ok && !g_sh->error && GetTickCount64() - t0 < 10000 &&
+                                          WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT;)
+        Sleep(1);
+    if (!g_sh->helper_ok) {   // a slow start must not leave the helper running with the game's window
+        TerminateProcess(g_helper, 1);
+        WaitForSingleObject(g_helper, 1000);
+        log("frame bridge: helper did not start Streamline - off (see its log)");
+        return 0;
+    }
     g_live = 1;
     HANDLE wd = CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
     if (wd) CloseHandle(wd);
@@ -227,6 +279,12 @@ static void (*g_motion_pass)(ID3D11Resource *depth, float jx, float jy);
 void fgb_set_motion(void (*pass)(ID3D11Resource *depth, float jx, float jy)) { g_motion_pass = pass; }
 ID3D11Texture2D *fgb_mv_texture(void) { return g_mv; }
 void fgb_set_frame_limit(uint32_t us) { if (g_sh) g_sh->frame_limit_us = us; }   // NVIDIA Reflex frame limit (0 none)
+// DLSS preset for every mode, NVIDIA's number (10..13 = J..M, 0 its default per mode); the helper applies it from the next frame
+void fgb_set_preset(unsigned preset) { g_preset = preset; if (g_sh) g_sh->sr_preset = preset; }
+int fgb_helper_has_presets(void) { return g_sh && (g_sh->helper_caps & FGB_CAP_PRESET); }   // an older add-on's helper: 0
+// Sharpening of the DLSS output: RCAS's con (exp2(-stops)), 0 off. Takes effect from the next frame.
+void fgb_set_sharpness(float con) { g_sharpness = con; }
+unsigned fgb_sharp_frames(void) { return g_sharp_frames; }   // frames sharpened so far
 unsigned fgb_shown(void) { return g_sh ? g_sh->shown : 0; }   // frames the helper has shown (generated ones included)
 
 // DLSS SR on / off and the render size (<= the output size; equal = DLAA). Takes effect from the next frame.
@@ -355,17 +413,20 @@ void fgb_hudless(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float 
 // call - fgb_motion_vectors() (another mod's early effects, right after the scene's geometry) or the HUD-less point.
 // Returns 1 if they are made. Before writing, the GPU waits until the helper has read the previous frame's.
 static unsigned g_mv_frame = ~0u;
+static D3D11_TEXTURE2D_DESC g_dfail;   // the depth buffer the copy failed for: not tried (and logged) again every frame
 int fgb_make_vectors(ID3D11Resource *depth, const float vp[16]) {
     if (!fgb_active()) return 0;
     if (g_mv_frame == g_n) return 1;
+    // depth: own copy (the game's depth may be bound as the depth target right now), read as R24 by the compute pass
+    D3D11_TEXTURE2D_DESC dd;
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)depth, &dd);
+    if (!memcmp(&dd, &g_dfail, sizeof dd)) return 0;
     wait_previous();
     int sr = g_sr;
     UINT rw = sr ? g_rw : g_w, rh = sr ? g_rh : g_h;
     float jx = sr ? g_jx : 0, jy = sr ? g_jy : 0;
-    // depth: own copy (the game's depth may be bound as the depth target right now), read as R24 by the compute pass
-    D3D11_TEXTURE2D_DESC dd;
-    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)depth, &dd);
     if (!g_dcopy || dd.Width != g_dw || dd.Height != g_dh) {
+        D3D11_TEXTURE2D_DESC game = dd;
         if (g_dcopy_srv) ID3D11ShaderResourceView_Release(g_dcopy_srv);
         if (g_dcopy) ID3D11Texture2D_Release(g_dcopy);
         g_dcopy = NULL; g_dcopy_srv = NULL;
@@ -374,7 +435,10 @@ int fgb_make_vectors(ID3D11Resource *depth, const float vp[16]) {
         sd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1;
         if (dd.Format != DXGI_FORMAT_R24G8_TYPELESS || FAILED(ID3D11Device_CreateTexture2D(g_dev, &dd, NULL, &g_dcopy)) ||
             FAILED(ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)g_dcopy, &sd, &g_dcopy_srv))) {
-            g_log("frame bridge: depth format %u not supported - no motion vectors", dd.Format);
+            if (g_dcopy) ID3D11Texture2D_Release(g_dcopy);
+            g_dcopy = NULL;
+            g_dfail = game;
+            g_log("frame bridge: depth format %u with %u samples not supported - no motion vectors", game.Format, game.SampleDesc.Count);
             return 0;
         }
         g_dw = dd.Width; g_dh = dd.Height;
@@ -448,6 +512,7 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
         if (g_sh->error || ((i & 63) == 0 && (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart > 250)) {
             g_sr_timeouts++;
             g_log("frame bridge: no DLSS output from the helper for frame %u - bridge off", g_n);
+            TerminateProcess(g_helper, 1);   // the watchdog stops with g_live = 0: a frozen helper would hold fgb_stop 5 s
             g_live = 0;
             return;
         }
@@ -459,7 +524,37 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
     if (ms > g_sr_wait_max) g_sr_wait_max = ms;
     g_sr_frames++;
     ID3D11DeviceContext4_Wait(g_ctx4, g_fsr, g_n + 1);
-    ID3D11DeviceContext_CopyResource(g_ctx, backbuffer, (ID3D11Resource *)g_srout[g_n % 2]);
+    if (g_sharpness > 0 && g_sharp_cs) {   // the game's compute bindings in the slots used, put back afterwards
+        float k[4] = {g_sharpness, 0, 0, 0};
+        ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_sharp_cb, 0, NULL, k, 0, 0);
+        ID3D11ComputeShader *ocs = NULL; ID3D11ClassInstance *oci[1]; UINT onci = 1;
+        ID3D11ShaderResourceView *osrv = NULL; ID3D11UnorderedAccessView *ouav = NULL; ID3D11Buffer *ocb = NULL;
+        ID3D11DeviceContext_CSGetShader(g_ctx, &ocs, oci, &onci);
+        ID3D11DeviceContext_CSGetShaderResources(g_ctx, 0, 1, &osrv);
+        ID3D11DeviceContext_CSGetUnorderedAccessViews(g_ctx, 0, 1, &ouav);
+        ID3D11DeviceContext_CSGetConstantBuffers(g_ctx, 0, 1, &ocb);
+        ID3D11DeviceContext_CSSetShader(g_ctx, g_sharp_cs, NULL, 0);
+        ID3D11DeviceContext_CSSetShaderResources(g_ctx, 0, 1, &g_srout_srv[g_n % 2]);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(g_ctx, 0, 1, &g_sharp_uav, NULL);
+        ID3D11DeviceContext_CSSetConstantBuffers(g_ctx, 0, 1, &g_sharp_cb);
+        ID3D11DeviceContext_Dispatch(g_ctx, (g_w + 7) / 8, (g_h + 7) / 8, 1);
+        ID3D11ShaderResourceView *nsrv = NULL;
+        ID3D11UnorderedAccessView *nuav = NULL;
+        ID3D11DeviceContext_CSSetShaderResources(g_ctx, 0, 1, &nsrv);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(g_ctx, 0, 1, &nuav, NULL);
+        ID3D11DeviceContext_CSSetShader(g_ctx, ocs, onci ? oci : NULL, onci);
+        ID3D11DeviceContext_CSSetShaderResources(g_ctx, 0, 1, &osrv);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(g_ctx, 0, 1, &ouav, NULL);
+        ID3D11DeviceContext_CSSetConstantBuffers(g_ctx, 0, 1, &ocb);
+        if (ocs) ID3D11ComputeShader_Release(ocs);
+        for (UINT i = 0; i < onci; i++) if (oci[i]) ID3D11ClassInstance_Release(oci[i]);
+        if (osrv) ID3D11ShaderResourceView_Release(osrv);
+        if (ouav) ID3D11UnorderedAccessView_Release(ouav);
+        if (ocb) ID3D11Buffer_Release(ocb);
+        ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_srout[g_n % 2], (ID3D11Resource *)g_sharp);   // frame generation's HUD-less image
+        ID3D11DeviceContext_CopyResource(g_ctx, backbuffer, (ID3D11Resource *)g_sharp);
+        g_sharp_frames++;
+    } else ID3D11DeviceContext_CopyResource(g_ctx, backbuffer, (ID3D11Resource *)g_srout[g_n % 2]);
     if (rw < g_w || rh < g_h) depth_upscale();
 }
 
@@ -704,7 +799,7 @@ void fgb_stop(void) {
     __atomic_store_n(&g_sh->frames, FGB_QUIT, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);
-    if (g_helper) WaitForSingleObject(g_helper, 5000);
+    if (g_helper && WaitForSingleObject(g_helper, 5000) == WAIT_TIMEOUT) TerminateProcess(g_helper, 1);   // frozen: not left on the window
     g_live = 0;
     release_gpu_waits();
 }

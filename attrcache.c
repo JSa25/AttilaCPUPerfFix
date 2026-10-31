@@ -13,6 +13,7 @@
 // OPEN_EXISTING, no template, plain flags.
 #include <windows.h>
 #include <string.h>
+#include "gamerva.h"
 
 #define MAXPATHC   400       // longer paths are passed through
 #define TABLE      16384     // hash slots (power of two)
@@ -173,19 +174,19 @@ static void learn(const wchar_t *q, DWORD n, DWORD err) {
     DWORD seps[MAXPATHC / 2], ns = 0;  // positions of '\' after the drive
     for (DWORD i = 2; i < len; i++) if (q[i] == L'\\') seps[ns++] = i;
     if (!ns) return;
-    AcquireSRWLockExclusive(&g_lock);
-    // deepest existing ancestor A = q[0..seps[k]) (k = 0: the drive "x:")
+    // deepest existing ancestor A = q[0..seps[k]) (k = 0: the drive "x:"). Found without the lock, so other threads'
+    // lookups go on meanwhile; a change after this is caught below (watches armed, then M confirmed missing).
     LONG k = (LONG)ns - 1;
     DWORD e;
     for (; k > 0; k--) {
         DWORD a = real_attr_n(q, seps[k], &e);
         if (a != INVALID_FILE_ATTRIBUTES) {
-            if (!(a & FILE_ATTRIBUTE_DIRECTORY)) k = -1;  // a file in the middle of the path: leave it alone
+            if (!(a & FILE_ATTRIBUTE_DIRECTORY)) return;  // a file in the middle of the path: leave it alone
             break;
         }
     }
-    if (k < 0) goto out;
     DWORD mlen = (DWORD)k + 1 < ns ? seps[k + 1] : len;
+    AcquireSRWLockExclusive(&g_lock);
     // Watch A and every folder above it, top-down, before confirming M is missing: M appearing changes A; A being
     // replaced or moved changes its parent, and so on up to the drive. Each watch's parents are older than it.
     for (LONG j = 0; j <= k; j++)
@@ -292,28 +293,6 @@ static DWORD WINAPI stats_thread(void *a) {  // one line after each burst of cal
     return 0;
 }
 
-static void *ac_iat_hook(HMODULE m, const char *name, void *to) {
-    unsigned char *b = (unsigned char *)m;
-    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
-    IMAGE_DATA_DIRECTORY *dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dd->VirtualAddress) return NULL;
-    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(b + dd->VirtualAddress); d->Name; d++) {
-        if (_stricmp((char *)(b + d->Name), "KERNEL32.dll") != 0 || !d->OriginalFirstThunk) continue;
-        IMAGE_THUNK_DATA *names = (IMAGE_THUNK_DATA *)(b + d->OriginalFirstThunk), *iat = (IMAGE_THUNK_DATA *)(b + d->FirstThunk);
-        for (; names->u1.AddressOfData; names++, iat++) {
-            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
-            if (strcmp((char *)((IMAGE_IMPORT_BY_NAME *)(b + names->u1.AddressOfData))->Name, name) != 0) continue;
-            void *old = (void *)iat->u1.Function;
-            DWORD prot;
-            if (!old || !VirtualProtect(&iat->u1.Function, sizeof(void *), PAGE_READWRITE, &prot)) return NULL;
-            iat->u1.Function = (DWORD_PTR)to;
-            VirtualProtect(&iat->u1.Function, sizeof(void *), prot, &prot);
-            return old;
-        }
-    }
-    return NULL;
-}
-
 // also used by the test (m = NULL: no import patch, only the cache)
 int attrcache_init(int verify, void (*log)(const char *fmt, ...)) {
     g_log = log;
@@ -326,13 +305,13 @@ int attrcache_init(int verify, void (*log)(const char *fmt, ...)) {
 }
 
 int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...)) {
-    if (!attrcache_init(verify, log) || !ac_iat_hook(m, "GetFileAttributesW", (void *)ac_GetFileAttributesW)) {
+    if (!attrcache_init(verify, log) || !iat_hook(m, "GetFileAttributesW", (void *)ac_GetFileAttributesW)) {
         log("attribute cache: GetFileAttributesW import not found - not installed");
         return 0;
     }
     // Opens: chain to whatever the import pointed at (fileio.c's hook when that fix is installed first). r_open is
     // kernel32's until then, which is the same function when nothing else hooked it.
-    void *old = ac_iat_hook(m, "CreateFileW", (void *)ac_CreateFileW);
+    void *old = iat_hook(m, "CreateFileW", (void *)ac_CreateFileW);
     if (old) r_open = (ac_open_fn)old;
     else log("attribute cache: CreateFileW import not found - only file checks are cached");
     HANDLE t = CreateThread(NULL, 64 * 1024, stats_thread, NULL, 0, NULL);

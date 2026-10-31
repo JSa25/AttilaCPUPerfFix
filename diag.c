@@ -8,6 +8,7 @@
 //     and the log says so. The handler allocates nothing (the heap may be what broke) and writes with WriteFile.
 #include <windows.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -18,6 +19,7 @@
 
 static wchar_t g_dlog[MAX_PATH];
 static DWORD g_main_tid, g_self_base;
+int g_crash_logging = 1;  // heapfix.ini [mod] crash_logging (heapfix.c)
 volatile DWORD g_uikeep_tid;  // uikeep.c: the thread that is keeping or deleting a menu picture right now, else 0
 static volatile LONG g_records, g_busy;
 static char g_buf[8192];  // the handler's only buffer: static, so a stack overflow record needs no stack
@@ -46,11 +48,22 @@ static const char *image_of(DWORD a, DWORD *base) {
     return b == (BYTE *)GetModuleHandleW(NULL) ? "exe" : "image";
 }
 
+// Appends to [p, end) and returns the new end of the text: never past end - 1, whatever snprintf would have needed
+// (a cut-off write must not move p beyond the buffer, or the next write gets a negative, i.e. huge, size).
+static char *put(char *p, char *end, const char *fmt, ...) {
+    if (end - p <= 1) return p;
+    va_list a;
+    va_start(a, fmt);
+    int n = vsnprintf(p, end - p, fmt, a);
+    va_end(a);
+    return n < 0 ? p : n < end - p ? p + n : end - 1;
+}
+
 // "name.dll+0x1234" for an address in a loaded module, else the bare address.
-static int where(char *out, int cap, DWORD a) {
+static char *where(char *p, char *end, DWORD a) {
     DWORD base;
     const char *name = image_of(a, &base);
-    return name ? snprintf(out, cap, "%s+0x%lX", name, a - base) : snprintf(out, cap, "%08lX", a);
+    return name ? put(p, end, "%s+0x%lX", name, a - base) : put(p, end, "%08lX", a);
 }
 
 static const char *code_name(DWORD c) {
@@ -77,7 +90,8 @@ static int same_ascii(const char *a, const char *b) {
 // for the log: the game version in plain words, by empire.retail.dll's TimeDateStamp (NULL = unknown build)
 static const char *build_name(DWORD stamp) {
     return stamp == 0x69CE1786u ? "normal Steam version (1.6.0) - supported"
-         : stamp == 0x698089B0u ? "GOG version - partly supported (some fixes do not fit it and stay off, see STATUS)"
+         : stamp == 0x6A4F4723u ? "GOG version (6A4F4723) - supported"
+         : stamp == 0x698089B0u ? "older GOG version - partly supported (some fixes do not fit it and stay off, see STATUS)"
          : NULL;
 }
 
@@ -91,28 +105,28 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     SYSTEMTIME t;
     GetLocalTime(&t);
     DWORD tid = GetCurrentThreadId();
-    p += snprintf(p, end - p, "[%02d:%02d:%02d.%03d] EXCEPTION %d: 0x%08lX %s at ", t.wHour, t.wMinute, t.wSecond,
+    p = put(p, end, "[%02d:%02d:%02d.%03d] EXCEPTION %d: 0x%08lX %s at ", t.wHour, t.wMinute, t.wSecond,
                   t.wMilliseconds, (int)nrec, code, what);
     DWORD at = (DWORD)(UINT_PTR)e->ExceptionRecord->ExceptionAddress, at_base = 0;
     const char *at_name = image_of(at, &at_base);
-    p += where(p, end - p, at);
-    p += snprintf(p, end - p, ", %s thread %lu (first chance: the game may still handle it)\n",
+    p = where(p, end, at);
+    p = put(p, end, ", %s thread %lu (first chance: the game may still handle it)\n",
                   tid == g_main_tid ? "main" : "worker", tid);
     // the same in plain words: whose code it happened in
     int ours = at_base && at_base == g_self_base, game = at_name && same_ascii(at_name, "empire.retail.dll");
-    p += snprintf(p, end - p, "  -> %s%s. If the game closed or froze right now, this is why; if it kept running, it "
+    p = put(p, end, "  -> %s%s. If the game closed or froze right now, this is why; if it kept running, it "
                   "recovered.\n", ours ? "inside this mod (please report it)" : game ? "in the game's own code, not in this mod"
                   : "not in this mod, in ", ours || game ? "" : at_name ? at_name : "code outside any DLL");
     if (g_uikeep_tid && g_uikeep_tid == tid)
-        p += snprintf(p, end - p, "  -> it happened while the menu texture fix was keeping or deleting a menu picture. "
+        p = put(p, end, "  -> it happened while the menu texture fix was keeping or deleting a menu picture. "
                       "To switch that fix off, create an empty uikeep_off.txt in the game folder, and please report it.\n");
     if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) &&
         e->ExceptionRecord->NumberParameters >= 2) {
         ULONG_PTR k = e->ExceptionRecord->ExceptionInformation[0];
-        p += snprintf(p, end - p, "  %s address %08lX\n", k == 0 ? "read of" : k == 1 ? "write to" : "execute at",
+        p = put(p, end, "  %s address %08lX\n", k == 0 ? "read of" : k == 1 ? "write to" : "execute at",
                       (DWORD)e->ExceptionRecord->ExceptionInformation[1]);
     }
-    p += snprintf(p, end - p, "  eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX ebp=%08lX esp=%08lX\n",
+    p = put(p, end, "  eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX ebp=%08lX esp=%08lX\n",
                   c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
     {   // Stack scan: values on the stack that point into a loaded module, the likely return addresses (for a stack
         // overflow: the innermost frames, the loop that ran away)
@@ -120,12 +134,12 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
         DWORD *sp = (DWORD *)(UINT_PTR)c->Esp, *top = (DWORD *)tib->StackBase;
         int found = 0;
         DWORD last = 0;
-        p += snprintf(p, end - p, "  stack:");
+        p = put(p, end, "  stack:");
         for (; sp < top && sp < (DWORD *)(UINT_PTR)c->Esp + 4096 && found < (code == EXCEPTION_STACK_OVERFLOW ? 40 : 24) && end - p > 80; sp++) {
             DWORD base;
             if (image_of(*sp, &base)) {
                 *p++ = ' ';
-                p += where(p, end - p, *sp);
+                p = where(p, end, *sp);
                 found++;
                 last = *sp;
             }
@@ -148,16 +162,16 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
                 if (i == nmod && nmod < 24) { bases[i] = base; names[i] = nm; counts[i] = 0; nmod++; }
                 if (i < nmod) counts[i]++;
             }
-            p += snprintf(p, end - p, "  stack used %lu KB; module-pointing values:", (DWORD)((top - s0) * 4 / 1024));
-            for (int i = 0; i < nmod && end - p > 80; i++) p += snprintf(p, end - p, " %s %lu", names[i], counts[i]);
-            p += snprintf(p, end - p, "\n  outside the loop (from %lu KB below the stack top, outward):",
+            p = put(p, end, "  stack used %lu KB; module-pointing values:", (DWORD)((top - s0) * 4 / 1024));
+            for (int i = 0; i < nmod && end - p > 80; i++) p = put(p, end, " %s %lu", names[i], counts[i]);
+            p = put(p, end, "\n  outside the loop (from %lu KB below the stack top, outward):",
                           first ? (DWORD)((top - first) * 4 / 1024) : 0);
             found = 0;
             for (sp = first ? first + 1 : top; sp < top && found < 48 && end - p > 80; sp++) {
                 DWORD base;
                 if (*sp != last && image_of(*sp, &base)) {
                     *p++ = ' ';
-                    p += where(p, end - p, *sp);
+                    p = where(p, end, *sp);
                     found++;
                 }
             }
@@ -528,7 +542,11 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
     }
     log("other hook DLLs in the game folder:%s", fl ? found : " none");
 
-    AddVectoredExceptionHandler(0, on_exception);  // last in the chain; it only logs
-    log("crash logging on: exceptions are recorded here as EXCEPTION lines");
+    if (!g_crash_logging)
+        log("crash logging off (crash_logging=0 in heapfix.ini)");
+    else {
+        AddVectoredExceptionHandler(0, on_exception);  // last in the chain; it only logs
+        log("crash logging on: exceptions are recorded here as EXCEPTION lines");
+    }
     sampler_start(empire, dir, log);
 }

@@ -11,12 +11,13 @@
 //   mov [result],eax | movss [result],xmm0) ; pinsrd xmm0,ecx,0 ; pop. Same integer / same float bits
 //   (sign of zero, NaN, overflow -> 0x80000000 included) while MXCSR has DAZ off. The CW temporaries
 //   [esp+C] and [esp+T] are compiler scratch for this block (written only by it), so they are not written.
-// x87fix_frame() (per frame, main thread) puts the original bytes back for the down/up/frndint sites if
+// x87fix_frame() (per frame, main thread; other game threads suspended meanwhile) puts the original bytes back for the down/up/frndint sites if
 // the main thread's rounding control or DAZ ever changes, or if the watcher thread (every 10 s it briefly
 // suspends each game thread and reads its x87 control word and MXCSR) saw another thread with them. x87fix_test.c runs every matched site's
 // original bytes and replacement on edge values and random inputs.
 #include <windows.h>
 #include <tlhelp32.h>
+#include "gamerva.h"
 #include <string.h>
 
 #define X87_MAX_SITES 2048
@@ -129,36 +130,41 @@ static int x87_scan(const unsigned char *text, unsigned size, unsigned rva0) {
 // Set by the watcher thread when some game thread runs with non-default rounding control or DAZ.
 static volatile LONG g_x87_other_thread_bad;
 
-// Per frame on the main thread: the down/up/frndint replacements assume default rounding control and DAZ off.
-void x87fix_frame(void) {
-    if (g_x87_reverted || ((x87_cw() & 0xC00) == 0 && !(x87_mxcsr() & 0x40) && !g_x87_other_thread_bad)) return;
-    int n = 0;
+// Puts the original bytes of the down/up/frndint sites back while every other game thread is suspended, so none runs
+// half-rewritten code (paused_write, gamerva.h). 0 (nothing written) if a suspended thread stood inside a site: tried
+// again next frame.
+static int g_x87_restored;
+static int x87_busy(UINT_PTR eip) {
+    DWORD rva = (DWORD)eip - (DWORD)(UINT_PTR)g_x87_base;
+    for (int i = 0; i < g_x87_n; i++)
+        if (g_x87[i].patched && rva - g_x87[i].rva < g_x87[i].len) return 1;
+    return 0;
+}
+static void x87_restore(void) {
     for (int i = 0; i < g_x87_n; i++) {
         struct x87site *s = &g_x87[i];
         if (s->patched && !(s->mode == 3 && !s->frndint)) {
             x87_write(g_x87_base + s->rva, s->orig, s->len);
             s->patched = 0;
-            n++;
+            g_x87_restored++;
         }
     }
     FlushInstructionCache(GetCurrentProcess(), NULL, 0);
-    g_x87_reverted = 1;
-    g_x87_log("x87 fix: non-default rounding control or DAZ seen on a game thread - %d rounding sites restored", n);
+}
+static int x87_restore_paused(int *restored) {
+    g_x87_restored = 0;
+    int ok = paused_write((HMODULE)g_x87_base, x87_busy, x87_restore);
+    *restored = g_x87_restored;
+    return ok;
 }
 
-typedef LONG(NTAPI *query_thread_fn)(HANDLE, int, PVOID, ULONG, PULONG);
-
-// 1 if the thread was started inside the game's own code (empire.retail.dll or the exe): only those run
-// the patched blocks. Others set their own FPU state and never run them (XAudio2's thread runs with
-// DAZ/FTZ on: MXCSR 9FE0 seen in game; thread-pool, Steam, EOS, driver threads).
-static int game_thread(HANDLE h) {
-    static query_thread_fn q;
-    if (!q) q = (query_thread_fn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
-    void *start = NULL;
-    if (!q || q(h, 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof start, NULL) != 0) return 0;
-    HMODULE m = NULL;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, start, &m)) return 0;
-    return m == (HMODULE)g_x87_base || m == GetModuleHandleW(NULL);
+// Per frame on the main thread: the down/up/frndint replacements assume default rounding control and DAZ off.
+void x87fix_frame(void) {
+    if (g_x87_reverted || ((x87_cw() & 0xC00) == 0 && !(x87_mxcsr() & 0x40) && !g_x87_other_thread_bad)) return;
+    int n = 0;
+    if (!x87_restore_paused(&n)) return;
+    g_x87_reverted = 1;
+    g_x87_log("x87 fix: non-default rounding control or DAZ seen on a game thread - %d rounding sites restored", n);
 }
 
 // Every 10 s: briefly suspend each game thread and read its x87 control word and MXCSR.
@@ -174,7 +180,7 @@ static DWORD WINAPI x87_watch(LPVOID unused) {
             if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
             HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
             if (!h) continue;
-            if (!game_thread(h)) { CloseHandle(h); continue; }
+            if (!game_thread(h, (HMODULE)g_x87_base)) { CloseHandle(h); continue; }
             CONTEXT ctx = {.ContextFlags = CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS};
             if (SuspendThread(h) != (DWORD)-1) {
                 BOOL got = GetThreadContext(h, &ctx);
@@ -194,11 +200,12 @@ static DWORD WINAPI x87_watch(LPVOID unused) {
     }
 }
 
-static int cpu_has_sse41(void) {
-    int ecx;
-    __asm__ volatile("cpuid" : "=c"(ecx) : "a"(1) : "ebx", "edx");
-    return (ecx >> 19) & 1;
+static int cpu_ecx1(void) {   // CPUID leaf 1 ECX: bit 0 SSE3 (fisttp), bit 19 SSE4.1 (roundss)
+    int eax = 1, ecx;
+    __asm__ volatile("cpuid" : "+a"(eax), "=c"(ecx) : : "ebx", "edx");   // cpuid also overwrites EAX
+    return ecx;
 }
+static int cpu_has_sse41(void) { return (cpu_ecx1() >> 19) & 1; }
 
 // Must run on the game's main thread. Returns the number of blocks replaced.
 int install_x87fix(HMODULE m, void (*log)(const char *fmt, ...)) {
@@ -210,12 +217,12 @@ int install_x87fix(HMODULE m, void (*log)(const char *fmt, ...)) {
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
         if (!memcmp(sec->Name, ".text", 6)) break;
     if ((unsigned char *)sec >= (unsigned char *)IMAGE_FIRST_SECTION(nt) + nt->FileHeader.NumberOfSections * sizeof *sec) return 0;
-    int sse41 = cpu_has_sse41(), defaults = (x87_cw() & 0xC00) == 0 && !(x87_mxcsr() & 0x40);
+    int sse3 = cpu_ecx1() & 1, sse41 = cpu_has_sse41(), defaults = (x87_cw() & 0xC00) == 0 && !(x87_mxcsr() & 0x40);
     int found = x87_scan(b + sec->VirtualAddress, sec->Misc.VirtualSize, sec->VirtualAddress), n = 0, fast = 0;
     for (int i = 0; i < found; i++) {
         struct x87site *s = &g_x87[i];
         int fisttp = s->mode == 3 && !s->frndint;
-        if (!fisttp && !(sse41 && defaults)) continue;
+        if (fisttp ? !sse3 : !(sse41 && defaults)) continue;
         unsigned char repl[38];
         x87_replacement(s, repl);
         x87_write(b + s->rva, repl, s->len);
@@ -229,6 +236,6 @@ int install_x87fix(HMODULE m, void (*log)(const char *fmt, ...)) {
         if (w) CloseHandle(w);
     }
     log("x87 fix: %d of %d rounding-mode blocks replaced (%d truncating via fisttp, %d via SSE4.1 roundss)%s", n, found,
-        fast, n - fast, sse41 && defaults ? "" : " - SSE4.1 missing or non-default FPU state: only the truncating ones");
+        fast, n - fast, !sse3 ? " - SSE3 missing: none of the truncating ones" : sse41 && defaults ? "" : " - SSE4.1 missing or non-default FPU state: only the truncating ones");
     return n;
 }
