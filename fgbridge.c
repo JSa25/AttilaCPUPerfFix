@@ -89,7 +89,7 @@ static const char sharp_src[] =
     "  float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * k.x;\n"
     "  dst[p] = float4((lobe * (b + d + f + hh) + e4.rgb) / (4.0 * lobe + 1.0), e4.a);\n"
     "}\n";
-static unsigned g_sr_frames, g_sr_timeouts;
+static unsigned g_sr_frames, g_sr_timeouts, g_sr_slow;   // g_sr_slow: DLSS outputs that came after over 250 ms (logged, first 20)
 static double g_sr_wait_ms, g_sr_wait_max;
 static void (*g_log)(const char *fmt, ...);
 static DWORD WINAPI watchdog(void *arg);
@@ -514,19 +514,26 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
     LARGE_INTEGER q0, q1, qf;
     QueryPerformanceCounter(&q0);
     QueryPerformanceFrequency(&qf);
+    // A slow frame is not a dead helper: the helper waits for its earlier DLSS passes on the GPU, so a GPU stall (the
+    // driver compiling ReShade's shaders when its effects load; Rome 2 1.8: a player lost DLSS "after ReShade loaded")
+    // delays it. 6.9.0 gave up after 250 ms; now only when the helper has failed or exited, or after 3 s (as the watchdog).
     for (int i = 0; __atomic_load_n(&g_sh->sr_done, __ATOMIC_ACQUIRE) < g_n + 1; i++) {
         QueryPerformanceCounter(&q1);
-        if (g_sh->error || ((i & 63) == 0 && (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart > 250)) {
+        double waited = (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart;
+        // checked every 64 spins, and every pass once it sleeps (Sleep(1) can last 15.6 ms: 64 of them were a second)
+        if (g_sh->error || (((i & 63) == 0 || waited > 20) && (waited > 3000 || WaitForSingleObject(g_helper, 0) != WAIT_TIMEOUT))) {
             g_sr_timeouts++;
-            g_log("frame bridge: no DLSS output from the helper for frame %u - bridge off", g_n);
+            g_log("frame bridge: no DLSS output from the helper for frame %u (%.0f ms, helper %s) - bridge off", g_n, waited,
+                  g_sh->error ? "failed" : WaitForSingleObject(g_helper, 0) != WAIT_TIMEOUT ? "gone" : "running");
             TerminateProcess(g_helper, 1);   // the watchdog stops with g_live = 0: a frozen helper would hold fgb_stop 5 s
             g_live = 0;
             return;
         }
-        if (i < 2000) YieldProcessor(); else Sleep(0);
+        if (i < 2000) YieldProcessor(); else Sleep(waited > 20 ? 1 : 0);
     }
     QueryPerformanceCounter(&q1);
     double ms = (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart;
+    if (ms > 250 && g_sr_slow++ < 20) g_log("frame bridge: DLSS output for frame %u came after %.0f ms (the GPU was busy) - kept going", g_n, ms);
     g_sr_wait_ms += ms;
     if (ms > g_sr_wait_max) g_sr_wait_max = ms;
     g_sr_frames++;

@@ -196,6 +196,12 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.9.1:
+-With the Upscaling and Framegen add-on: DLSS no longer switches itself off
+ when the graphics card is busy for a moment, for example while ReShade loads
+ its effects (the picture froze and DLSS turned off). It only switches off
+ when its helper has really stopped, and that is now noticed faster.
+
 Version 6.9.0:
 -ReShade works with the "Upscaling and Framegen for Attila" add-on. Its
  effects go on the 3D picture before the game's UI is drawn, so the UI stays
