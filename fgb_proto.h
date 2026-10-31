@@ -15,6 +15,7 @@
 #define FGB_QUIT 0xFFFFFFFFu
 #define FGB_CAP_PRESET 1u   /* sr_preset is applied (add-on version 5) */
 #define FGB_CAP_HUD_POST 2u /* hud_post is applied (add-on version 6; Rome 2's add-on version 4) */
+#define FGB_CAP_VSYNC 8u    /* vsync_off is applied (add-on version 7); 4u is reserved */
 
 typedef struct {
     uint32_t proto, width, height, format, hwnd, luid_lo;
@@ -45,7 +46,11 @@ typedef struct {
     volatile uint32_t hud_post;    /* game: bit n % 32 set = frame n's HUD-less colour after DLSS SR is the full-size
                                       _hudless (ReShade's effects on it), not the SR output. Was padding (same place as
                                       in Rome 2's block) */
-    uint32_t pad1[5];
+    uint32_t pad1[3];              /* reserved */
+    volatile uint32_t vsync_off;   /* game: 1 = the helper presents without V-Sync (the player's choice: no cap at the screen's
+                                      refresh rate, frames may tear). Was padding: an older game side leaves 0 (V-Sync on),
+                                      an older helper ignores it */
+    uint32_t pad2;
     float vp[16], prev_vp[16];     /* game: view-projection of frame n and n-1 (row-major, clip = M x [x y z 1]) */
 } FgbShared;
 _Static_assert(sizeof(FgbShared) == 256, "bridge block layout");

@@ -21,7 +21,9 @@ static const GUID iid_device5 = {0x8ffde202, 0xa0e7, 0x45df, {0x9e, 0x01, 0xe8, 
 static const GUID iid_context4 = {0x917600da, 0xf58c, 0x4c33, {0x98, 0xd8, 0x3e, 0x15, 0xb3, 0x90, 0xfa, 0x24}};
 static const GUID iid_fence = {0xaffde9d1, 0x1df7, 0x4bb7, {0x8a, 0x34, 0x0f, 0x46, 0x25, 0x1d, 0xab, 0x80}};
 
-// depth -> R32F and camera motion vectors from depth: world = inv(vp) x ndc, previous pixel = prev_vp x world
+// depth -> R32F and camera motion vectors from depth: world = inv(vp) x ndc, previous pixel = prev_vp x world.
+// A viewport shifted left / up by the jitter leaves the last column / row of the render undrawn (measured on an RTX 5090:
+// every pixel of it, at any jitter below 0): its depth is taken from the one before (jit_edge_fill does the colour)
 static const char *cs_src =
     "cbuffer B : register(b0) { row_major float4x4 inv_vp; row_major float4x4 prev_vp; float2 size; float2 jit; };\n"
     "Texture2D<float> dep : register(t0);\n"
@@ -29,7 +31,10 @@ static const char *cs_src =
     "RWTexture2D<float2> mv : register(u1);\n"
     "[numthreads(8, 8, 1)] void cs(uint3 id : SV_DispatchThreadID) {\n"
     "  if (id.x >= (uint)size.x || id.y >= (uint)size.y) return;\n"
-    "  float z = dep[id.xy];\n"
+    "  uint2 s = id.xy;\n"
+    "  if (jit.x < 0 && s.x == (uint)size.x - 1 && s.x) s.x--;\n"
+    "  if (jit.y < 0 && s.y == (uint)size.y - 1 && s.y) s.y--;\n"
+    "  float z = dep[s];\n"
     "  d32[id.xy] = z;\n"
     "  float2 cur = float2(id.xy) + 0.5 - jit;\n"   // where this pixel's surface is without the jitter
     "  float2 ndc = float2(cur.x / size.x * 2 - 1, 1 - cur.y / size.y * 2);\n"
@@ -53,6 +58,7 @@ static HWND g_hwnd;           // the game's window (the helper presents into it)
 static UINT g_w, g_h, g_dw, g_dh;
 static uint32_t g_n;          // the frame being built
 static int g_hud_done, g_waited, g_live, g_hud_post;   // g_hud_post: this frame's HUD-less image after SR is the game's (fgb_hud_post)
+static uint32_t g_vsync_off;   // the player turned V-Sync off (fgb_set_vsync)
 static float g_prev_vp[16];
 static int g_have_prev;
 static unsigned g_pace_timeouts;
@@ -230,7 +236,7 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     g_hwnd = hwnd;
     g_sh->luid_lo = adesc.AdapterLuid.LowPart; g_sh->luid_hi = adesc.AdapterLuid.HighPart;
     g_sh->fg_frames = fg_frames;
-    g_sh->render_w = g_rw; g_sh->render_h = g_rh; g_sh->sr_on = g_sr; g_sh->sr_preset = g_preset;
+    g_sh->render_w = g_rw; g_sh->render_h = g_rh; g_sh->sr_on = g_sr; g_sh->sr_preset = g_preset; g_sh->vsync_off = g_vsync_off;
     g_sh->fg_test_limit = g_fg_test_limit;
     g_sh->proto = FGB_PROTO;
 
@@ -282,6 +288,10 @@ void fgb_set_frame_limit(uint32_t us) { if (g_sh) g_sh->frame_limit_us = us; }  
 // DLSS preset for every mode, NVIDIA's number (10..13 = J..M, 0 its default per mode); the helper applies it from the next frame
 void fgb_set_preset(unsigned preset) { g_preset = preset; if (g_sh) g_sh->sr_preset = preset; }
 int fgb_helper_has_presets(void) { return g_sh && (g_sh->helper_caps & FGB_CAP_PRESET); }   // an older add-on's helper: 0
+// V-Sync of the helper's presents (on by default: its frames never get windowed G-Sync, and without V-Sync they tear);
+// off = the player's choice (g_vsync_off, above). An older helper keeps V-Sync on.
+void fgb_set_vsync(int on) { g_vsync_off = !on; if (g_sh) g_sh->vsync_off = g_vsync_off; }
+int fgb_helper_has_vsync(void) { return g_sh && (g_sh->helper_caps & FGB_CAP_VSYNC); }
 // Sharpening of the DLSS output: RCAS's con (exp2(-stops)), 0 off. Takes effect from the next frame.
 void fgb_set_sharpness(float con) { g_sharpness = con; }
 unsigned fgb_sharp_frames(void) { return g_sharp_frames; }   // frames sharpened so far
@@ -402,6 +412,24 @@ void fgb_cpu_stats(double *hud_ms, double *present_ms, double *pace_ms, unsigned
 }
 static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]);
 static void depth_upscale(void);
+// after the render's copy into dst: with the viewport shifted left (jx < 0) / up (jy < 0) the render's last column / row
+// was never drawn (the clear colour: DLSS kept it and smeared it into lines along the right edge while the camera moved;
+// Rome 2's player report, measured here too); it gets the one before it from src
+static void jit_edge_fill(ID3D11DeviceContext *ctx, ID3D11Resource *dst, ID3D11Resource *src, UINT rw, UINT rh, float jx, float jy) {
+    UINT dx = jx < 0 && rw > 1, dy = jy < 0 && rh > 1;
+    if (dx) {
+        D3D11_BOX b = {rw - 2, 0, 0, rw - 1, rh - dy, 1};
+        ID3D11DeviceContext_CopySubresourceRegion(ctx, dst, 0, rw - 1, 0, 0, src, 0, &b);
+    }
+    if (dy) {
+        D3D11_BOX b = {0, rh - 2, 0, rw - dx, rh - 1, 1};
+        ID3D11DeviceContext_CopySubresourceRegion(ctx, dst, 0, 0, rh - 1, 0, src, 0, &b);
+    }
+    if (dx && dy) {
+        D3D11_BOX b = {rw - 2, rh - 2, 0, rw - 1, rh - 1, 1};
+        ID3D11DeviceContext_CopySubresourceRegion(ctx, dst, 0, rw - 1, rh - 1, 0, src, 0, &b);
+    }
+}
 void fgb_hudless(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]) {
     LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
@@ -499,6 +527,7 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
     float jx = sr ? g_jx : 0, jy = sr ? g_jy : 0;
     D3D11_BOX box = {0, 0, 0, rw, rh, 1};
     ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)g_hud, 0, 0, 0, 0, backbuffer, 0, &box);
+    jit_edge_fill(g_ctx, (ID3D11Resource *)g_hud, backbuffer, rw, rh, jx, jy);
     if (!fgb_make_vectors(depth, vp)) return;
     g_hud_done = 1;
     if (!sr) return;

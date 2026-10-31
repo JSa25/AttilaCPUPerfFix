@@ -196,6 +196,16 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.9.2:
+-With the Upscaling and Framegen add-on (version 7): a V-Sync On / Off switch
+ in the F11 panel (and vsync= in FrameBridge\settings.txt). On, the default,
+ shows frames at the screen's refresh rate without tearing; Off lifts that cap
+ (useful on 60 / 75 Hz screens), but the picture may tear. A V-Sync forced in
+ the NVIDIA app or Control Panel still applies.
+-No more thin lines along the right edge of the screen with DLAA while the
+ camera moves (the scene's last column was left undrawn by the sub-pixel
+ jitter, and DLSS smeared it). The DLSS image is slightly sharper too.
+
 Version 6.9.1:
 -With the Upscaling and Framegen add-on: DLSS no longer switches itself off
  when the graphics card is busy for a moment, for example while ReShade loads
