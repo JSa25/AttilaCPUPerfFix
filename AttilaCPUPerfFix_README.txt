@@ -196,6 +196,17 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.9.0:
+-ReShade works with the "Upscaling and Framegen for Attila" add-on. Its
+ effects go on the 3D picture before the game's UI is drawn, so the UI stays
+ clean, and they are in the frame generation frames too. ReShade gets the
+ game's depth with the camera's near / far distances, so depth effects line up
+ without setting anything. ReShade's menu (Home) shows and takes keys. Install
+ ReShade as usual (Attila.exe, DirectX 10/11/12). Without the add-on ReShade
+ works as before.
+-With add-on version 6: no more ghost image after an end turn with frame
+ generation (a camera cut or a long pause starts DLSS fresh).
+
 Version 6.8.0:
 -New memory allocator for small blocks. It is built like the game's own heap
  (the same allocator with the game's settings), split into 8 heaps so threads
@@ -375,6 +386,9 @@ Credits and licenses
 --------------------
 Built with AI assistance (Claude by Anthropic). Tested in game by the author.
 dlmalloc by Doug Lea, released to the public domain (CC0 1.0).
+The ReShade link (in dinput8.dll) is built with ReShade's add-on API headers,
+Copyright (C) 2021 Patrick Mours, used under the MIT licence (the same text as
+below, with his name in place of AMD's).
 
 The DLSS add-on's sharpening (in dinput8.dll) follows AMD FidelityFX Robust
 Contrast Adaptive Sharpening (RCAS), used under the MIT licence:

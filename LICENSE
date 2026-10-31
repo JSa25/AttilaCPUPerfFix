@@ -18,5 +18,6 @@ This software is provided "as is", without warranty of any kind. The author is n
 damage or data loss arising from its use.
 
 Files from third parties keep their own licenses: dlmalloc/malloc-2.8.6.c is dlmalloc by Doug Lea,
-released to the public domain (CC0 1.0), and is not covered by the terms above. Total War: ATTILA and its code belong to
+released to the public domain (CC0 1.0), and reshade/*.hpp are ReShade's add-on API headers, Copyright (C) 2021
+Patrick Mours, BSD-3-Clause OR MIT as stated in each file; neither is covered by the terms above. Total War: ATTILA and its code belong to
 their owners; this repository contains none of the game's files.

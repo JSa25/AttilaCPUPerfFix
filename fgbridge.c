@@ -52,7 +52,7 @@ static FgbShared *g_sh;
 static HWND g_hwnd;           // the game's window (the helper presents into it)
 static UINT g_w, g_h, g_dw, g_dh;
 static uint32_t g_n;          // the frame being built
-static int g_hud_done, g_waited, g_live;
+static int g_hud_done, g_waited, g_live, g_hud_post;   // g_hud_post: this frame's HUD-less image after SR is the game's (fgb_hud_post)
 static float g_prev_vp[16];
 static int g_have_prev;
 static unsigned g_pace_timeouts;
@@ -409,6 +409,13 @@ void fgb_hudless(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float 
     if (g_tq_set[g_n % 8] & 1 << TQ_W1) tq(TQ_H1);
     g_hud_ms += ms_since(t0);
 }
+// after the SR round trip and ReShade's effects on its output (bridgeprobe.c): the back buffer, still without the UI, is
+// frame generation's HUD-less image (a helper without FGB_CAP_HUD_POST keeps its SR output: the effects only in the final)
+void fgb_hud_post(ID3D11Resource *backbuffer) {
+    if (!fgb_active() || !g_hud_done || !(g_sh->helper_caps & FGB_CAP_HUD_POST)) return;
+    ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_hud, backbuffer);
+    g_hud_post = 1;
+}
 // This frame's depth copy for DLSS and motion vectors (camera, then the per-object pass): once per frame, at the first
 // call - fgb_motion_vectors() (another mod's early effects, right after the scene's geometry) or the HUD-less point.
 // Returns 1 if they are made. Before writing, the GPU waits until the helper has read the previous frame's.
@@ -674,6 +681,9 @@ void fgb_present(ID3D11Resource *backbuffer) {
     ID3D11DeviceContext4_Signal(g_ctx4, g_fence, 2ull * g_n + 2);
     ID3D11DeviceContext_Flush(g_ctx);
     g_sh->reset = !g_hud_done;
+    // frame generation's HUD-less image after SR: the game's own (fgb_hud_post) or the helper's SR output
+    uint32_t bit = 1u << (g_n % 32);
+    g_sh->hud_post = g_hud_post && g_hud_done ? g_sh->hud_post | bit : g_sh->hud_post & ~bit;
     // a frame without the scene (menu, pause, loading): the next one counts the camera as not moved, not as moved
     // since the last scene frame, seconds ago (one frame of huge wrong motion vectors: a smear after every menu)
     if (!g_hud_done) g_have_prev = 0;
@@ -691,7 +701,7 @@ void fgb_present(ID3D11Resource *backbuffer) {
     g_present_ms += ms_since(t0);
     g_cpu_frames++;
     g_n++;
-    g_hud_done = g_waited = 0;
+    g_hud_done = g_waited = g_hud_post = 0;
     g_jx = g_jy = 0;   // a frame that never asked fgb_jitter() is not jittered
 }
 

@@ -4,11 +4,14 @@ rem Needs llvm-mingw (its bin folder on PATH). See README.md.
 setlocal
 cd /d "%~dp0"
 if "%CC%"=="" set "CC=i686-w64-mingw32-clang"
+if "%CXX%"=="" set "CXX=i686-w64-mingw32-clang++"
 if not exist build mkdir build
 set "LIBS=-lkernel32 -lwinmm -ladvapi32 -lpsapi -lbcrypt"
 
+rem rslink.cpp: the add-on's ReShade link (C++, ReShade's add-on API headers in reshade\; no C++ runtime linked)
+"%CXX%" -std=c++17 -O2 -Wall -Wextra -isystem reshade -fno-exceptions -fno-rtti -fno-threadsafe-statics -c -o build\rslink.o rslink.cpp || exit /b 1
 rem --no-insert-timestamp keeps the build reproducible: the same compiler gives the same file
-"%CC%" -O2 -Wall -Wextra -shared -s -static -Wl,--no-insert-timestamp -o build\dinput8.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c pools.c passtime.c gputime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c dinput8.def %LIBS% -lgdi32 || exit /b 1
+"%CC%" -O2 -Wall -Wextra -shared -s -static -Wl,--no-insert-timestamp -o build\dinput8.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c pools.c passtime.c gputime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c build\rslink.o dinput8.def %LIBS% -lgdi32 || exit /b 1
 echo built build\dinput8.dll
 
 if /i not "%~1"=="test" exit /b 0

@@ -44,6 +44,7 @@ with its 64-bit helper, is in the game folder. The helper's source is in its own
 | `fgpanel.c` | Upscaling add-on: the F11 settings panel |
 | `fgb_motion_api.h` | Upscaling add-on: `fgb_motion_vectors`, exported for other mods - this frame's motion vectors on the game's D3D11 device (the struct and what the values mean) |
 | `passtime.c`, `gputime.c` | Upscaling add-on: the hook on the render stage driver the bridge runs on, and the hook on the game's `GetProcAddress` import (D3D11 device and DXGI factory) |
+| `rslink.cpp`, `reshade/` | Upscaling add-on (6.9): with ReShade in the game folder, registers as a ReShade add-on and runs ReShade's effects at the point where the interface starts (after DLSS), with the scene depth and the camera's near / far for ReShade's depth; the glue in `bridgeprobe.c` presents from under ReShade's swapchain wrapper. C++ without the C++ runtime; `reshade/` holds ReShade 6.8.0's add-on API headers, unchanged |
 
 Every patch first compares the game's bytes at its address with what it expects, and skips itself
 (and says so in `heapfix.log`) if they differ. So on another game version it does nothing.
@@ -85,4 +86,5 @@ build.bat test "C:\...\steamapps\common\Total War Attila\empire.retail.dll"
 ## License
 
 See [LICENSE](LICENSE). `dlmalloc/malloc-2.8.6.c` is dlmalloc by Doug Lea, released to the public domain
-([CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)), unchanged.
+([CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)), unchanged. `reshade/*.hpp` are ReShade's add-on API
+headers by Patrick Mours (BSD-3-Clause OR MIT, as stated in each file), unchanged.
