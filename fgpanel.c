@@ -58,6 +58,11 @@ static int p_vsync_driver;   // NVIDIA's driver setting (FgbShared::driver_vsync
 void fgp_set_vsync_driver(int v) { p_vsync_driver = v; p_dirty = 1; }
 static int p_fpson;   // the frame-rate counter (row 8): 0 off, 1..4 top left / top right / bottom left / bottom right
 static int p_cdirty = 1;
+// the key that opens / closes the panel (settings.txt panel_key=, default F8: Mat's 4K UI Scale 2.1.1+ holds F11 for its
+// compare picture, and both mods read the key directly, 2026-11-02)
+static int p_key = VK_F8;
+static wchar_t p_keyhint[32] = L"F8 to close";
+void fgp_set_key(int vk, const wchar_t *name) { p_key = vk; _snwprintf(p_keyhint, 32, L"%ls to close", name); p_dirty = 1; }
 void fgp_set_fps_counter(int corner) { p_fpson = corner >= 0 && corner < 5 ? corner : 0; p_dirty = p_cdirty = 1; }
 void fgp_set_fg(int fg) { p_fg = fg; p_dirty = 1; }   // after an F11 switch: what the new helper allows
 static int p_tsr, p_tfg;   // the picked upscaler / frame generation (rows 9 / 10): 0 NVIDIA DLSS, 1 AMD FSR; from the next start
@@ -292,7 +297,7 @@ static void redraw(void) {
     float x0 = p_cx0 + 26 * u, x1 = p_cx1 - 26 * u, y = p_cy0 + 16 * u;
     // heading, and how to close it
     text(SR_AMD ? L"AMD FSR" : FG_AMD ? L"DLSS + AMD FSR" : L"DLSS", p_title, C_TEXT, (int)x0, (int)y, (int)(x0 + (FG_AMD ? 300 : 200) * u), (int)(y + 36 * u), DT_LEFT);
-    text(L"F11 to close", p_tiny, C_DIM, (int)(x1 - 90 * u), (int)y, (int)x1, (int)(y + 36 * u), DT_RIGHT);
+    text(p_keyhint, p_tiny, C_DIM, (int)(x1 - 98 * u), (int)y, (int)x1, (int)(y + 36 * u), DT_RIGHT);
     {   // Defaults: everything back to the recommendation below (the frame-rate counter stays as it is)
         float bx0 = x1 - 200 * u, bx1 = x1 - 100 * u, by0 = y + 5 * u, by1 = y + 31 * u;
         int hot = p_nbtn == p_hover;
@@ -680,11 +685,11 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
         if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO *)&mi) &&
             EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) { p_hz = dm.dmDisplayFrequency; p_dirty = 1; }
     }
-    static SHORT f11_prev, lb_prev;
+    static SHORT key_prev, lb_prev;
     int focus = GetForegroundWindow() == hwnd;
-    SHORT f11 = focus ? GetAsyncKeyState(VK_F11) : 0, lb = focus ? GetAsyncKeyState(VK_LBUTTON) : 0;
-    if ((f11 & 0x8000) && !(f11_prev & 0x8000)) { p_open = !p_open; p_dirty = 1; }
-    f11_prev = f11;
+    SHORT key = focus ? GetAsyncKeyState(p_key) : 0, lb = focus ? GetAsyncKeyState(VK_LBUTTON) : 0;
+    if ((key & 0x8000) && !(key_prev & 0x8000)) { p_open = !p_open; p_dirty = 1; }
+    key_prev = key;
     int over = 0, mx = 0, my = 0, hover = -1;
     if (p_open) {
         POINT c;

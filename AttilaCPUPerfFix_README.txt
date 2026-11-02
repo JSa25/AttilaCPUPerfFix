@@ -150,7 +150,7 @@ save, and restart the game.
 The mod never changes your heapfix.ini. Delete it to get the defaults back.
 The old *_off.txt files (heapfix_off.txt, uikeep_off.txt, update_off.txt, ...)
 still work. The DLSS add-on keeps its own settings in FrameBridge\settings.txt
-(F11 in game).
+(F8 in game).
 
 The STATUS lines in heapfix.log show which fixes are on, and why one is off.
 
@@ -197,6 +197,13 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.10.5:
+-With the Upscaling and Framegen add-on: its settings panel opens with F8 now
+ (it was F11, which Attila 4K UI Scale 2.1.1 and newer use for their
+ "compare" picture). Another key: panel_key= in FrameBridge\settings.txt.
+-With the add-on: when it cannot start, F8 still opens its panel, with a note
+ to look in heapfix.log, instead of doing nothing.
+
 Version 6.10.4:
 -Fixes from a full code review: a very long game folder path could overwrite
  memory at start; a rare crash or failed save load when the game opened and
