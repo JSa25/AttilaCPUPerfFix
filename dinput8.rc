@@ -1,0 +1,34 @@
+// dinput8.dll's version resource: who made it and what it is, as Windows shows it under Properties > Details.
+// The mod's own name and version (version.h), not Microsoft's DirectInput: it only forwards DirectInput8Create.
+#include <winver.h>
+#include "version.h"
+
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     MOD_VERSION_RC
+PRODUCTVERSION  MOD_VERSION_RC
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "JGdaCaesar"
+            VALUE "FileDescription",  "Attila Engine Performance Fix (Total War: ATTILA mod; forwards DirectInput8Create to Windows)"
+            VALUE "FileVersion",      MOD_VERSION_STR
+            VALUE "InternalName",     "AttilaCPUPerfFix"
+            VALUE "LegalCopyright",   "JGdaCaesar. Source: github.com/JSa25/AttilaCPUPerfFix"
+            VALUE "OriginalFilename", "dinput8.dll"
+            VALUE "ProductName",      "Attila Engine Performance Fix"
+            VALUE "ProductVersion",   MOD_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END

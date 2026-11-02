@@ -197,6 +197,11 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.10.2:
+-Windows Defender no longer flags dinput8.dll as "Trojan:Win32/Wacatac.B!ml".
+ That was a false alarm of Microsoft's automatic file check; the DLL now
+ carries its name, maker and version (Properties > Details).
+
 Version 6.10.1:
 -The Upscaling and Framegen add-on no longer crashes the game on a game build
  it does not know (crash "illegal instruction" at empire.retail.dll+0x176A453):
