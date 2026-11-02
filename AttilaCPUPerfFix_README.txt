@@ -197,6 +197,16 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.10.1:
+-The Upscaling and Framegen add-on no longer crashes the game on a game build
+ it does not know (crash "illegal instruction" at empire.retail.dll+0x176A453):
+ it checks the game's code first and otherwise stays off, and the game runs
+ with the performance fix only.
+-With the add-on (version 9): Windows Defender no longer flags its helper
+ program (helper64.exe) as "Trojan:Win32/Wacatac.C!ml". That was a false alarm
+ of Microsoft's automatic file check; the helper now carries its name and
+ version, and test settings that only the developer uses are left out.
+
 Version 6.10.0:
 -With the Upscaling and Framegen add-on (version 8): AMD FSR upscaling and
  frame generation, so the add-on now also runs on AMD and Intel graphics cards

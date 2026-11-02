@@ -360,11 +360,20 @@ int install_passtime(HMODULE m, void (*log)(const char *fmt, ...)) {
     unsigned long long tb = __builtin_ia32_rdtsc();
     g_pt_tsc_per_ms = (double)(tb - ta) / ((b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart);
     g_pt_frame0 = g_geo_frame;
-    int n = 0;
+    int n = 0, stage_ok = 1;
     for (unsigned i = 0; i < PT_N; i++) {
-        unsigned char *site = base + game_rva(base, PT_FUNCS[i].rva);
+        unsigned rva = game_rva(base, PT_FUNCS[i].rva);
+        unsigned char *site = base + rva;
         // the set-camera gets the bridge's own jump hook (bridgeprobe.c cam_hook): timed through here it cost ~9 ms per frame
         if (bridge_mode && !bridge_full && PT_FUNCS[i].rva != 0x176A450) continue;
+        // the stage driver is hooked in release builds too: only where its first 5 bytes are the known ones (push ebx;
+        // push esi; mov esi,ecx; push edi). On another game build a jump written there landed mid-instruction and the game
+        // later ran into it (player log: 0xC000001D illegal instruction at empire.retail.dll+0x176A453)
+        if (PT_FUNCS[i].rva == 0x176A450 && (!rva || memcmp(site, "\x53\x56\x8B\xF1\x57", 5))) {
+            log("pass time: the stage driver +0x176A450 is not the expected code (another game build?) - not hooked");
+            stage_ok = 0;
+            continue;
+        }
         if (site[0] == 0xE9) {  // already hooked by another fix: leave it
             log("pass time: +0x%X already patched - not timed", PT_FUNCS[i].rva);
             continue;
@@ -373,6 +382,7 @@ int install_passtime(HMODULE m, void (*log)(const char *fmt, ...)) {
     }
     FlushInstructionCache(GetCurrentProcess(), g_pt_code, PT_N * 32);
     log("pass time: %d of %d functions timed (TSC %.0f per ms)", n, (int)PT_N, g_pt_tsc_per_ms);
+    if (bridge_mode && !stage_ok) { log("DLSS add-on: this game build is not supported - the add-on stays off, the game runs with the performance fix only"); return 0; }
     if (gpu_mode && install_gputime(m, log))
         for (unsigned i = 0; i < PT_N; i++)
             g_pt_gpu[i] = PT_FUNCS[i].rva == 0x176A450 || PT_FUNCS[i].rva == 0x1778E90 || PT_FUNCS[i].rva == 0x17FA310 ||
