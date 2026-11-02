@@ -16,7 +16,11 @@
 #define FOOTERS 1
 #define HAVE_MORECORE 0
 #define DEFAULT_GRANULARITY ((size_t)64U * (size_t)1024U)              // the game's (read from its mparams)
-#define DEFAULT_TRIM_THRESHOLD ((size_t)2U * (size_t)1024U * (size_t)1024U)
+// automatic trim only once 64 MB at the top is free (a battle unloading), not at the game's 2 MB: giving memory back on
+// frees took 1-4 ms per call, stutter that 6.2's heap did not have (AGENT_LOG 169-170, wip/heap_vanilla/tools/
+// hitchbench.c); no periodic scan for unused segments; the game's own trim still gives memory back (pool_trim)
+#define DEFAULT_TRIM_THRESHOLD ((size_t)64U << 20)
+#define MAX_RELEASE_CHECK_RATE MAX_SIZE_T
 #define DEFAULT_MMAP_THRESHOLD ((size_t)256U * (size_t)1024U)        // never reached: only blocks <= 16 KB come here
 #define NO_MALLINFO 1
 #define NO_MALLOC_STATS 1

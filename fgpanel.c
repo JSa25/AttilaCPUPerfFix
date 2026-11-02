@@ -18,8 +18,11 @@
 
 UINT fgb_render_w(void), fgb_render_h(void);   // fgbridge.c
 unsigned fgb_fg_max(void);
+unsigned fgb_sr_backend(void), fgb_fg_backend(void);   // fgbridge.c: 0 none, 1 NVIDIA, 2 AMD FSR
+#define SR_AMD (fgb_sr_backend() == 2)   // AMD FSR upscaling / frame generation runs: AMD's names, no DLSS-only rows
+#define FG_AMD (fgb_fg_backend() == 2)
 
-typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*sharp)(int choice); void (*view)(int choice); void (*vsync)(int on); } FgpApply;
+typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*sharp)(int choice); void (*view)(int choice); void (*vsync)(int on); void (*fps)(int on); void (*tech)(int sr, int fg); } FgpApply;
 
 static ID3D11Device *p_dev;
 static ID3D11DeviceContext *p_ctx;
@@ -35,6 +38,8 @@ static int p_w, p_h, p_x, p_y, p_open, p_dirty = 1, p_ok, p_hover = -1;
 static float p_u;               // 1 = 1080p
 static float p_cx0, p_cy0, p_cx1, p_cy1, p_cr;   // the card (rounded rectangle) inside the texture; outside: its shadow
 static UINT p_bw, p_bh;
+static void make_mask(void);
+static float p_cy1_full;   // the card's bottom with every row (fgp_init); p_cy1 is less while a row is hidden
 static int p_sr, p_fg, p_motion;   // current choices: SR 0 off / 1 DLAA / 2..5 Quality..Ultra Performance; FG 0 / 1 / 2 / 3 generated frames; motion 0 / 1, -1 not available, -2 no frame generation on this GPU
 static FgpApply p_apply;
 static volatile int p_block;       // the game's mouse buttons are hidden (panel open, cursor over it)
@@ -49,10 +54,22 @@ void fgp_set_sharp(int choice) { p_sharp = choice; p_dirty = 1; }
 static int p_vsync = 1, p_vsync_ok = 1;   // V-Sync of the shown frames (row 7): 0 off, 1 on; p_vsync_ok: the helper applies it
 void fgp_set_vsync(int on) { p_vsync = on != 0; p_dirty = 1; }
 void fgp_set_vsync_available(int on) { p_vsync_ok = on; p_dirty = 1; }
+static int p_vsync_driver;   // NVIDIA's driver setting (FgbShared::driver_vsync): 2 / 3 / 4 = forced on / off / Fast Sync, the row greyed
+void fgp_set_vsync_driver(int v) { p_vsync_driver = v; p_dirty = 1; }
+static int p_fpson;   // the frame-rate counter (row 8): 0 off, 1..4 top left / top right / bottom left / bottom right
+static int p_cdirty = 1;
+void fgp_set_fps_counter(int corner) { p_fpson = corner >= 0 && corner < 5 ? corner : 0; p_dirty = p_cdirty = 1; }
+void fgp_set_fg(int fg) { p_fg = fg; p_dirty = 1; }   // after an F11 switch: what the new helper allows
+static int p_tsr, p_tfg;   // the picked upscaler / frame generation (rows 9 / 10): 0 NVIDIA DLSS, 1 AMD FSR; from the next start
+void fgp_set_tech(int sr, int fg) { p_tsr = sr; p_tfg = fg; p_dirty = 1; }
+static int p_drop = -1;   // the open drop-down list (its row), -1 none
+void fgb_gpu_caps(int *dlss_sr, int *dlss_fg);   // fgbridge.c
+const wchar_t *fgb_gpu_name(void);
+static unsigned p_hz;   // the refresh rate of the game's screen (read once, fgp_frame)
 static int p_view;                 // Debug View (row 6, test builds: shown when p_apply.view is set): 0 off, 1 no mip bias, 2 no bloom fix
 
 typedef struct { RECT r; int row, value, enabled; } Btn;
-static Btn p_btn[40];
+static Btn p_btn[64];
 static int p_nbtn;
 
 // ---- the game's mouse through DirectInput 8: buttons and wheel hidden while p_block ----
@@ -169,7 +186,7 @@ static void choices(int row, float x0, float y0, float x1, float y1, const wchar
         else if (hot) fill_rr(sx0 + 2 * u, y0 + 2 * u, sx1 - 2 * u, y1 - 2 * u, r, C_HOVER, 1);
         if (k && k != chosen && k != chosen + 1) fill_rr(sx0 - 0.5f * u, y0 + 9 * u, sx0 + 0.5f * u, y1 - 9 * u, 0, C_RULE, 1);
         text(names[k], p_small, !enabled ? C_OFF : sel ? C_ON_BRONZE : hot ? C_TEXT : C_DIM, (int)sx0, (int)y0, (int)sx1, (int)y1, DT_CENTER);
-        if (p_nbtn < 40) {
+        if (p_nbtn < 64) {
             RECT rc = {(LONG)sx0, (LONG)y0, (LONG)sx1, (LONG)y1};
             p_btn[p_nbtn].r = rc; p_btn[p_nbtn].row = row; p_btn[p_nbtn].value = k; p_btn[p_nbtn].enabled = enabled;
             p_nbtn++;
@@ -178,20 +195,88 @@ static void choices(int row, float x0, float y0, float x1, float y1, const wchar
 }
 
 static const wchar_t *const sr_names[6] = {L"Off", L"DLAA", L"Quality", L"Balanced", L"Performance", L"Ultra Perf."};
+static const wchar_t *const sr_names_fsr[6] = {L"Off", L"Native AA", L"Quality", L"Balanced", L"Performance", L"Ultra Perf."};
 static const wchar_t *const fg_names[4] = {L"Off", L"2x", L"3x", L"4x"};
-static const wchar_t *const mv_names[2] = {L"Camera only", L"Per object"};
+static const wchar_t *const mv_names[2] = {L"Full", L"Fast"};   // per_object / camera_only: shown Full first, so slot = 1 - p_motion
 static const wchar_t *const cap_names[5] = {L"Off", L"Auto", L"60", L"90", L"120"};
 static const wchar_t *const preset_names[5] = {L"Default", L"J", L"K", L"L", L"M"};
 static const wchar_t *const sharp_names[4] = {L"Off", L"Low", L"Medium", L"High"};
 static const wchar_t *const vsync_names[2] = {L"Off", L"On"};
-static const wchar_t *const view_names[3] = {L"Off", L"No mip bias", L"No bloom fix"};
+#define VIEW_N 3
+static const wchar_t *const view_names[VIEW_N] = {L"Off", L"No mip bias", L"No bloom fix"};
 // the frame cap (row 3): the choice (0 off, 1 auto, 2.. 60 / 90 / 120) and the rendered-frame cap in effect (0 none)
 static int p_cap = 1;
 static unsigned p_cap_fps;
 void fgp_set_cap(int choice, unsigned fps) { p_cap = choice; p_cap_fps = fps; p_dirty = 1; }
 
+
+static void add_btn(float x0, float y0, float x1, float y1, int row, int value, int enabled) {
+    if (p_nbtn >= 64) return;
+    RECT rc = {(LONG)x0, (LONG)y0, (LONG)x1, (LONG)y1};
+    p_btn[p_nbtn].r = rc; p_btn[p_nbtn].row = row; p_btn[p_nbtn].value = value; p_btn[p_nbtn].enabled = enabled;
+    p_nbtn++;
+}
+// a drop-down: the box shows the pick (value -1 opens / closes it); its list is drawn after every row (drop_list), so it
+// lies over the rows below and takes the clicks there (the hover search goes from the last button back)
+static struct { int row, n, chosen, allowed; float x0, y0, x1, y1; const wchar_t *const *names; } p_dl;
+static void dropdown(int row, float x0, float y0, float x1, float y1, const wchar_t *const *names, int n, int chosen, int allowed) {
+    float u = p_u, r = 3 * u;
+    int hot = p_nbtn == p_hover, open = p_drop == row;
+    fill_rr(x0, y0, x1, y1, r, open || hot ? C_HOVER : C_TRACK, 1);
+    text(names[chosen], p_small, C_TEXT, (int)(x0 + 12 * u), (int)y0, (int)(x1 - 30 * u), (int)y1, DT_LEFT);
+    text(open ? L"\x25B4" : L"\x25BE", p_small, C_BRONZE, (int)(x1 - 28 * u), (int)y0, (int)(x1 - 8 * u), (int)y1, DT_CENTER);
+    add_btn(x0, y0, x1, y1, row, -1, 1);
+    if (open) { p_dl.row = row; p_dl.n = n; p_dl.chosen = chosen; p_dl.allowed = allowed; p_dl.names = names;
+                p_dl.x0 = x0; p_dl.y0 = y1 + 2 * u; p_dl.x1 = x1; p_dl.y1 = y1; }
+}
+static void drop_list(void) {
+    if (p_drop < 0 || p_dl.row != p_drop) return;
+    float u = p_u, ih = 34 * u, y = p_dl.y0;
+    fill_rr(p_dl.x0 - 1 * u, y - 1 * u, p_dl.x1 + 1 * u, y + ih * p_dl.n + 1 * u, 3 * u, C_RULE, 1);
+    for (int k = 0; k < p_dl.n; k++, y += ih) {
+        int enabled = p_dl.allowed >> k & 1, hot = enabled && p_nbtn == p_hover, sel = k == p_dl.chosen;
+        fill_rr(p_dl.x0, y, p_dl.x1, y + ih, 2 * u, sel ? C_BRONZE : hot ? C_HOVER : C_TRACK, 1);
+        text(p_dl.names[k], p_small, sel ? C_ON_BRONZE : !enabled ? C_OFF : C_TEXT, (int)(p_dl.x0 + 12 * u), (int)y, (int)p_dl.x1, (int)(y + ih), DT_LEFT);
+        add_btn(p_dl.x0, y, p_dl.x1, y + ih, p_dl.row, k, enabled);
+    }
+}
+static const wchar_t *const fps_names[5] = {L"Off", L"Top left", L"Top right", L"Bottom left", L"Bottom right"};
+static const wchar_t *const tsr_names[2] = {L"NVIDIA DLSS", L"AMD FSR"};
+static const wchar_t *const tfg_names[2] = {L"NVIDIA DLSS Frame Generation", L"AMD FSR Frame Generation"};
+// what this PC should use (always shown; the Defaults button sets it), from the GPU, the screen size and its refresh rate:
+// NVIDIA's parts where the GPU has them, AMD FSR for the rest; Attila is mostly limited by the CPU, so a strong GPU gets the
+// best image (DLAA / Native AA up to 1440p, Quality at 4K) and a weaker one more upscaling; 3x frame generation on an RTX 50
+// with a 200 Hz+ screen, else 2x; preset NVIDIA's default, sharpness Medium, V-Sync On
+typedef struct { int sr_amd, fg_amd, sr, fg; } Rec;
+static int gpu_class(void) {   // 2 strong, 1 middle, 0 entry, from the name: "RTX 5090", "RX 7900 XTX", "RX 9070"
+    const wchar_t *g = fgb_gpu_name(), *r = wcsstr(g, L"RTX "), *a = wcsstr(g, L"RX ");
+    if (r) {
+        unsigned n = wcstoul(r + 4, NULL, 10), series = n / 100, tier = n % 100;
+        return tier >= 80 || (tier >= 70 && series >= 40) ? 2 : tier >= 60 ? 1 : 0;
+    }
+    if (a) {
+        unsigned n = wcstoul(a + 3, NULL, 10), t = n % 1000;
+        if (t < 100) t *= 10;   // 9070: tier 70
+        return t >= 800 || (t >= 700 && n >= 9000) ? 2 : t >= 600 ? 1 : 0;
+    }
+    return 1;
+}
+static Rec recommended(void) {
+    int dsr, dfg;
+    fgb_gpu_caps(&dsr, &dfg);
+    Rec r;
+    r.sr_amd = !dsr; r.fg_amd = !(dsr && dfg);
+    int fg_ok = 1;
+    int c = gpu_class();
+    r.sr = p_bh >= 2000 ? 4 - c : p_bh >= 1300 ? (c == 2 ? 1 : 3 - c) : (c ? 1 : 2);   // 4K: Quality / Balanced / Performance
+    const wchar_t *rtx = wcsstr(fgb_gpu_name(), L"RTX ");   // 3x needs an RTX 50 (from the name: the same whatever runs now)
+    r.fg = !fg_ok ? 0 : !r.fg_amd && rtx && wcstoul(rtx + 4, NULL, 10) >= 5000 && p_hz >= 200 ? 2 : 1;
+    return r;
+}
 static void redraw(void) {
     float u = p_u;
+    float cy1 = p_cy1_full - (SR_AMD ? 58 * u : 0);   // the DLSS preset row is not shown while AMD FSR upscales
+    if (cy1 != p_cy1) { p_cy1 = cy1; make_mask(); }
     // the panel: vertical gradient (the shadow area outside it is cut by the alpha below)
     for (int y = 0; y < p_h; y++) {
         float t = (y - p_cy0) / (p_cy1 - p_cy0);
@@ -206,59 +291,107 @@ static void redraw(void) {
     p_nbtn = 0;
     float x0 = p_cx0 + 26 * u, x1 = p_cx1 - 26 * u, y = p_cy0 + 16 * u;
     // heading, and how to close it
-    text(L"DLSS", p_title, C_TEXT, (int)x0, (int)y, (int)(x0 + 200 * u), (int)(y + 36 * u), DT_LEFT);
-    text(L"F11 to close", p_tiny, C_DIM, (int)(x1 - 200 * u), (int)y, (int)x1, (int)(y + 36 * u), DT_RIGHT);
+    text(SR_AMD ? L"AMD FSR" : FG_AMD ? L"DLSS + AMD FSR" : L"DLSS", p_title, C_TEXT, (int)x0, (int)y, (int)(x0 + (FG_AMD ? 300 : 200) * u), (int)(y + 36 * u), DT_LEFT);
+    text(L"F11 to close", p_tiny, C_DIM, (int)(x1 - 90 * u), (int)y, (int)x1, (int)(y + 36 * u), DT_RIGHT);
+    {   // Defaults: everything back to the recommendation below (the frame-rate counter stays as it is)
+        float bx0 = x1 - 200 * u, bx1 = x1 - 100 * u, by0 = y + 5 * u, by1 = y + 31 * u;
+        int hot = p_nbtn == p_hover;
+        fill_rr(bx0, by0, bx1, by1, 3 * u, hot ? C_HOVER : C_TRACK, 1);
+        text(L"Defaults", p_small, hot ? C_TEXT : C_DIM, (int)bx0, (int)by0, (int)bx1, (int)by1, DT_CENTER);
+        add_btn(bx0, by0, bx1, by1, 20, 0, 1);
+    }
     y += 44 * u;
     fill_rr(x0, y, x1, y + 1 * u, 0, C_RULE, 1);
     y += 18 * u;
     // the settings: name and what it does now on the left, the choices on the right
-    wchar_t cap[8][64];
-    _snwprintf(cap[0], 64, L"Render %u \x00d7 %u", fgb_render_w(), fgb_render_h());
+    wchar_t cap[11][64];
+    _snwprintf(cap[0], 64, SR_AMD ? L"AMD FSR, render %u \x00d7 %u" : L"Render %u \x00d7 %u", fgb_render_w(), fgb_render_h());
     unsigned fgmax = fgb_fg_max();   // NVIDIA's rules for this GPU: frame generation on RTX 40 / 50, 3x and 4x on RTX 50
     if (!fgmax) _snwprintf(cap[1], 64, L"Needs an RTX 40 or 50 series GPU");
+    else if (FG_AMD) _snwprintf(cap[1], 64, p_fg ? L"AMD FSR, 1 generated per rendered frame" : L"AMD FSR Frame Generation, 2x");
     else if (p_fg) _snwprintf(cap[1], 64, L"%d generated per rendered frame", p_fg);
     else _snwprintf(cap[1], 64, fgmax == 1 ? L"3x and 4x need an RTX 50 series GPU" : L"Every frame rendered");
     _snwprintf(cap[2], 64, p_motion == -2 ? L"Needs frame generation" : p_motion < 0 ? L"Not available this session"
-               : p_motion ? L"Soldiers and horses tracked" : L"Camera movement only");
+               : p_motion ? L"Soldiers, horses, trees and grass" : L"Camera only: for weak CPUs");
     if (p_cap_fps) _snwprintf(cap[3], 64, L"%u rendered, %u shown fps", p_cap_fps, p_cap_fps * (p_fg + 1));
     else _snwprintf(cap[3], 64, p_cap == 1 ? L"Screen rate with frame generation" : L"No cap");
     static const wchar_t *const preset_caps[5] = {L"", L"Less ghosting, more flicker", L"Best image for DLAA / Quality",
                                                   L"Sharpest, the slowest", L"Sharp, faster than L"};
     // Default: NVIDIA's documented preset for the mode (Streamline 2.14.16 reports none in use, and the NVIDIA app's override
     // can change it): DLAA / Quality / Balanced K, Performance M, Ultra Performance L
-    if (!p_presets_ok) _snwprintf(cap[4], 64, L"Update the DLSS add-on for this");
+    if (SR_AMD) _snwprintf(cap[4], 64, L"NVIDIA DLSS only");
+    else if (!p_presets_ok) _snwprintf(cap[4], 64, L"Update the DLSS add-on for this");
     else if (!p_sr) _snwprintf(cap[4], 64, L"Needs Super Resolution or DLAA");
     else if (!p_preset) _snwprintf(cap[4], 64, L"NVIDIA's pick here: %lc", L"-KKKML"[p_sr < 6 ? p_sr : 0]);
     else _snwprintf(cap[4], 64, L"%ls", preset_caps[p_preset]);
-    _snwprintf(cap[5], 64, !p_sr ? L"Needs Super Resolution or DLAA" : p_sharp ? L"Crisper DLSS output" : L"DLSS output as it is");
+    if (SR_AMD) _snwprintf(cap[5], 64, !p_sr ? L"Needs upscaling or Native AA" : p_sharp ? L"Crisper FSR output" : L"FSR output as it is");
+    else _snwprintf(cap[5], 64, !p_sr ? L"Needs Super Resolution or DLAA" : p_sharp ? L"Crisper DLSS output" : L"DLSS output as it is");
     _snwprintf(cap[6], 64, L"Test build only, not saved");
-    _snwprintf(cap[7], 64, !p_vsync_ok ? L"Update the DLSS add-on for this" : p_vsync ? L"No tearing, up to the screen's rate"
+    _snwprintf(cap[7], 64, p_vsync_driver == 2 ? L"Forced On in NVIDIA's settings" : p_vsync_driver == 3 ? L"Forced Off in NVIDIA's settings"
+               : p_vsync_driver == 4 ? L"Fast Sync in NVIDIA's settings" : !p_vsync_ok ? L"Update the DLSS add-on for this"
+               : p_vsync ? L"No tearing, up to the screen's rate"
                                                                                      : L"No cap, the picture may tear");
-    static const wchar_t *const label[8] = {L"Super Resolution", L"Frame Generation", L"Motion Vectors", L"Frame Cap", L"DLSS Preset",
-                                            L"Sharpness", L"Debug View", L"V-Sync"};
+    static const wchar_t *const label[11] = {L"Super Resolution", L"Frame Generation", L"Motion Vectors", L"Frame Cap", L"DLSS Preset",
+                                             L"Sharpness", L"Debug View", L"V-Sync", L"FPS Counter", L"Upscaler", L"Frame Gen Tech"};
+    _snwprintf(cap[8], 64, p_fpson ? L"Rendered / shown frames per second" : L"Hidden");
+    int dsr, dfg;
+    fgb_gpu_caps(&dsr, &dfg);
+    int run_sr = SR_AMD ? 1 : 0, run_fg = FG_AMD ? 1 : 0;
+    _snwprintf(cap[9], 64, p_tsr != run_sr ? L"From the next game start" : dsr ? L"Running now" : L"DLSS needs an NVIDIA RTX GPU");
+    _snwprintf(cap[10], 64, p_tfg != run_fg ? L"From the next game start" : dfg ? L"Running now" : L"DLSS needs an RTX 40 or 50 series GPU");
     // the preset and sharpness right under Super Resolution, V-Sync under Frame Cap (rows keep their ids)
-    static const int order[8] = {0, 4, 5, 1, 2, 3, 7, 6};
+    static const int order[11] = {9, 10, 0, 4, 5, 1, 2, 3, 7, 8, 6};
+    const int nrows = 10;
     float lab = x0 + 196 * u, rh = 38 * u;
-    for (int i = 0; i < (p_apply.view ? 8 : 7); i++) {
+    p_dl.row = -1;
+    for (int i = 0; i < nrows + (p_apply.view ? 1 : 0); i++) {
         int row = order[i];
-        float c0 = row && row != 3 ? lab + (x1 - lab) * 0.30f : lab;   // the shorter rows leave their caption more room
-        text(label[row], p_label, C_TEXT, (int)x0, (int)(y - 3 * u), (int)c0, (int)(y + rh * 0.55f), DT_LEFT);
+        if (row == 4 && SR_AMD) continue;
+        float c0 = row && row != 3 && row != 8 && row < 9 ? lab + (x1 - lab) * 0.30f : lab;   // the shorter rows leave their caption more room
+        text(row == 0 && SR_AMD ? L"Upscaling" : label[row], p_label, C_TEXT, (int)x0, (int)(y - 3 * u), (int)c0, (int)(y + rh * 0.55f), DT_LEFT);
         text(cap[row], p_tiny, C_DIM, (int)x0, (int)(y + rh * 0.5f), (int)(c0 - 10 * u), (int)(y + rh + 3 * u), DT_LEFT | DT_END_ELLIPSIS);
-        if (row == 0) choices(0, c0, y, x1, y + rh, sr_names, 6, p_sr, 6);
+        if (row == 0) choices(0, c0, y, x1, y + rh, SR_AMD ? sr_names_fsr : sr_names, 6, p_sr, 6);
         else if (row == 1) choices(1, c0, y, x1, y + rh, fg_names, 4, p_fg, (int)fgmax + 1);
         else if (row == 3) choices(3, c0, y, x1, y + rh, cap_names, 5, p_cap, 5);
-        else if (row == 4) choices(4, c0, y, x1, y + rh, preset_names, 5, p_preset, p_sr && p_presets_ok ? 5 : 0);
+        else if (row == 4) choices(4, c0, y, x1, y + rh, preset_names, 5, p_preset, p_sr && p_presets_ok && !SR_AMD ? 5 : 0);
         else if (row == 5) choices(5, c0, y, x1, y + rh, sharp_names, 4, p_sharp, p_sr ? 4 : 0);
-        else if (row == 6) choices(6, c0, y, x1, y + rh, view_names, 3, p_view, p_sr ? 3 : 0);
-        else if (row == 7) choices(7, c0, y, x1, y + rh, vsync_names, 2, p_vsync, p_vsync_ok ? 2 : 0);
+        else if (row == 6) choices(6, c0, y, x1, y + rh, view_names, VIEW_N, p_view, p_sr ? VIEW_N : 0);
+        else if (row == 7) choices(7, c0, y, x1, y + rh, vsync_names, 2, p_vsync, p_vsync_ok && p_vsync_driver < 2 ? 2 : 0);
+        else if (row == 8) choices(8, c0, y, x1, y + rh, fps_names, 5, p_fpson, 5);
+        else if (row == 9) dropdown(9, c0 + 40 * u, y, x1, y + rh, tsr_names, 2, p_tsr, (dsr ? 1 : 0) | 2);
+        else if (row == 10) dropdown(10, c0 + 40 * u, y, x1, y + rh, tfg_names, 2, p_tfg, (dsr && dfg && !p_tsr ? 1 : 0) | 2);
         else {
-            choices(2, c0, y, x1, y + rh, mv_names, 2, p_motion, p_motion >= 0 ? 2 : 0);
+            choices(2, c0, y, x1, y + rh, mv_names, 2, 1 - p_motion, p_motion >= 0 ? 2 : 0);
             y += rh + 8 * u;   // per-object motion's cost, under its row
-            text(L"Per object costs a lot of fps in big battles. Use it only if you see smearing or ghosting with frame generation.",
+            text(L"Full tracks what moves on its own: no ghosting on soldiers and swaying trees. Fast helps weaker CPUs in very big battles.",
                  p_tiny, C_DIM, (int)x0, (int)y, (int)x1, (int)(y + 18 * u), DT_LEFT | DT_END_ELLIPSIS);
             y += 18 * u - rh - 8 * u;
         }
         y += rh + 20 * u;
+    }
+    {   // the recommendation for this PC, always shown: the settings (from the GPU, the screen and its refresh rate), the model
+        Rec r = recommended();
+        const wchar_t *g = fgb_gpu_name(), *gs = wcsstr(g, L"RTX ");
+        if (!gs) gs = wcsstr(g, L"RX ");
+        if (!gs) gs = wcsstr(g, L"Arc ");
+        wchar_t rec[200], hz[16] = L"", mdl[200];
+        if (p_hz) _snwprintf(hz, 16, L", %u Hz", p_hz);
+        _snwprintf(rec, 200, L"Recommended for %ls at %u \x00d7 %u%ls: %ls %ls%ls%ls%ls", gs ? gs : g, p_bw, p_bh, hz,
+                   r.sr_amd ? L"AMD FSR" : L"NVIDIA DLSS", (r.sr_amd ? sr_names_fsr : sr_names)[r.sr], r.fg ? L", " : L"",
+                   !r.fg ? L"" : r.fg_amd ? L"AMD FSR Frame Generation " : L"DLSS Frame Generation ", r.fg ? fg_names[r.fg] : L"");
+        // line 2: the settings for the model picked in rows 9 / 10 (AMD FSR upscaling needs each soldier's own motion: its
+        // reactive mask marks moving units only from per-object vectors, AGENT_LOG 163 / 171)
+        int msr = p_tsr, mfg = p_tfg;
+        if (msr) _snwprintf(mdl, 200, L"With AMD FSR: motion vectors Full, sharpness Medium, V-Sync On");
+        else _snwprintf(mdl, 200, L"With NVIDIA DLSS%ls: preset Default (%lc), motion vectors Full, sharpness Medium, V-Sync On",
+                        mfg ? L" and AMD FSR Frame Generation" : L"", L"-KKKML"[p_sr > 0 && p_sr < 6 ? p_sr : 2]);
+        if (p_tsr != (SR_AMD ? 1 : 0) || p_tfg != (FG_AMD ? 1 : 0))   // a pick waiting for the restart: said instead, louder
+            _snwprintf(rec, 200, L"Restart the game to switch to %ls upscaling with %ls frame generation", p_tsr ? L"AMD FSR" : L"NVIDIA DLSS",
+                       p_tfg ? L"AMD FSR" : L"NVIDIA DLSS");
+        text(rec, p_tiny, C_BRONZE, (int)x0, (int)(y - 8 * u), (int)x1, (int)(y + 14 * u), DT_LEFT | DT_END_ELLIPSIS);
+        y += 22 * u;
+        text(mdl, p_tiny, C_BRONZE, (int)x0, (int)(y - 8 * u), (int)x1, (int)(y + 14 * u), DT_LEFT | DT_END_ELLIPSIS);
+        y += 22 * u;
     }
     y -= 4 * u;
     fill_rr(x0, y, x1, y + 1 * u, 0, C_RULE, 1);
@@ -268,8 +401,9 @@ static void redraw(void) {
     _snwprintf(v, 96, L"Game %.0f fps    Shown %.0f fps", p_game_fps, p_shown_fps);
     if (p_note) text(p_note, p_small, C_BRONZE, (int)x0, (int)y, (int)x1, (int)(y + 26 * u), DT_LEFT | DT_END_ELLIPSIS);
     else text(v, p_small, C_TEXT, (int)x0, (int)y, (int)(x0 + 300 * u), (int)(y + 26 * u), DT_LEFT);
-    if (fgmax && !p_note) text(L"Frame generation needs the game window in focus", p_tiny, C_DIM, (int)(x0 + 300 * u), (int)y, (int)x1, (int)(y + 26 * u),
+    if (fgmax && !p_note && !FG_AMD) text(L"Frame generation needs the game window in focus", p_tiny, C_DIM, (int)(x0 + 300 * u), (int)y, (int)x1, (int)(y + 26 * u),
          DT_RIGHT | DT_END_ELLIPSIS);
+    drop_list();   // over the rows below it
     GdiFlush();
     // the colours through the fixed mask: premultiplied by the card's alpha, the edge highlight, the shadow's alpha
     for (size_t i = 0, n = (size_t)p_w * p_h; i < n; i++) {
@@ -324,7 +458,57 @@ static int pipeline(void) {
     return ok;
 }
 
-static void blend_panel(ID3D11Resource *bb) {
+
+// ---- the frame-rate counter (top right): rendered / shown frames per second, its own small texture ----
+static HDC c_dc;
+static HBITMAP c_bmp;
+static unsigned char *c_bits, *c_rgba;
+static ID3D11Texture2D *c_tex;
+static ID3D11ShaderResourceView *c_srv;
+static int c_w, c_h;
+static HFONT c_font;
+static void counter_redraw(void) {
+    if (!c_dc) {
+        c_w = (int)(130 * p_u); c_h = (int)(24 * p_u);
+        BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), c_w, -c_h, 1, 32, BI_RGB, 0, 0, 0, 0, 0}, {{0, 0, 0, 0}}};
+        c_dc = CreateCompatibleDC(NULL);
+        c_bmp = c_dc ? CreateDIBSection(c_dc, &bi, DIB_RGB_COLORS, (void **)&c_bits, NULL, 0) : NULL;
+        c_rgba = malloc((size_t)c_w * c_h * 4);
+        c_font = CreateFontW(-(int)(13 * p_u), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+        D3D11_TEXTURE2D_DESC td = {(UINT)c_w, (UINT)c_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        if (!c_bmp || !c_rgba || FAILED(ID3D11Device_CreateTexture2D(p_dev, &td, NULL, &c_tex)) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(p_dev, (ID3D11Resource *)c_tex, NULL, &c_srv))) { p_fpson = 0; return; }
+        SelectObject(c_dc, c_bmp);
+    }
+    memset(c_bits, 0, (size_t)c_w * c_h * 4);
+    wchar_t s[48];
+    if (p_shown_fps > p_game_fps * 1.2) _snwprintf(s, 48, L"%.0f / %.0f fps", p_game_fps, p_shown_fps);   // frame generation runs
+    else _snwprintf(s, 48, L"%.0f fps", p_game_fps);
+    RECT r = {(int)(4 * p_u), 0, c_w - (int)(4 * p_u), c_h};
+    SetBkMode(c_dc, TRANSPARENT);
+    SelectObject(c_dc, c_font);
+    SetTextColor(c_dc, RGB(255, 255, 255));
+    DrawTextW(c_dc, s, -1, &r, (p_fpson == 1 || p_fpson == 3 ? DT_LEFT : DT_RIGHT) | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    GdiFlush();
+    // the numbers only (no background): the text's coverage in white, around it a 2-pixel dark outline so it stays
+    // readable on bright sky and smoke; premultiplied RGBA (the outline adds alpha only)
+    for (int y = 0; y < c_h; y++)
+        for (int x = 0; x < c_w; x++) {
+            const unsigned char *b = c_bits + ((size_t)y * c_w + x) * 4;
+            unsigned char *o = c_rgba + ((size_t)y * c_w + x) * 4;
+            float t = b[1] / 255.0f, ol = 0;
+            for (int dy = -2; dy <= 2; dy++)
+                for (int dx = -2; dx <= 2; dx++) {
+                    int xx = x + dx, yy = y + dy;
+                    if (xx >= 0 && yy >= 0 && xx < c_w && yy < c_h) { float v = c_bits[((size_t)yy * c_w + xx) * 4 + 1] / 255.0f; if (v > ol) ol = v; }
+                }
+            float a = t > ol * 0.8f ? t : ol * 0.8f;
+            o[0] = o[1] = o[2] = (unsigned char)(t * 255 + 0.5f);
+            o[3] = (unsigned char)(a * 255 + 0.5f);
+        }
+    ID3D11DeviceContext_UpdateSubresource(p_ctx, (ID3D11Resource *)c_tex, 0, NULL, c_rgba, c_w * 4, 0);
+}
+static void blend_panel(ID3D11Resource *bb, ID3D11ShaderResourceView *tex, int tx, int ty, int tw, int th) {
     ID3D11DeviceContext *c = p_ctx;
     if (bb != p_rtv_res) {   // the back buffer's view (the same resource every frame)
         if (p_rtv) ID3D11RenderTargetView_Release(p_rtv);
@@ -352,7 +536,7 @@ static void blend_panel(ID3D11Resource *bb) {
     ID3D11DeviceContext_IAGetPrimitiveTopology(c, &topo);
     ID3D11DeviceContext_PSGetShaderResources(c, 0, 1, &srv);
 
-    D3D11_VIEWPORT pv = {(float)p_x, (float)p_y, (float)p_w, (float)p_h, 0, 1};
+    D3D11_VIEWPORT pv = {(float)tx, (float)ty, (float)tw, (float)th, 0, 1};
     ID3D11DeviceContext_OMSetRenderTargets(c, 1, &p_rtv, NULL);
     ID3D11DeviceContext_OMSetBlendState(c, p_blend, NULL, 0xffffffff);
     ID3D11DeviceContext_RSSetViewports(c, 1, &pv);
@@ -365,7 +549,7 @@ static void blend_panel(ID3D11Resource *bb) {
     ID3D11DeviceContext_DSSetShader(c, NULL, NULL, 0);
     ID3D11DeviceContext_IASetInputLayout(c, NULL);
     ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &p_srv);
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &tex);
     ID3D11DeviceContext_Draw(c, 3, 0);
 
     UINT nrt = 0;
@@ -395,8 +579,11 @@ int fgp_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh, DXGI
     if (p_fg > (int)fgb_fg_max()) p_fg = (int)fgb_fg_max();   // never show a choice this GPU does not allow as the current one
     float u = p_u = bh / 1080.0f;
     float m = 20 * u;   // room for the shadow around the panel
-    p_cx0 = m; p_cy0 = m; p_cx1 = m + 790 * u; p_cy1 = m + (374 + (apply.view ? 4 : 3) * 58) * u; p_cr = 3 * u;   // + the preset, sharpness and V-Sync rows (+ Debug View)
+    p_cx0 = m; p_cy0 = m; p_cx1 = m + 790 * u;
+    int extra = 3 + 1 + 2;   // + preset, sharpness, V-Sync, FPS counter, upscaler, frame generation tech
+    p_cy1 = m + (374 + 44 + (extra + (apply.view ? 1 : 0)) * 58) * u; p_cr = 3 * u;   // + those rows (+ Debug View), the recommendation lines
     p_w = (int)ceilf(p_cx1 + m); p_h = (int)ceilf(p_cy1 + m);
+    p_cy1_full = p_cy1;
     p_x = (int)(bw * 0.03f - m); p_y = (int)(bh * 0.08f - m);
     if (p_x < 0) p_x = 0;
     if (p_y < 0) p_y = 0;
@@ -406,9 +593,23 @@ int fgp_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh, DXGI
     p_rgba = malloc((size_t)p_w * p_h * 4);
     if (!p_dc || !p_bmp || !p_rgba) return 0;
     SelectObject(p_dc, p_bmp);
-    // the mask: the card (slightly see-through, a hairline highlight on its edge, lit from above) and a soft shadow below it
     p_mask = malloc((size_t)p_w * p_h * 3);
     if (!p_mask) return 0;
+    make_mask();
+    p_title = CreateFontW(-(int)(27 * u), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Palatino Linotype");
+    p_label = CreateFontW(-(int)(17 * u), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Palatino Linotype");
+    p_small = CreateFontW(-(int)(15 * u), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    p_tiny = CreateFontW(-(int)(13 * u), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    D3D11_TEXTURE2D_DESC td = {(UINT)p_w, (UINT)p_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &p_tex)) || !pipeline()) return 0;
+    p_ok = 1;
+    return 1;
+}
+
+// the mask: the card (slightly see-through, a hairline highlight on its edge, lit from above) and a soft shadow below it;
+// made again when the card's height changes (the DLSS preset row is hidden while AMD FSR upscales)
+static void make_mask(void) {
+    float u = p_u, m = 20 * u;
     for (int yy = 0; yy < p_h; yy++)
         for (int xx = 0; xx < p_w; xx++) {
             float px = xx + 0.5f, py = yy + 0.5f;
@@ -422,14 +623,6 @@ int fgp_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh, DXGI
             unsigned char *k = p_mask + ((size_t)yy * p_w + xx) * 3;
             k[0] = (unsigned char)(ac * 255 + 0.5f); k[1] = (unsigned char)(a * 255 + 0.5f); k[2] = (unsigned char)(e * 255 + 0.5f);
         }
-    p_title = CreateFontW(-(int)(27 * u), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Palatino Linotype");
-    p_label = CreateFontW(-(int)(17 * u), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Palatino Linotype");
-    p_small = CreateFontW(-(int)(15 * u), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
-    p_tiny = CreateFontW(-(int)(13 * u), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
-    D3D11_TEXTURE2D_DESC td = {(UINT)p_w, (UINT)p_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
-    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &p_tex)) || !pipeline()) return 0;
-    p_ok = 1;
-    return 1;
 }
 
 void fgp_set_note(const wchar_t *note) { p_note = note; p_dirty = 1; }
@@ -451,12 +644,40 @@ int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT b
 }
 
 void fgp_set_fps(double game, double shown) {
-    if (game != p_game_fps || shown != p_shown_fps) { p_game_fps = game; p_shown_fps = shown; p_dirty = 1; }
+    if (game != p_game_fps || shown != p_shown_fps) { p_game_fps = game; p_shown_fps = shown; p_dirty = p_cdirty = 1; }
+}
+
+// the Defaults button: every choice back to the recommendation (as if clicked), the frame-rate counter kept
+static void fgp_defaults(void) {
+    Rec r = recommended();
+    unsigned fgmax = fgb_fg_max();
+    int fg = r.fg > (int)fgmax ? (int)fgmax : r.fg, ra = r.sr_amd, fa = r.fg_amd;
+#define SET(var, val, cb) if ((var) != (val)) { (var) = (val); if (p_apply.cb) p_apply.cb(var); }
+    SET(p_sr, r.sr, sr);
+    SET(p_fg, fg, fg);
+    if (p_motion >= 0) { SET(p_motion, 1, motion); }   // Full (per object) for everyone (AGENT_LOG 179)
+    SET(p_cap, 1, cap);
+    SET(p_preset, 0, preset);
+    SET(p_sharp, 2, sharp);
+    if (p_vsync_ok) { SET(p_vsync, 1, vsync); }
+#undef SET
+    if (ra != p_tsr || fa != p_tfg) { p_tsr = ra; p_tfg = fa; if (p_apply.tech) p_apply.tech(ra, fa); }
+    (void)fa; (void)ra;
+    p_drop = -1;
+    p_dirty = 1;
 }
 
 // each Present (main thread), before the frame is handed to the helper: input, then the panel over the back buffer
 void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
     if (!p_ok) return;
+    static int hz_read;
+    if (!hz_read) {   // the screen's refresh rate, for the recommendation
+        hz_read = 1;
+        MONITORINFOEXW mi = {.cbSize = sizeof mi};
+        DEVMODEW dm = {.dmSize = sizeof dm};
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO *)&mi) &&
+            EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) { p_hz = dm.dmDisplayFrequency; p_dirty = 1; }
+    }
     static SHORT f11_prev, lb_prev;
     int focus = GetForegroundWindow() == hwnd;
     SHORT f11 = focus ? GetAsyncKeyState(VK_F11) : 0, lb = focus ? GetAsyncKeyState(VK_LBUTTON) : 0;
@@ -471,15 +692,25 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
             my = c.y * (int)p_bh / cr.bottom - p_y;
             over = mx >= p_cx0 && my >= p_cy0 && mx < p_cx1 && my < p_cy1;
         }
-        for (int i = 0; over && i < p_nbtn; i++) {
+        for (int i = p_nbtn - 1; over && i >= 0 && hover < 0; i--) {
             const Btn *b = &p_btn[i];
             if (b->enabled && mx >= b->r.left && mx < b->r.right && my >= b->r.top && my < b->r.bottom) hover = i;
         }
+        if ((lb & 0x8000) && !(lb_prev & 0x8000) && p_drop >= 0 && (hover < 0 || p_btn[hover].row != p_drop)) { p_drop = -1; p_dirty = 1; }
         if (hover >= 0 && (lb & 0x8000) && !(lb_prev & 0x8000)) {
             const Btn *b = &p_btn[hover];
+            if (b->row >= 9 && b->row <= 10 && b->value < 0) { p_drop = p_drop == b->row ? -1 : b->row; p_dirty = 1; }
+            else if (b->row == 9 || b->row == 10) {   // a pick from the list: DLSS frame generation needs DLSS upscaling
+                int sr = b->row == 9 ? b->value : p_tsr, fg = b->row == 10 ? b->value : p_tfg;
+                if (sr) fg = 1;
+                if (sr != p_tsr || fg != p_tfg) { p_tsr = sr; p_tfg = fg; if (p_apply.tech) p_apply.tech(sr, fg); }
+                p_drop = -1;
+            }
+            if (b->row == 8 && b->value != p_fpson) { p_fpson = b->value; p_cdirty = 1; if (p_apply.fps) p_apply.fps(p_fpson); }   // a corner, or off
+            if (b->row == 20) fgp_defaults();
             if (b->row == 0 && b->value != p_sr) { p_sr = b->value; if (p_apply.sr) p_apply.sr(p_sr); }
             if (b->row == 1 && b->value != p_fg) { p_fg = b->value; if (p_apply.fg) p_apply.fg(p_fg); }
-            if (b->row == 2 && b->value != p_motion) { p_motion = b->value; if (p_apply.motion) p_apply.motion(p_motion); }
+            if (b->row == 2 && 1 - b->value != p_motion) { p_motion = 1 - b->value; if (p_apply.motion) p_apply.motion(p_motion); }
             if (b->row == 3 && b->value != p_cap) { p_cap = b->value; if (p_apply.cap) p_apply.cap(p_cap); }
             if (b->row == 4 && b->value != p_preset) { p_preset = b->value; if (p_apply.preset) p_apply.preset(p_preset); }
             if (b->row == 5 && b->value != p_sharp) { p_sharp = b->value; if (p_apply.sharp) p_apply.sharp(p_sharp); }
@@ -491,10 +722,16 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
     if (hover != p_hover) { p_hover = hover; p_dirty = 1; }
     lb_prev = lb;
     p_block = p_open && over;
+    if (p_fpson && p_shown_fps > 0) {   // the counter, panel open or not
+        if (p_cdirty || !c_tex) { counter_redraw(); p_cdirty = 0; }
+        int left = p_fpson == 1 || p_fpson == 3, top = p_fpson <= 2, mg = (int)(12 * p_u);
+        if (c_srv) blend_panel(backbuffer, c_srv, left ? mg : (int)p_bw - c_w - mg, top ? mg : (int)p_bh - c_h - mg, c_w, c_h);
+    }
     if (!p_open) return;
     if (p_dirty) { redraw(); p_dirty = 0; }
-    blend_panel(backbuffer);
+    blend_panel(backbuffer, p_srv, p_x, p_y, p_w, p_h);
 }
 
 // tests (bridgetest): open / choose without a mouse
 void fgp_test_open(int open) { p_open = open; p_dirty = 1; }
+void fgp_test_drop(int row) { p_drop = row; p_dirty = 1; }   // a drop-down list open (bridgetest panel)

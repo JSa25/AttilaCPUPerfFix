@@ -15,7 +15,9 @@
 #define FGB_QUIT 0xFFFFFFFFu
 #define FGB_CAP_PRESET 1u   /* sr_preset is applied (add-on version 5) */
 #define FGB_CAP_HUD_POST 2u /* hud_post is applied (add-on version 6; Rome 2's add-on version 4) */
-#define FGB_CAP_VSYNC 8u    /* vsync_off is applied (add-on version 7); 4u is reserved */
+#define FGB_CAP_FSR 4u      /* tech is applied: AMD FSR upscaling / frame generation where NVIDIA's are missing or not wanted (add-on version 8) */
+#define FGB_CAP_VSYNC 8u    /* vsync_off is applied (add-on version 7) */
+#define FGB_CAP_RESTART 16u /* the helper starts at frame done (not 0): the game may stop it and start another (F11 switch) */
 
 typedef struct {
     uint32_t proto, width, height, format, hwnd, luid_lo;
@@ -46,11 +48,17 @@ typedef struct {
     volatile uint32_t hud_post;    /* game: bit n % 32 set = frame n's HUD-less colour after DLSS SR is the full-size
                                       _hudless (ReShade's effects on it), not the SR output. Was padding (same place as
                                       in Rome 2's block) */
-    uint32_t pad1[3];              /* reserved */
+    uint32_t tech;                 /* game: 0 = NVIDIA only (an older game side), 1 = auto (DLSS / DLSS-G where the GPU has
+                                      them, AMD FSR for the rest), 2 = AMD FSR for both, 3 = DLSS upscaling + AMD FSR frame generation. Was padding: an older helper
+                                      ignores it, so the game checks FGB_CAP_FSR */
+    volatile uint32_t sr_backend, fg_backend;   /* helper, before helper_ok: 0 none, 1 NVIDIA (DLSS / DLSS-G), 2 AMD FSR.
+                                                   Was padding: an older helper leaves 0 (read as NVIDIA when helper_ok) */
     volatile uint32_t vsync_off;   /* game: 1 = the helper presents without V-Sync (the player's choice: no cap at the screen's
                                       refresh rate, frames may tear). Was padding: an older game side leaves 0 (V-Sync on),
                                       an older helper ignores it */
-    uint32_t pad2;
+    volatile uint32_t driver_vsync; /* helper, before helper_ok: NVIDIA's driver Vertical sync for the helper, which overrides
+                                      vsync_off (AGENT_LOG 157): 1 the application decides, 2 forced on, 3 forced off, 4 Fast
+                                      Sync; 0 unknown. Was padding: an older helper leaves 0 */
     float vp[16], prev_vp[16];     /* game: view-projection of frame n and n-1 (row-major, clip = M x [x y z 1]) */
 } FgbShared;
 _Static_assert(sizeof(FgbShared) == 256, "bridge block layout");

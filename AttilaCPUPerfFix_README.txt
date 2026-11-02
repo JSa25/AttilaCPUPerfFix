@@ -189,13 +189,44 @@ Compatibility and notes
 - Not fixed: the short freeze during autosave (save compression) and end-turn
   AI time, which is only slightly faster.
 - Optional add-on (new in 6.3): "Upscaling and Framegen for Attila" adds NVIDIA
-  DLSS upscaling and frame generation on GeForce RTX cards. It is a separate
-  download and needs this mod 6.3 or newer. Without it, nothing of it is
-  active.
+  DLSS upscaling and frame generation on GeForce RTX cards, and since 6.10.0
+  (add-on version 8) AMD FSR upscaling and frame generation on other cards. It
+  is a separate download and needs this mod 6.3 or newer (6.10.0 for AMD FSR).
+  Without it, nothing of it is active.
 
 
 Changelog
 ---------
+Version 6.10.0:
+-With the Upscaling and Framegen add-on (version 8): AMD FSR upscaling and
+ frame generation, so the add-on now also runs on AMD and Intel graphics cards
+ and on NVIDIA cards without DLSS. The F11 panel has an Upscaler and a Frame
+ Gen Tech choice (technology= in FrameBridge\settings.txt: auto, dlss, fsr,
+ mixed). Auto, the default, uses NVIDIA DLSS where the card has it and AMD FSR
+ everywhere else. A new pick in F11 switches at once, without a restart.
+ Players coming from add-on version 7 start on auto.
+-AMD FSR gets a reactive mask: smoke, fire, other effects and moving soldiers
+ no longer leave ghost trails with FSR.
+-Motion vectors for swaying trees and grass (and for the soldier models with
+ dismemberment, which had camera motion only), so the wind no longer smears
+ foliage with frame generation or FSR.
+-Motion vectors "Full" (soldiers, horses, trees and grass) is now the default
+ for everyone; "Fast" (camera only) stays in F11 for weaker CPUs in very big
+ battles. Settings saved by older versions are switched to Full once.
+-F11 panel: an FPS counter (Off or any screen corner; rendered / shown fps),
+ a "Recommended for this PC" line with a Defaults button that applies it,
+ and the DLSS Preset row is hidden while AMD FSR upscales.
+-The F11 V-Sync row says so, and is greyed out, when V-Sync is forced on or
+ off in NVIDIA's driver settings (the driver's setting wins).
+-Add-on: no more small hitch every second with frame generation (fps stayed a
+ few frames below the frame cap since 6.7.0).
+-Memory: the small-block heap no longer gives memory back to Windows on almost
+ every free, only when more than 64 MB sits unused. This removes the
+ occasional stutter (and sound stutter) some players had since 6.8.0.
+-With the add-on: texture sharpness below native resolution is now applied
+ to every texture slot the game reuses, and the add-on recovers by itself if
+ the link to its helper stops after a graphics driver hiccup.
+
 Version 6.9.2:
 -With the Upscaling and Framegen add-on (version 7): a V-Sync On / Off switch
  in the F11 panel (and vsync= in FrameBridge\settings.txt). On, the default,

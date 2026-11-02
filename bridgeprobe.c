@@ -67,9 +67,10 @@ static void jit_frame_start(void), jit_frame_end(void);   // DLAA viewport jitte
 // per-object motion (fgmotion.c, AGENT_LOG 99): fgbridge_on.txt line 4 contains "motion"
 static int g_motion;              // the motion pass is set up (bridge mode); on / off: g_motion_on and the F11 panel
 static int g_motion_on;
+unsigned fgb_sr_backend(void);
 static int g_copy_patched;         // the game's instance record copy calls fgm_copy (stays patched for the session)
 // the F11 panel (fgpanel.c)
-typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*sharp)(int choice); void (*view)(int choice); void (*vsync)(int on); } FgpApply;
+typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*sharp)(int choice); void (*view)(int choice); void (*vsync)(int on); void (*fps)(int on); void (*tech)(int sr, int fg); } FgpApply;
 void fgp_set_cap(int choice, unsigned fps);
 void fgp_set_preset(int choice);
 void fgp_set_sharp(int choice);
@@ -78,8 +79,16 @@ void fgb_set_preset(unsigned preset);
 int fgb_helper_has_presets(void);
 void fgb_set_vsync(int on);
 int fgb_helper_has_vsync(void);
+int fgb_driver_vsync(void);
 void fgp_set_vsync(int on);
 void fgp_set_vsync_available(int on);
+void fgp_set_vsync_driver(int v);
+void fgp_set_fps_counter(int corner);
+void fgp_set_fg(int fg);
+int fgb_restart(unsigned tech);
+int fgb_can_restart(void);
+int fgb_fences_lost(void);
+void fgp_set_tech(int sr, int fg);
 void fgb_set_sharpness(float con);
 void fgb_set_frame_limit(unsigned us);
 int fgp_init(ID3D11Device *, ID3D11DeviceContext *, UINT bw, UINT bh, DXGI_FORMAT fmt, int sr, int fg, int motion, FgpApply apply);
@@ -92,11 +101,12 @@ void fgb_set_fg(unsigned frames_to_generate);
 unsigned fgb_fg_max(void);
 void fgb_set_fg_test_limit(unsigned limit);
 void fgb_set_test_not_nvidia(int on);
+void fgb_set_tech(unsigned tech);   // fgbridge.c: 0 NVIDIA only, 1 auto, 2 AMD FSR for both
 void fgm_set_enabled(int on);
 static HWND g_out_hwnd;           // the game's window (the helper presents into it)
 static int g_sr;                 // DLAA (defined with the jitter below)
 static void jit_install(void);
-void fgb_set_motion(void (*pass)(ID3D11Resource *depth, float jx, float jy));
+void fgb_set_motion(int (*pass)(ID3D11Resource *depth, float jx, float jy));
 ID3D11Texture2D *fgb_mv_texture(void);
 int fgb_make_vectors(ID3D11Resource *depth, const float vp[16]);
 static ID3D11Resource *g_main_depth;   // the scene's depth buffer, seen at the HUD-less point
@@ -106,7 +116,7 @@ void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT 
 void fgm_mapped(ID3D11Resource *r, D3D11_MAP type, const D3D11_MAPPED_SUBRESOURCE *m);
 void *__cdecl fgm_copy(void *dst, const void *src, size_t n);
 void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT base_v, UINT start_inst);
-void fgm_pass(ID3D11Resource *depth, float jx, float jy);
+int fgm_pass(ID3D11Resource *depth, float jx, float jy);
 void fgm_frame_end(void);
 void fgm_report(void (*log)(const char *fmt, ...));
 void fgm_dump_next(const wchar_t *path);
@@ -233,6 +243,20 @@ static int targets(char *out, size_t len) {
 
 // the stage vtables the bridge tells apart (main 3D view, HUD, overlay), this game build's rvas (set at install)
 static unsigned g_vt_main = 0x1CCE4E4, g_vt_hud = 0x1C9A900, g_vt_overlay = 0x1CA0858;
+// the main view's depth prepasses (AGENT_LOG 178): grass (+0x1CCE3E0, +0x1CCE2E4) and trees (+0x1CA0404) draw only there or
+// there first, into the main depth; the motion pass takes their swaying draws from them too (0: not this game build)
+static unsigned g_vt_pre[3] = {0x1CCE3E0, 0x1CCE2E4, 0x1CA0404};
+// the vertex dump (vdump_draw, AGENT_LOG 181): frames left, frame number, file; g_mp_on: the motion probe (defined below)
+static int g_vdump_left, g_mp_on;
+static int g_shot_armed, g_shots;   // shot_take (AGENT_LOG 182)
+static float g_lod_extra;   // fsrtest.txt "bias=": added to the texture mip bias (AGENT_LOG 183)
+static unsigned g_vdump_frame;
+static FILE *g_vdump;
+static int g_switch;   // a new helper after this frame's Present: an F11 pick of upscaler / frame generation, or recovery
+static void switch_now(void);
+static unsigned g_vt_fx = 0x1C99FB8, g_vt_fx_end = 0x1C9D064;   // transparent effects into the HDR scene; the next stage
+void fgb_react_begin(ID3D11Resource *hdr);
+void fgb_react_end(void);
 // half-size BGRA/RGBA dump of the back buffer: bridge_bb_<capture>_<k>.raw (header: w, h, format)
 static void dump_bb(const char *where) {
     if (g_dumps >= 24) return;
@@ -295,6 +319,15 @@ __attribute__((force_align_arg_pointer)) static void bp_enter(unsigned id, const
     if (id == g_id_stage && (g_capturing || g_motion)) mp_hook(g_capturing ? "stage entry" : NULL);
     if (id == g_id_stage && g_live_state == 1) jit_install();
     unsigned vt = obj ? *(const unsigned *)obj - g_pt_base : 0;
+    if (g_live_state == 1 && id == g_id_stage && (vt == g_vt_fx || vt == g_vt_fx_end)) {   // AMD FSR's reactive mask
+        if (vt == g_vt_fx_end) fgb_react_end();
+        else {
+            ID3D11RenderTargetView *rt = NULL;
+            ID3D11DeviceContext_OMGetRenderTargets(g_ctx, 1, &rt, NULL);
+            if (rt) { ID3D11Resource *r = NULL; ID3D11RenderTargetView_GetResource(rt, &r); ID3D11RenderTargetView_Release(rt);
+                      if (r) { fgb_react_begin(r); ID3D11Resource_Release(r); } }
+        }
+    }
     if (g_live_state == 1 && id == g_id_stage && vt == g_vt_hud && g_hud_frame != g_frame && fgb_active()) {
         g_hud_frame = g_frame;
         jit_frame_end();
@@ -417,6 +450,37 @@ __attribute__((force_align_arg_pointer)) static void bp_frame(void) {
         _snwprintf(p, MAX_PATH, L"%ls\\bridge_go.txt", g_dir);
         if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES && DeleteFileW(p)) g_armed = 1;
     }
+    if (g_vdump_left && --g_vdump_left == 0) { fclose(g_vdump); g_vdump = NULL; g_log("vertex dump written"); }
+    g_vdump_frame++;
+}
+
+// ---- full-size screenshots for image comparisons (AGENT_LOG 182): shot_go.txt in the game folder -> the game's back buffer
+// at this Present (after DLSS / FSR, before the F11 panel and frame generation) to shot_<n>.raw (u32 width, height, DXGI
+// format, then the rows), and a log line with the settings it was taken with (shot_log, below the setting names)
+static void shot_log(int n);
+static void shot_take(ID3D11Resource *bb) {
+    D3D11_TEXTURE2D_DESC d;
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)bb, &d);
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc.Count = 1; d.SampleDesc.Quality = 0;
+    ID3D11Texture2D *stg = NULL;
+    if (FAILED(ID3D11Device_CreateTexture2D(g_dev, &d, NULL, &stg))) return;
+    ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)stg, bb);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
+        wchar_t p[MAX_PATH];
+        _snwprintf(p, MAX_PATH, L"%ls\\shot_%d.raw", g_dir, ++g_shots);
+        FILE *f = _wfopen(p, L"wb");
+        if (f) {
+            unsigned hdr[3] = {d.Width, d.Height, d.Format};
+            fwrite(hdr, 4, 3, f);
+            for (UINT y = 0; y < d.Height; y++) fwrite((const unsigned char *)m.pData + (size_t)y * m.RowPitch, 4, d.Width, f);
+            fclose(f);
+            shot_log(g_shots);
+        }
+        ID3D11DeviceContext_Unmap(g_ctx, (ID3D11Resource *)stg, 0);
+    }
+    ID3D11Texture2D_Release(stg);
 }
 
 // the bridge off for the session: the helper stops, and the game's own viewports and camera block come back (a preset
@@ -545,8 +609,21 @@ static HRESULT present_hooked(IDXGISwapChain *sc, UINT sync, UINT flags, unsigne
                         frames = 0; t0 = t; shown0 = sh;
                     }
                 }
+                if (g_shot_armed) { g_shot_armed = 0; shot_take(bb); }
                 fgp_frame(bb, g_out_hwnd);
                 fgb_present(bb);
+                {   // the helper's fences stuck at all ones (its GPU device was lost): a new helper, 3 times a session at most
+                    static int lost;
+                    if (!g_switch && lost < 3 && fgb_fences_lost()) {
+                        lost++;
+                        g_log("frame bridge: the helper's GPU fences are stuck (its device was lost) - starting a new helper (%d of 3)", lost);
+                        g_switch = 1;
+                    } else if (!g_switch && lost >= 3 && fgb_fences_lost()) {
+                        g_off_note = L"DLSS stopped: the GPU reset the add-on's helper several times. Restart the game.";
+                        bridge_off();
+                    }
+                }
+                if (g_switch) switch_now();
                 // the game's own swapchain is presented too (hidden window, sync 0, past the overlay / UI mod hooks):
                 // without its Presents the NVIDIA driver held the game's main thread ~30-40% of each frame on a battle
                 // clump, the GPU half idle (AGENT_LOG 109: 120-135 fps without the add-on, 75 with it; 155 with this)
@@ -841,11 +918,13 @@ static void cam_refresh(void) {   // the frame's new jitter into the copies: the
         if (g_cbuf[i].valid) cam_write(&g_cbuf[i], g_cbuf[i].src);
 }
 
+#define g_pscam_off 0
+
 // below native size the copy from the frame start; at DLAA from the frame's first jittered draw (Rome 2's rule: passes
 // before the scene keep the game's camera)
 static void ps_cb_apply(ID3D11DeviceContext *c) {
     int scaled = g_rw != g_live_w || g_rh != g_live_h;
-    CamBuf *e = g_ps_cb0 && g_jit_on && (scaled || ((g_jx || g_jy) && g_jit_drawn)) && screen_part(g_rt_w, g_rt_h) && !overlay_stage()
+    CamBuf *e = !g_pscam_off && g_ps_cb0 && g_jit_on && (scaled || ((g_jx || g_jy) && g_jit_drawn)) && screen_part(g_rt_w, g_rt_h) && !overlay_stage()
                     ? cam_find((ID3D11Resource *)g_ps_cb0, 1) : NULL;
     ID3D11Buffer *want = e && e->valid ? e->ours : g_ps_cb0;
     if (want != g_ps_bound && r_pscb) { r_pscb(c, 0, 1, &want); g_ps_bound = want; }
@@ -876,14 +955,14 @@ static void cam_mapped(ID3D11DeviceContext *c, ID3D11Resource *r, D3D11_MAP t, c
 }
 static void STDMETHODCALLTYPE w_unmap(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub) {
     g_hk[HK_UNMAP]++;
-    CamBuf *e = c == g_ctx ? cam_find(r, 0) : NULL;
+    CamBuf *e = c == g_ctx && !g_pscam_off ? cam_find(r, 0) : NULL;
     if (e && e->mapped) { cam_write(e, e->mapped); e->mapped = NULL; }
     r_unmap(c, r, sub);
 }
 static void STDMETHODCALLTYPE w_updsub(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub, const D3D11_BOX *box, const void *data, UINT rp, UINT dp) {
     g_hk[HK_UPDSUB]++;
     r_updsub(c, r, sub, box, data, rp, dp);
-    if (c != g_ctx || g_live_state != 1 || box || !data) return;
+    if (c != g_ctx || g_live_state != 1 || box || !data || g_pscam_off) return;
     CamBuf *e = cam_find(r, 1);
     if (e) cam_write(e, data);
 }
@@ -960,10 +1039,38 @@ static void(STDMETHODCALLTYPE *r_pssamp)(ID3D11DeviceContext *, UINT, UINT, ID3D
 static void STDMETHODCALLTYPE w_pssamp(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11SamplerState *const *s) {
     if (c != g_ctx || g_live_state != 1 || !g_jit_on || g_rw >= g_live_w || g_lod_off || !s || !n || n > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT ||
         !screen_part(g_rt_w, g_rt_h) || overlay_stage()) { r_pssamp(c, start, n, s); return; }
-    float bias = log2f((float)g_rw / g_live_w);
+    float bias = log2f((float)g_rw / g_live_w) + g_lod_extra;
     ID3D11SamplerState *b[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
     for (UINT i = 0; i < n; i++) g_lod_swaps += (b[i] = lod_sampler(s[i], bias)) != s[i];
     r_pssamp(c, start, n, b);
+}
+
+// The game does not set a sampler again when it thinks the slot already holds it (RenoDX's notes, texture_lod_bias.hpp:
+// the shadow pass's sampler stayed in the main view; AGENT_LOG 172-173): swapping only in PSSetSamplers can leave a
+// material sampler unbiased in the scene, or our biased copy bound into the shadow maps. So the bound slots are fixed
+// whenever the biased state starts or ends: the game's samplers -> our copies going in, ours -> the game's going out.
+static unsigned g_lod_in, g_lod_out;   // slots fixed going in / going out (the 30 s report: the skip happens if > 0)
+static void lod_slots(ID3D11DeviceContext *c) {
+    static int active;
+    int now = c == g_ctx && g_live_state == 1 && g_jit_on && g_rw < g_live_w && !g_lod_off && screen_part(g_rt_w, g_rt_h) &&
+              !overlay_stage();
+    if (now == active || (!now && !g_nlod)) { active = now; return; }
+    active = now;
+    ID3D11SamplerState *s[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT], *b[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+    ID3D11DeviceContext_PSGetSamplers(c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, s);
+    int changed = 0;
+    float bias = log2f((float)g_rw / g_live_w) + g_lod_extra;
+    for (UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++) {
+        b[i] = s[i];
+        if (!s[i]) continue;
+        if (now) b[i] = lod_sampler(s[i], bias);
+        else
+            for (unsigned k = 0; k < g_nlod; k++)
+                if (g_lod[k].ours == s[i]) { b[i] = g_lod[k].game; break; }
+        if (b[i] != s[i]) { changed = 1; now ? g_lod_in++ : g_lod_out++; }
+    }
+    if (changed) r_pssamp(c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, b);
+    for (UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++) if (s[i]) ID3D11SamplerState_Release(s[i]);
 }
 
 static void dsv_changed(ID3D11DepthStencilView *dsv) {
@@ -1011,6 +1118,7 @@ static void STDMETHODCALLTYPE w_omrt(ID3D11DeviceContext *c, UINT n, ID3D11Rende
     dsv_changed(dsv);
     target_changed(n, rtv, dsv);
     jit_apply(c, 0);
+    lod_slots(c);
 }
 
 static void STDMETHODCALLTYPE w_omrtuav(ID3D11DeviceContext *c, UINT n, ID3D11RenderTargetView *const *rtv, ID3D11DepthStencilView *dsv,
@@ -1021,6 +1129,7 @@ static void STDMETHODCALLTYPE w_omrtuav(ID3D11DeviceContext *c, UINT n, ID3D11Re
     dsv_changed(dsv);
     target_changed(n, rtv, dsv);
     jit_apply(c, 0);
+    lod_slots(c);
 }
 
 static void STDMETHODCALLTYPE w_omdss(ID3D11DeviceContext *c, ID3D11DepthStencilState *st, UINT ref) {
@@ -1071,6 +1180,7 @@ static void jit_frame_end(void) {
     if (!g_jit_on) return;   // also after DLAA was switched off (F11 panel)
     g_jit_on = 0;
     jit_apply(g_ctx, 0);
+    lod_slots(g_ctx);   // our biased samplers out of the slots before the next frame's shadow pass
 }
 
 // ---- Motion probe (dev, AGENT_LOG 97): what a per-object motion pass needs to know. With motion_on.txt in the game
@@ -1223,6 +1333,53 @@ static void mp_copy_buffer(ID3D11Buffer *src, unsigned off, unsigned bytes, unsi
     g_mp_ncopy++;
 }
 
+// ---- vertex dump (dev, motion probe on: motion_on.txt; AGENT_LOG 181): verts_go.txt in the game folder -> the next 4
+// frames' draws of the shaders whose vertices the CPU writes every frame (37ca95e9: arrows / trails, 416460f3: distant
+// soldiers' billboards) go to verts_dump.bin: per draw the frame, shader, stage, index count / start, base vertex,
+// vertex stride, index size, then the indices and a 64 KB vertex window from the base vertex. Whether the game keeps
+// their order from frame to frame decides how their motion can be made. Read back at once (a stall: 4 frames, dev only).
+static void vdump_draw(ID3D11DeviceContext *c, UINT count, UINT start_idx, INT base_v) {
+    if (!g_vdump_left || !g_vdump || c != g_ctx || GetCurrentThreadId() != g_pt_main) return;
+    ID3D11VertexShader *vs = NULL;
+    ID3D11DeviceContext_VSGetShader(c, &vs, NULL, NULL);
+    unsigned long long h = vs ? mp_vs_hash(vs) : 0;
+    if (vs) ID3D11VertexShader_Release(vs);
+    if (h != 0x37ca95e9b122bd8dull && h != 0x416460f36ab45618ull) return;
+    ID3D11Buffer *vb = NULL, *ib = NULL;
+    UINT st = 0, of = 0, ibo = 0;
+    DXGI_FORMAT ibf = DXGI_FORMAT_UNKNOWN;
+    ID3D11DeviceContext_IAGetVertexBuffers(c, 0, 1, &vb, &st, &of);
+    ID3D11DeviceContext_IAGetIndexBuffer(c, &ib, &ibf, &ibo);
+    if (vb && ib && st) {
+        UINT isz = ibf == DXGI_FORMAT_R32_UINT ? 4 : 2;
+        D3D11_BUFFER_DESC vd, id;
+        ID3D11Buffer_GetDesc(vb, &vd);
+        ID3D11Buffer_GetDesc(ib, &id);
+        UINT v0 = of + (UINT)base_v * st, i0 = ibo + start_idx * isz, ib_bytes = count * isz;
+        UINT vb_bytes = v0 < vd.ByteWidth ? (vd.ByteWidth - v0 < 65536 ? vd.ByteWidth - v0 : 65536) : 0;
+        if (i0 + ib_bytes <= id.ByteWidth && vb_bytes) {
+            D3D11_BUFFER_DESC sd = {ib_bytes + vb_bytes, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+            ID3D11Buffer *stg = NULL;
+            if (SUCCEEDED(ID3D11Device_CreateBuffer(g_dev, &sd, NULL, &stg))) {
+                D3D11_BOX bi = {i0, 0, 0, i0 + ib_bytes, 1, 1}, bv = {v0, 0, 0, v0 + vb_bytes, 1, 1};
+                ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)stg, 0, 0, 0, 0, (ID3D11Resource *)ib, 0, &bi);
+                ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)stg, 0, ib_bytes, 0, 0, (ID3D11Resource *)vb, 0, &bv);
+                D3D11_MAPPED_SUBRESOURCE m;
+                if (SUCCEEDED(ID3D11DeviceContext_Map(c, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
+                    unsigned hdr[10] = {0x56445550u, g_vdump_frame, (unsigned)h, (unsigned)(h >> 32), mp_stage_vt(), count, start_idx, (unsigned)base_v, st, isz};
+                    fwrite(hdr, 4, 10, g_vdump);
+                    fwrite(&vb_bytes, 4, 1, g_vdump);
+                    fwrite(m.pData, 1, ib_bytes + vb_bytes, g_vdump);
+                    ID3D11DeviceContext_Unmap(c, (ID3D11Resource *)stg, 0);
+                }
+                ID3D11Buffer_Release(stg);
+            }
+        }
+    }
+    if (vb) ID3D11Buffer_Release(vb);
+    if (ib) ID3D11Buffer_Release(ib);
+}
+
 static void mp_draw(ID3D11DeviceContext *c, const char *kind, UINT count, UINT inst, UINT start_inst) {
     if (g_jit_cur && !g_jit_drawn && c == g_ctx) { g_jit_drawn = 1; ps_cb_apply(c); }   // the pixel shaders see the jitter from now on
     if (!g_capturing || !g_cap || c != g_ctx || GetCurrentThreadId() != g_pt_main) return;
@@ -1365,11 +1522,16 @@ static void mp_draw(ID3D11DeviceContext *c, const char *kind, UINT count, UINT i
 static void STDMETHODCALLTYPE w_dii(ID3D11DeviceContext *c, UINT ic, UINT inst, UINT si, INT bv, UINT sinst) {
     g_hk[HK_DRAW]++;
     mp_draw(c, "DrawIndexedInstanced", ic, inst, sinst);
-    if (g_motion && c == g_ctx && GetCurrentThreadId() == g_pt_main && mp_stage_vt() == g_vt_main) fgm_draw(c, ic, inst, si, bv, sinst);
+    vdump_draw(c, ic, si, bv);
+    if (g_motion && c == g_ctx && GetCurrentThreadId() == g_pt_main) {
+        unsigned vt = mp_stage_vt();
+        if (vt == g_vt_main || (vt && (vt == g_vt_pre[0] || vt == g_vt_pre[1] || vt == g_vt_pre[2]))) fgm_draw(c, ic, inst, si, bv, sinst);
+    }
     r_dii(c, ic, inst, si, bv, sinst);
 }
 static void STDMETHODCALLTYPE w_di(ID3D11DeviceContext *c, UINT ic, UINT si, INT bv) {
     mp_draw(c, "DrawIndexed", ic, 1, 0);
+    vdump_draw(c, ic, si, bv);   // the arrows and billboards draw this way (siege capture, AGENT_LOG 181)
     r_di(c, ic, si, bv);
 }
 static void STDMETHODCALLTYPE w_dinst(ID3D11DeviceContext *c, UINT vc, UINT inst, UINT sv, UINT sinst) {
@@ -1579,9 +1741,27 @@ static int g_preset;
 static const char *const SHARP_KEYS[4] = {"off", "low", "medium", "high"};
 static const float SHARP_CON[4] = {0, 0.42f, 0.66f, 0.87f};
 static int g_sharp = 2;
+static void shot_log(int n) {
+    unsigned fgb_sr_backend(void);
+    const char *tech = !g_sr ? "-" : fgb_sr_backend() == 2 ? "AMD FSR" : "NVIDIA DLSS";
+    g_log("screenshot %d: shot_%d.raw - super resolution %s (%s), render %ux%u, preset %s, sharpness %s, frame generation %s", n, n,
+          SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 0], tech, g_rw, g_rh, PRESET_KEYS[g_preset >= 0 && g_preset < 5 ? g_preset : 0],
+          SHARP_KEYS[g_sharp >= 0 && g_sharp < 4 ? g_sharp : 0], g_fg ? "on" : "off");
+}
 // V-Sync of the add-on's frames (6.9.2, players with fps held at their screen's refresh rate): on (default, no tearing) or off
 static const char *const VSYNC_KEYS[2] = {"off", "on"};
 static int g_vsync = 1;
+// the frame-rate counter (F11 panel): rendered / shown frames per second in a corner; off by default
+static const char *const FPSC_KEYS[5] = {"off", "top_left", "top_right", "bottom_left", "bottom_right"};
+static int g_fpsc;
+// technology (FSR_PLAN F5): auto = NVIDIA DLSS / DLSS-G where the GPU has them, AMD FSR for the rest (GPUs that are not
+// NVIDIA, frame generation on RTX 20 / 30); fsr = AMD FSR for both on any GPU (to compare)
+// dlss = NVIDIA for both (as auto on an RTX 40 / 50), mixed = DLSS upscaling + AMD FSR frame generation (F11 panel)
+static const char *const TECH_KEYS[4] = {"auto", "fsr", "dlss", "mixed"};
+static int g_tech;
+#define TECH_HELP "# technology: auto, dlss, mixed, fsr (auto: NVIDIA DLSS where your GPU has it, AMD FSR for the rest; mixed: DLSS upscaling + AMD FSR frame generation; fsr: AMD FSR for both)\n"
+#define TECH_LINE "technology=%s\n"
+#define TECH_ARG , TECH_KEYS[g_tech >= 0 && g_tech < 4 ? g_tech : 0]
 static void settings_save(void) {
     if (!g_settings[0]) return;
     FILE *f = _wfopen(g_settings, L"w");
@@ -1589,18 +1769,20 @@ static void settings_save(void) {
     fprintf(f, "# DLSS add-on settings. The F11 panel in game changes and saves them.\n"
                "# super_resolution: off, dlaa, quality, balanced, performance, ultra_performance\n"
                "# frame_generation: off, 2x, 3x, 4x (limited to what your GPU allows)\n"
-               "# motion_vectors: camera_only, per_object (cleaner frame generation on moving units, costs fps in big battles)\n"
+               "# motion_vectors: per_object (Full: soldiers, horses, trees and grass, the default), camera_only (Fast: for weaker CPUs in very big battles)\n"
                "# frame_cap: off, auto, 60, 90, 120 (rendered frames; auto: the screen's refresh rate / the frames shown per\n"
                "#            rendered frame with frame generation on, e.g. 120 at 2x on a 240 Hz screen)\n"
                "# dlss_preset: default, j, k, l, m (NVIDIA's DLSS model; default: K for DLAA / Quality / Balanced, M for\n"
                "#              Performance, L for Ultra Performance)\n"
                "# sharpness: off, low, medium, high (sharpening of the DLSS output, as games with DLSS built in have)\n"
                "# vsync: on, off (on: frames are shown at the screen's refresh rate, no tearing; off: no cap, but they may tear)\n"
+               "# fps_counter: off, top_left, top_right, bottom_left, bottom_right (rendered / shown frames per second)\n"
                "# addon: on, off (off: the add-on does nothing at all from the next game start; set on again to use it)\n"
-               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\ndlss_preset=%s\nsharpness=%s\nvsync=%s\naddon=on\nversion=3\n",
+               TECH_HELP
+               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\ndlss_preset=%s\nsharpness=%s\nvsync=%s\nfps_counter=%s\n" TECH_LINE "addon=on\nversion=4\n",
             SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 2], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only",
             CAP_KEYS[g_fcap >= 0 && g_fcap < 5 ? g_fcap : 1], PRESET_KEYS[g_preset >= 0 && g_preset < 5 ? g_preset : 0],
-            SHARP_KEYS[g_sharp >= 0 && g_sharp < 4 ? g_sharp : 2], VSYNC_KEYS[g_vsync != 0]);
+            SHARP_KEYS[g_sharp >= 0 && g_sharp < 4 ? g_sharp : 2], VSYNC_KEYS[g_vsync != 0], FPSC_KEYS[g_fpsc >= 0 && g_fpsc < 5 ? g_fpsc : 0] TECH_ARG);
     fclose(f);
 }
 static int settings_value(const char *text, const char *key, const char *const *names, int n, int fallback) {
@@ -1676,6 +1858,38 @@ static void panel_sharp(int choice) {
     fgb_set_sharpness(SHARP_CON[g_sharp]);
     g_log("F11 panel: sharpness %s", SHARP_KEYS[g_sharp]);
     settings_save();
+}
+static void panel_fps(int corner) {
+    g_fpsc = corner >= 0 && corner < 5 ? corner : 0;
+    g_log("F11 panel: frame-rate counter %s", FPSC_KEYS[g_fpsc]);
+    settings_save();
+}
+static void panel_tech(int sr, int fg) {
+    g_tech = sr ? 1 : fg ? 3 : 2;
+    g_switch = fgb_can_restart();   // a helper that can be replaced: now (AGENT_LOG 166); otherwise the pick applies at the next start
+    g_log("F11 panel: technology %s (%s)", TECH_KEYS[g_tech], g_switch ? "switching now" : "from the next game start");
+    settings_save();
+}
+#define PANEL_TECH panel_tech
+// a new helper (with the picked technology in the FSR build), then every setting again (AGENT_LOG 165, 173)
+static void switch_now(void) {
+    g_switch = 0;
+    unsigned fgb_sr_backend(void), fgb_fg_backend(void);
+    int r = fgb_restart(g_tech == 1 ? 2 : g_tech == 3 ? 3 : 1);
+    if (r < 0) { g_off_note = L"The add-on could not switch - restart the game. Choices made here are saved."; bridge_off(); return; }
+    if (!r) return;
+    if (g_fg > fgb_fg_max()) g_fg = fgb_fg_max();
+    fgb_set_fg(g_fg);
+    sr_set(g_sr);
+    fgb_set_preset(PRESET_NGX[g_preset]);
+    fgb_set_sharpness(SHARP_CON[g_sharp]);
+    fgb_set_vsync(g_vsync);
+    cap_apply();
+    fgp_set_fg((int)g_fg);
+    fgp_set_presets_available(fgb_helper_has_presets());
+    fgp_set_vsync_available(fgb_helper_has_vsync());
+    fgp_set_vsync_driver(fgb_driver_vsync());
+    fgp_set_tech(fgb_sr_backend() == 2, fgb_fg_backend() == 2);
 }
 static void panel_vsync(int on) {
     g_vsync = on != 0;
@@ -1788,6 +2002,9 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             fgb_set_sharpness(SHARP_CON[g_sharp]);
             fgb_set_vsync(g_vsync);
             if (!g_vsync && !fgb_helper_has_vsync()) g_log("DLSS add-on: V-Sync off needs add-on version 7 - its helper keeps V-Sync on");
+            if (fgb_driver_vsync() >= 2)   // the driver's choice wins over the panel's (AGENT_LOG 157)
+                g_log("DLSS add-on: V-Sync is %s in NVIDIA's settings (Control Panel / app, global profile) - the F11 V-Sync choice has no effect",
+                      fgb_driver_vsync() == 2 ? "forced on" : fgb_driver_vsync() == 3 ? "forced off" : "Fast Sync");
             if (!fgb_helper_has_presets())   // the engine fix updated, the add-on not (or a hand install of an older one)
                 g_log("DLSS add-on: its helper is older than this engine fix (add-on version 4 or older) - the DLSS preset choice "
                       "needs the add-on updated; everything else works");
@@ -1815,7 +2032,7 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
                     mp_hook(NULL);
                 } else g_motion = 0;
             }
-            FgpApply ap = {panel_sr, panel_fg, panel_motion, panel_cap, panel_preset, panel_sharp, PANEL_VIEW, panel_vsync};
+            FgpApply ap = {panel_sr, panel_fg, panel_motion, panel_cap, panel_preset, panel_sharp, PANEL_VIEW, panel_vsync, panel_fps, PANEL_TECH};
             if (!fgp_init(g_dev, g_ctx, g_live_w, g_live_h, d->BufferDesc.Format, g_sr, (int)g_fg, g_motion ? g_motion_on : no_fg ? -2 : -1, ap))
                 g_log("frame bridge: F11 panel not available (back buffer format %u)", d->BufferDesc.Format);
             else {
@@ -1824,6 +2041,14 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
                 fgp_set_presets_available(fgb_helper_has_presets());
                 fgp_set_vsync(g_vsync);
                 fgp_set_vsync_available(fgb_helper_has_vsync());
+                fgp_set_vsync_driver(fgb_driver_vsync());
+                fgp_set_fps_counter(g_fpsc);
+                {   // the drop-downs show the pick; auto shows what runs
+                    unsigned fgb_sr_backend(void), fgb_fg_backend(void);
+                    int sr = g_tech == 1, fg = g_tech == 1 || g_tech == 3;
+                    if (g_tech == 0) { sr = fgb_sr_backend() == 2; fg = fgb_fg_backend() == 2; }
+                    fgp_set_tech(sr, fg);
+                }
             }
         }
         else if (hid) DestroyWindow(hid);
@@ -2050,7 +2275,8 @@ static void bp_report(void (*log)(const char *fmt, ...)) {
         for (unsigned i = 0; i < g_nlod; i++) nb += g_lod[i].ours != NULL;
         if (g_nlod) log("  texture mip bias %.2f: %u of %u game samplers biased, %u sampler binds swapped%s", g_lod_bias, nb, g_nlod,
                         g_lod_swaps, g_lod_full ? ", table full" : "");
-        g_lod_swaps = 0;
+        if (g_nlod) log("  texture mip bias, slots the game did not set again: %u biased going in, %u put back going out", g_lod_in, g_lod_out);
+        g_lod_swaps = g_lod_in = g_lod_out = 0;
         if (g_ps_bloom_ds) log("  bloom source pass with the jitter taken out: %u draws%s", g_bloom_draws, g_bloom_off ? " (off)" : "");
         g_bloom_draws = 0;
         unsigned fgb_sharp_frames(void);
@@ -2178,6 +2404,8 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
     g_mod_size = nt->OptionalHeader.SizeOfImage;
     wcsncpy(g_dir, dir, MAX_PATH - 1);
     g_vt_main = game_rva(m, 0x1CCE4E4); g_vt_hud = game_rva(m, 0x1C9A900); g_vt_overlay = game_rva(m, 0x1CA0858);
+    for (int i = 0; i < 3; i++) g_vt_pre[i] = game_rva(m, g_vt_pre[i]);
+    g_vt_fx = game_rva(m, 0x1C99FB8); g_vt_fx_end = game_rva(m, 0x1C9D064);
     g_id_stage = pt_id_of(0x176A450); g_id_level = pt_id_of(0x1778E90); g_id_scene = pt_id_of(0x17FA310); g_id_view = pt_id_of(0x173EED0); g_id_cam = pt_id_of(0x177BB10);
     void *old = iat_hook(m, "GetProcAddress", (void *)w_gpa);
     if (!old) { log("bridge probe: GetProcAddress import not found - not installed"); return 0; }
@@ -2218,25 +2446,31 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         static const char *const MV_KEYS[2] = {"camera_only", "per_object"};
         g_sr = settings_value(text, "super_resolution=", SR_KEYS, 6, 2);       // default Quality (faster big battles)
         g_fg = (unsigned)settings_value(text, "frame_generation=", FG_KEYS, 4, 1);   // default 2x (limited to the GPU later)
-        g_motion_on = settings_value(text, "motion_vectors=", MV_KEYS, 2, 0);  // default camera only
+        g_motion_on = settings_value(text, "motion_vectors=", MV_KEYS, 2, 1);  // default per object ("Full", AGENT_LOG 179)
         g_fcap = settings_value(text, "frame_cap=", CAP_KEYS, 5, 1);   // default auto
         g_preset = settings_value(text, "dlss_preset=", PRESET_KEYS, 5, 0);   // default: NVIDIA's per mode
         g_sharp = settings_value(text, "sharpness=", SHARP_KEYS, 4, 2);       // default medium (files without the key too)
         g_vsync = settings_value(text, "vsync=", VSYNC_KEYS, 2, 1);           // default on (files without the key too)
+        g_fpsc = settings_value(text, "fps_counter=", FPSC_KEYS, 5, 0);       // default off
+        g_tech = settings_value(text, "technology=", TECH_KEYS, 4, 0);        // default auto (files without the key too)
+        fgb_set_tech(g_tech == 1 ? 2 : g_tech == 3 ? 3 : 1);   // auto and dlss: 1 (NVIDIA where it can, FSR for the rest)
+        log("  technology: %s", g_tech == 1 ? "AMD FSR for upscaling and frame generation" : g_tech == 3 ? "DLSS upscaling + AMD FSR frame generation"
+                                : g_tech == 2 ? "NVIDIA DLSS (AMD FSR where the GPU lacks it)" : "auto (NVIDIA DLSS where the GPU has it, AMD FSR for the rest)");
         // Every first start saved the defaults, so a changed default is applied once to files from before it: per_object
         // before version=2 (players' reports: half the fps in big battles on 6-core CPUs; it mostly helps frame
-        // generation), DLAA before version=3 (Quality renders smaller: faster big battles)
-        int ver = !sf ? 3 : strstr(text, "version=3") ? 3 : strstr(text, "version=2") ? 2 : 1;
-        int reset_mv = ver < 2 && g_motion_on, reset_sr = ver < 3 && g_sr == 1;
-        if (reset_mv) g_motion_on = 0;
+        // generation), DLAA before version=3 (Quality renders smaller: faster big battles), camera_only before version=4
+        // (per object now tracks trees and grass too and is the default: "Full"; user: "its needed to look good", AGENT_LOG 179)
+        int ver = !sf ? 4 : strstr(text, "version=4") ? 4 : strstr(text, "version=3") ? 3 : strstr(text, "version=2") ? 2 : 1;
+        int reset_mv = ver < 4 && !g_motion_on, reset_sr = ver < 3 && g_sr == 1;
+        if (reset_mv) g_motion_on = 1;
         if (reset_sr) g_sr = 2;
         g_live = 1;
         g_motion = 1;
         log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s, preset %s, sharpness %s, V-Sync %s (%ls%s%s)",
             SR_KEYS[g_sr], FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], PRESET_KEYS[g_preset], SHARP_KEYS[g_sharp], VSYNC_KEYS[g_vsync],
             sf ? L"settings.txt" : L"defaults",
-            reset_mv ? "; per_object was the old default, now camera_only" : "", reset_sr ? "; dlaa was the old default, now quality" : "");
-        if (!sf || ver < 3) settings_save();
+            reset_mv ? "; camera_only was the old default, now per_object (Full)" : "", reset_sr ? "; dlaa was the old default, now quality" : "");
+        if (!sf || ver < 4) settings_save();
         g_dev_di8_created = fgp_di8_created;
     }
     if (f) {
@@ -2258,6 +2492,9 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         if (strstr(l[3], "fakegpu20")) { fgb_set_fg_test_limit(1); log("  test: GPU treated as an RTX 20 / 30 (no frame generation)"); }
         else if (strstr(l[3], "fakegpu40")) { fgb_set_fg_test_limit(2); log("  test: GPU treated as an RTX 40 (frame generation 2x at most)"); }
         if (strstr(l[3], "fakeamd")) { fgb_set_test_not_nvidia(1); log("  test: GPU treated as not NVIDIA (bridge stays off)"); }
+        // dev: "forcefsr" AMD FSR for both (as technology=fsr), "nvonly" as an older engine fix (fakeamd then stays off)
+        if (strstr(l[3], "forcefsr")) { g_tech = 1; fgb_set_tech(2); log("  test: AMD FSR for upscaling and frame generation"); }
+        if (strstr(l[3], "nvonly")) { fgb_set_tech(0); log("  test: NVIDIA only, as an older engine fix"); }
         g_motion = g_live;   // set up whenever the bridge runs, so the F11 panel can switch it on
         log("frame bridge %s: helper %s, Streamline %s, frame generation %ux, DLSS %s", g_live ? "armed" : "NOT armed (bad fgbridge_on.txt)",
             l[0], l[1], g_fg + 1, (const char *[]){"off", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"}[g_sr]);

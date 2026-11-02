@@ -12,7 +12,8 @@ Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 ## Upscaling and Framegen add-on (6.3)
 
 From 6.3 the DLL also contains the game side of the separate **Upscaling and Framegen for Attila** add-on (NVIDIA
-DLSS upscaling and frame generation on GeForce RTX cards). It does nothing unless the add-on's `FrameBridge` folder,
+DLSS upscaling and frame generation on GeForce RTX cards; from 6.10.0 also AMD FSR upscaling and frame generation, with
+AMD's reactive mask for transparent effects, on any other card). It does nothing unless the add-on's `FrameBridge` folder,
 with its 64-bit helper, is in the game folder. The helper's source is in its own repository:
 [JSa25/TotalWarUpscalingFramegen](https://github.com/JSa25/TotalWarUpscalingFramegen).
 
@@ -21,7 +22,7 @@ with its 64-bit helper, is in the game folder. The helper's source is in its own
 | File | Fix |
 |---|---|
 | `heapfix.c` | Entry point (`DllMain`, or a DLL load notification when something loaded `dinput8.dll` before the game DLL), dinput8 forwarding, `heapfix.log`, and the main fix: replaces the game's single-lock dlmalloc heap for blocks up to 16 KB; larger blocks stay on the game's dlmalloc |
-| `pools.c`, `dlmalloc/` | The heap for those blocks: 8 dlmalloc 2.8.6 heaps with the game's own settings (64 KB growth, 2 MB trim, nothing reserved up front), each with its own lock, and a small per-thread cache, so threads do not wait on one lock but the address space is used like the game's own heap |
+| `pools.c`, `dlmalloc/` | The heap for those blocks: 8 dlmalloc 2.8.6 heaps with the game's own settings (64 KB growth, nothing reserved up front; since 6.10.0 memory goes back to Windows on a free only past 64 MB unused at the top, plus the game's own trim), each with its own lock, and a small per-thread cache, so threads do not wait on one lock but the address space is used like the game's own heap |
 | `pool.c` | Faster free lookup for the engine's small-object pools |
 | `sortfix.c` | The two render-list sorts (by +0x6C/+0x68 and +0x4C/+0x48): key extraction plus radix sort, same order as the game's sorts |
 | `batchfix.c` | Battle draw batching: items with the same material and equal variant values share a batch |
@@ -39,9 +40,9 @@ with its 64-bit helper, is in the game folder. The helper's source is in its own
 | `logtrim.c` | Keeps `heapfix.log` under about 1 MB: at game start, past 1 MB the oldest whole sessions are dropped |
 | `dinput8.def` | The exports a `dinput8.dll` must have |
 | `bridgeprobe.c` | Upscaling add-on (6.3), only with the add-on installed: finds the camera, the main depth buffer and the point where the interface starts; shrinks and jitters the 3D scene's viewports for DLSS; gives pixel shaders a corrected camera block at the lower presets; reads and saves `FrameBridge\settings.txt` |
-| `fgbridge.c`, `fgb_proto.h` | Upscaling add-on: shares the frame's image, depth and motion vectors with the 64-bit helper (textures, fences and a small shared block, by name), starts the helper, puts the upscaled image back before the interface is drawn, and hands the finished frame over at Present. NVIDIA GPUs only |
-| `fgmotion.c`, `motionvs.h` | Upscaling add-on: motion vectors for soldiers, horses and campaign armies (the game's skinning repeated for this frame and the previous one) |
-| `fgpanel.c` | Upscaling add-on: the F11 settings panel |
+| `fgbridge.c`, `fgb_proto.h` | Upscaling add-on: shares the frame's image, depth and motion vectors with the 64-bit helper (textures, fences and a small shared block, by name), starts the helper, puts the upscaled image back before the interface is drawn, and hands the finished frame over at Present. With AMD FSR (6.10.0) also the hole fill of the motion vectors and the reactive mask (the transparent effects' change to the scene, and moving soldiers) |
+| `fgmotion.c`, `motionvs.h`, `windvs.h` | Upscaling add-on: motion vectors for soldiers, horses and campaign armies (the game's skinning repeated for this frame and the previous one) and, from 6.10.0, for swaying trees and grass (the game's wind math at this frame's and the previous frame's time) |
+| `fgpanel.c` | Upscaling add-on: the F11 settings panel (with the FPS counter, the upscaler / frame generation choice and the recommendation for this PC) |
 | `fgb_motion_api.h` | Upscaling add-on: `fgb_motion_vectors`, exported for other mods - this frame's motion vectors on the game's D3D11 device (the struct and what the values mean) |
 | `passtime.c`, `gputime.c` | Upscaling add-on: the hook on the render stage driver the bridge runs on, and the hook on the game's `GetProcAddress` import (D3D11 device and DXGI factory) |
 | `rslink.cpp`, `reshade/` | Upscaling add-on (6.9): with ReShade in the game folder, registers as a ReShade add-on and runs ReShade's effects at the point where the interface starts (after DLSS), with the scene depth and the camera's near / far for ReShade's depth; the glue in `bridgeprobe.c` presents from under ReShade's swapchain wrapper. C++ without the C++ runtime; `reshade/` holds ReShade 6.8.0's add-on API headers, unchanged |

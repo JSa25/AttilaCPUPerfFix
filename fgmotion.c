@@ -12,6 +12,9 @@
 // Costs (battle run, AGENT_LOG 99): the game copies 22,000-48,000 records per frame for all its passes, so the copy hook
 // (FUN_117dab80's memcpy at +0x17DABAF, any thread) only notes which item went to which record slot; the main-view draws
 // queue their items, and one worker thread builds the previous records while the game renders the rest of the frame.
+// Swaying trees and grass (AGENT_LOG 178): drawn again the same way with windvs.h, the game's wind at this frame's and
+// the previous frame's time_in_sec (in the camera block copies) - no history of their own; the wind block is copied once a
+// frame. Their draws come from the main view and its depth prepasses (bridgeprobe.c), with the game's buffers as they are.
 #define COBJMACROS
 #include <windows.h>
 #include <d3d11_4.h>
@@ -21,6 +24,7 @@
 #include <math.h>
 #include <intrin.h>
 #include "motionvs.h"
+#include "windvs.h"
 
 static const GUID iid_device1 = {0xa04bfb29, 0x08ef, 0x43d6, {0xa4, 0x9c, 0xa9, 0xbd, 0xbd, 0xcb, 0xe6, 0x86}};
 static const GUID iid_context1 = {0xbb2c6faa, 0xb5fb, 0x4082, {0x8e, 0x6b, 0x38, 0x8b, 0x8c, 0xfa, 0x90, 0xe1}};
@@ -37,15 +41,38 @@ void fgm_set_enabled(int on) { m_enabled = on; }
 
 // ---- the skinned layouts (CreateInputLayout with one of the three shaders' bytecode) ----
 #define M_MAX_LAYOUTS 64
-static struct { const void *game; ID3D11InputLayout *ours; int skin4; } m_il[M_MAX_LAYOUTS];
+static struct { const void *game; ID3D11InputLayout *ours; int skin4, wind; } m_il[M_MAX_LAYOUTS];   // wind: 1 / 2 trees, 3 grass
 static volatile LONG m_nil;
 static ID3D11VertexShader *m_vs[2];
 static ID3D11PixelShader *m_ps;
 static ID3DBlob *m_vsb[2];
+static ID3D11VertexShader *m_wvs[3];   // windvs.h: tree_a, tree_b, grass
+static ID3DBlob *m_wvsb[3];
 
+// the game's vertex shaders whose models sway (windvs.h; the same code under several hashes)
+static int wind_kind(unsigned long long sig) {
+    if (sig == 0xd9228831741dc68eull || sig == 0x6cd77149cd64a265ull || sig == 0x8b29150b6008e5dfull) return 1;
+    if (sig == 0x0099406c17c7aff8ull || sig == 0x25b8fe1fa9738fe2ull || sig == 0xe8899e58144778f2ull) return 2;
+    if (sig == 0xc272bdade21308b2ull || sig == 0x20bbbad818a85073ull) return 3;
+    return 0;
+}
 void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT n, unsigned long long sig) {
+    int wind = wind_kind(sig);
+    if (wind) {   // the game's elements as they are: the wind needs no history of its own
+        ID3D11InputLayout *ours = NULL;
+        if (!m_on || n > 16 || FAILED(ID3D11Device_CreateInputLayout(m_dev, e, n, ID3D10Blob_GetBufferPointer(m_wvsb[wind - 1]),
+                                                                       ID3D10Blob_GetBufferSize(m_wvsb[wind - 1]), &ours))) {
+            if (m_on) m_log("motion pass: input layout for shader %016llx (wind) not created", sig);
+            return;
+        }
+        LONG k = InterlockedIncrement(&m_nil) - 1;
+        if (k >= M_MAX_LAYOUTS) { ID3D11InputLayout_Release(ours); return; }
+        m_il[k].ours = ours; m_il[k].skin4 = 0; m_il[k].wind = wind; m_il[k].game = il;
+        return;
+    }
+    // 4b23a601: a51431eb with dismemberment, whose cut factors only reach the pixel shader (skintest: bit-identical)
     int skin4 = sig == 0x520dbe181fbd767aull || sig == 0x3d52a1037cfa96abull;
-    if (!m_on || (!skin4 && sig != 0xa51431ebf7d15a22ull) || n > 16) return;
+    if (!m_on || (!skin4 && sig != 0xa51431ebf7d15a22ull && sig != 0x4b23a601f0f7b19bull) || n > 16) return;
     D3D11_INPUT_ELEMENT_DESC el[20];
     memcpy(el, e, n * sizeof *e);
     static const char prev[] = "PREV";
@@ -61,7 +88,7 @@ void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT 
     }
     LONG k = InterlockedIncrement(&m_nil) - 1;
     if (k >= M_MAX_LAYOUTS) { ID3D11InputLayout_Release(ours); return; }
-    m_il[k].ours = ours; m_il[k].skin4 = skin4; m_il[k].game = il;
+    m_il[k].ours = ours; m_il[k].skin4 = skin4; m_il[k].wind = 0; m_il[k].game = il;
 }
 
 // ---- instance buffers (Map hook) and, per 120-byte record slot, the item whose record the game copied there ----
@@ -188,7 +215,8 @@ static const MEnt *nearest(LONG f, float x, float y, float z, int bones) {
 #define M_TEX 16           // animation textures (slices of the previous-frame array; run 7: indexes >= 4 in a big battle)
 typedef struct {
     int li; ID3D11Buffer *vb0, *vb1, *ib; UINT st0, of0, of1, ib_off; DXGI_FORMAT ib_fmt;
-    UINT idx, inst, start_idx; INT base_v; ID3D11ShaderResourceView *anim;
+    UINT idx, inst, start_idx; INT base_v; ID3D11ShaderResourceView *anim;   // anim: NULL for the wind
+    UINT st1, start_inst;   // the wind's: its instance buffer's stride, the game's first instance
     UINT first;   // index of this draw's first instance in m_items / m_prev_cpu
 } MDraw;
 static MDraw m_draws[M_MAX_DRAWS];
@@ -202,8 +230,9 @@ static unsigned m_hit, m_new, m_badtex, m_skip_item, m_skip_range, m_skip_tex, m
 static int m_tex_max = -1;
 static unsigned long long m_worker_ticks;
 
-static ID3D11Buffer *m_prev_buf, *m_cb, *m_cam[2];
-static int m_cam_have[2];
+static ID3D11Buffer *m_prev_buf, *m_cb, *m_cam[2], *m_wind;
+static int m_cam_have[2], m_wind_have;
+static unsigned m_wind_draws, m_wind_inst;
 static ID3D11Resource *m_anim_res[M_TEX];          // the game's animation texture of each index
 static ID3D11Texture2D *m_prev_anim;               // their previous-frame copies (array slices)
 static ID3D11ShaderResourceView *m_prev_anim_srv;
@@ -257,6 +286,49 @@ static void wait_worker(void) {
     for (int i = 0; m_done != m_queued; i++) if (i > 64) Sleep(0); else YieldProcessor();
 }
 
+static void cam_copy(ID3D11DeviceContext *c) {   // this frame's camera block, as the game's shader reads it
+    if (m_cam_have[0]) return;
+    ID3D11Buffer *cb = NULL;
+    ID3D11DeviceContext_VSGetConstantBuffers(c, 0, 1, &cb);
+    if (cb) {
+        D3D11_BUFFER_DESC bd;
+        ID3D11Buffer_GetDesc(cb, &bd);
+        if (bd.ByteWidth == 576) { ID3D11DeviceContext_CopyResource(c, (ID3D11Resource *)m_cam[0], (ID3D11Resource *)cb); m_cam_have[0] = 1; }
+        ID3D11Buffer_Release(cb);
+    }
+}
+// a swaying draw: its buffers as bound (the game's instance offsets and first instance kept), the wind block once a frame
+static void wind_draw(ID3D11DeviceContext *c, int li, UINT idx, UINT inst, UINT start_idx, INT base_v, UINT start_inst) {
+    if (m_ndraws >= M_MAX_DRAWS) { m_skipped_full++; return; }
+    if (!m_wind_have) {
+        ID3D11Buffer *cb = NULL;
+        ID3D11DeviceContext_VSGetConstantBuffers(c, 1, 1, &cb);   // wind_VS: register b1 in all of them
+        if (!cb) return;
+        D3D11_BUFFER_DESC bd;
+        ID3D11Buffer_GetDesc(cb, &bd);
+        if (bd.ByteWidth >= 32) {
+            D3D11_BOX box = {0, 0, 0, 32, 1, 1};
+            ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)m_wind, 0, 0, 0, 0, (ID3D11Resource *)cb, 0, &box);
+            m_wind_have = 1;
+        }
+        ID3D11Buffer_Release(cb);
+        if (!m_wind_have) return;
+    }
+    cam_copy(c);
+    if (!m_cam_have[0]) return;
+    ID3D11Buffer *vb[2] = {0};
+    UINT st[2], of[2];
+    ID3D11DeviceContext_IAGetVertexBuffers(c, 0, 2, vb, st, of);
+    if (!vb[0] || !vb[1]) { if (vb[0]) ID3D11Buffer_Release(vb[0]); if (vb[1]) ID3D11Buffer_Release(vb[1]); m_skip_other++; return; }
+    MDraw *d = &m_draws[m_ndraws++];
+    memset(d, 0, sizeof *d);
+    d->li = li; d->vb0 = vb[0]; d->st0 = st[0]; d->of0 = of[0]; d->vb1 = vb[1]; d->st1 = st[1]; d->of1 = of[1];
+    ID3D11DeviceContext_IAGetIndexBuffer(c, &d->ib, &d->ib_fmt, &d->ib_off);
+    d->idx = idx; d->inst = inst; d->start_idx = start_idx; d->base_v = base_v; d->start_inst = start_inst;
+    m_wind_draws++;
+    m_wind_inst += inst;
+}
+
 void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT base_v, UINT start_inst) {
     if (!m_on || !m_enabled || c != m_ctx) return;
     unsigned long long t0 = __rdtsc();
@@ -267,6 +339,7 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
     for (LONG k = 0; k < m_nil && k < M_MAX_LAYOUTS; k++) if (m_il[k].game == il) { li = (int)k; break; }
     ID3D11InputLayout_Release(il);
     if (li < 0) return;
+    if (m_il[li].wind) { wind_draw(c, li, idx, inst, start_idx, base_v, start_inst); m_draw_ticks += __rdtsc() - t0; return; }
     if (m_ndraws >= M_MAX_DRAWS || (UINT)m_queued + inst > M_MAX_INST) { m_skipped_full++; return; }
     ID3D11Buffer *vb[2] = {0};
     UINT st[2], of[2];
@@ -331,16 +404,7 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
     verify_draw(vb[1], off, &items[off / 120], inst);
     InterlockedExchangeAdd(&m_queued, (LONG)inst);
     SetEvent(m_wake);
-    if (!m_cam_have[0]) {   // this frame's camera block, as the game's shader reads it
-        ID3D11Buffer *cb = NULL;
-        ID3D11DeviceContext_VSGetConstantBuffers(c, 0, 1, &cb);
-        if (cb) {
-            D3D11_BUFFER_DESC bd;
-            ID3D11Buffer_GetDesc(cb, &bd);
-            if (bd.ByteWidth == 576) { ID3D11DeviceContext_CopyResource(c, (ID3D11Resource *)m_cam[0], (ID3D11Resource *)cb); m_cam_have[0] = 1; }
-            ID3D11Buffer_Release(cb);
-        }
-    }
+    cam_copy(c);
     m_draws_total++;
     m_inst_total += inst;
     m_draw_ticks += __rdtsc() - t0;
@@ -402,7 +466,7 @@ static void release_draws(void) {
         MDraw *d = &m_draws[i];
         ID3D11Buffer_Release(d->vb0); ID3D11Buffer_Release(d->vb1);
         if (d->ib) ID3D11Buffer_Release(d->ib);
-        ID3D11ShaderResourceView_Release(d->anim);
+        if (d->anim) ID3D11ShaderResourceView_Release(d->anim);
     }
     m_ndraws = 0;
     m_queued = m_done = 0;
@@ -421,7 +485,7 @@ static ID3D11RasterizerState *m_rs;
 // the pipeline state the pass changes (no separate D3D11.1 context state through the UI mod's device: 0x80070057)
 typedef struct {
     ID3D11InputLayout *il; ID3D11Buffer *vb[3]; UINT st[3], of[3]; ID3D11Buffer *ib; DXGI_FORMAT ibf; UINT ibo; D3D11_PRIMITIVE_TOPOLOGY topo;
-    ID3D11VertexShader *vs; ID3D11Buffer *vcb[3]; ID3D11ShaderResourceView *vsrv[2];
+    ID3D11VertexShader *vs; ID3D11Buffer *vcb[4]; ID3D11ShaderResourceView *vsrv[2];
     ID3D11GeometryShader *gs; ID3D11HullShader *hs; ID3D11DomainShader *ds;
     ID3D11PixelShader *ps; ID3D11Buffer *pcb;
     D3D11_VIEWPORT vp[16]; UINT nvp; ID3D11RasterizerState *rs;
@@ -435,7 +499,7 @@ static void save_state(GameState *g) {
     ID3D11DeviceContext_IAGetIndexBuffer(c, &g->ib, &g->ibf, &g->ibo);
     ID3D11DeviceContext_IAGetPrimitiveTopology(c, &g->topo);
     ID3D11DeviceContext_VSGetShader(c, &g->vs, NULL, NULL);
-    ID3D11DeviceContext_VSGetConstantBuffers(c, 0, 3, g->vcb);
+    ID3D11DeviceContext_VSGetConstantBuffers(c, 0, 4, g->vcb);
     ID3D11DeviceContext_VSGetShaderResources(c, 0, 2, g->vsrv);
     ID3D11DeviceContext_GSGetShader(c, &g->gs, NULL, NULL);
     ID3D11DeviceContext_HSGetShader(c, &g->hs, NULL, NULL);
@@ -461,7 +525,7 @@ static void restore_state(GameState *g) {
     ID3D11DeviceContext_IASetIndexBuffer(c, g->ib, g->ibf, g->ibo);
     ID3D11DeviceContext_IASetPrimitiveTopology(c, g->topo);
     ID3D11DeviceContext_VSSetShader(c, g->vs, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(c, 0, 3, g->vcb);
+    ID3D11DeviceContext_VSSetConstantBuffers(c, 0, 4, g->vcb);
     ID3D11DeviceContext_VSSetShaderResources(c, 0, 2, g->vsrv);
     ID3D11DeviceContext_GSSetShader(c, g->gs, NULL, 0);
     ID3D11DeviceContext_HSSetShader(c, g->hs, NULL, 0);
@@ -475,15 +539,16 @@ static void restore_state(GameState *g) {
     ID3D11DeviceContext_OMSetBlendState(c, g->bs, g->bf, g->mask);
     REL(g->il); REL(g->ib); REL(g->vs); REL(g->gs); REL(g->hs); REL(g->ds); REL(g->ps); REL(g->pcb); REL(g->rs); REL(g->dsv);
     REL(g->dss); REL(g->bs);
-    for (int i = 0; i < 3; i++) { REL(g->vb[i]); REL(g->vcb[i]); }
+    for (int i = 0; i < 3; i++) REL(g->vb[i]);
+    for (int i = 0; i < 4; i++) REL(g->vcb[i]);
     for (int i = 0; i < 2; i++) REL(g->vsrv[i]);
     for (int i = 0; i < 8; i++) REL(g->rtv[i]);
 }
 
 UINT fgb_render_w(void), fgb_render_h(void);   // fgbridge.c
 
-void fgm_pass(ID3D11Resource *depth, float jx, float jy) {
-    if (!m_on || !m_ndraws) return;
+int fgm_pass(ID3D11Resource *depth, float jx, float jy) {   // 1: models were drawn into the vectors
+    if (!m_on || !m_ndraws) return 0;
     LARGE_INTEGER q0, q1, qf;
     QueryPerformanceCounter(&q0);
     if (depth != m_depth) {   // a read-only depth view of the game's depth buffer
@@ -491,13 +556,13 @@ void fgm_pass(ID3D11Resource *depth, float jx, float jy) {
         m_dsv = NULL;
         D3D11_DEPTH_STENCIL_VIEW_DESC dvd = {DXGI_FORMAT_D24_UNORM_S8_UINT, D3D11_DSV_DIMENSION_TEXTURE2D,
                                              D3D11_DSV_READ_ONLY_DEPTH | D3D11_DSV_READ_ONLY_STENCIL, {{0}}};
-        if (FAILED(ID3D11Device_CreateDepthStencilView(m_dev, depth, &dvd, &m_dsv))) { m_log("motion pass: no depth view - off"); m_on = 0; return; }
+        if (FAILED(ID3D11Device_CreateDepthStencilView(m_dev, depth, &dvd, &m_dsv))) { m_log("motion pass: no depth view - off"); m_on = 0; return 0; }
         m_depth = depth;
     }
     wait_worker();   // the previous records of this frame's models
     verify_pass();
     D3D11_BOX box = {0, 0, 0, (UINT)m_queued * 64, 1, 1};
-    ID3D11DeviceContext_UpdateSubresource(m_ctx, (ID3D11Resource *)m_prev_buf, 0, &box, m_prev_cpu, 0, 0);
+    if (m_queued) ID3D11DeviceContext_UpdateSubresource(m_ctx, (ID3D11Resource *)m_prev_buf, 0, &box, m_prev_cpu, 0, 0);
     if (!m_cam_have[1]) { ID3D11DeviceContext_CopyResource(m_ctx, (ID3D11Resource *)m_cam[1], (ID3D11Resource *)m_cam[0]); m_cam_have[1] = 1; }
     UINT rw = fgb_render_w(), rh = fgb_render_h();   // the game's render size (below the screen with the lower DLSS presets)
     float prm[4] = {768, 768, (float)rw, (float)rh};   // animation texture width (the only size taken, see fgm_draw)
@@ -506,17 +571,34 @@ void fgm_pass(ID3D11Resource *depth, float jx, float jy) {
     if (m_state) ID3D11DeviceContext1_SwapDeviceContextState(m_ctx1, m_state, &m_game_state);
     else save_state(&gs);
     D3D11_VIEWPORT v = {jx, jy, (float)rw, (float)rh, 0, 1};
-    ID3D11Buffer *cbs[3] = {m_cb, m_cam[0], m_cam[1]};
+    ID3D11Buffer *cbs[4] = {m_cb, m_cam[0], m_cam[1], m_wind};
     ID3D11DeviceContext_RSSetViewports(m_ctx, 1, &v);
     ID3D11DeviceContext_RSSetState(m_ctx, m_rs);
     ID3D11DeviceContext_OMSetDepthStencilState(m_ctx, m_dss, 0);
     ID3D11DeviceContext_OMSetRenderTargets(m_ctx, 1, &m_mv_rtv, m_dsv);
     ID3D11DeviceContext_IASetPrimitiveTopology(m_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_VSSetConstantBuffers(m_ctx, 0, 3, cbs);
+    ID3D11DeviceContext_VSSetConstantBuffers(m_ctx, 0, 4, cbs);
     ID3D11DeviceContext_PSSetShader(m_ctx, m_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(m_ctx, 0, 1, &m_cb);
+    for (UINT i = 0; i < m_ndraws; i++) {   // the swaying trees and grass first (the game's buffers and first instance as they were)
+        MDraw *d = &m_draws[i];
+        int w = m_il[d->li].wind;
+        if (!w) continue;
+        ID3D11Buffer *wvb[2] = {d->vb0, d->vb1};
+        UINT wst[2] = {d->st0, d->st1}, wof[2] = {d->of0, d->of1};
+        ID3D11DeviceContext_IASetInputLayout(m_ctx, m_il[d->li].ours);
+        ID3D11DeviceContext_IASetVertexBuffers(m_ctx, 0, 2, wvb, wst, wof);
+        ID3D11DeviceContext_IASetIndexBuffer(m_ctx, d->ib, d->ib_fmt, d->ib_off);
+        ID3D11DeviceContext_VSSetShader(m_ctx, m_wvs[w - 1], NULL, 0);
+        ID3D11DeviceContext_DrawIndexedInstanced(m_ctx, d->idx, d->inst, d->start_idx, d->base_v, d->start_inst);
+    }
+    // the hole fill's "before" copy after the wind: only units count as moving on their own, so swaying vegetation is
+    // neither marked reactive nor spread to the ground around it (FSR Quality lost its detail in the trees, AGENT_LOG 183)
+    void fgb_fill_begin(void);
+    fgb_fill_begin();
     for (UINT i = 0; i < m_ndraws; i++) {
         MDraw *d = &m_draws[i];
+        if (m_il[d->li].wind) continue;
         ID3D11Buffer *vbs[3] = {d->vb0, d->vb1, m_prev_buf};
         UINT st[3] = {d->st0, 120, 64}, of[3] = {d->of0, d->of1, d->first * 64};
         ID3D11ShaderResourceView *srv[2] = {d->anim, m_prev_anim_srv};
@@ -537,6 +619,7 @@ void fgm_pass(ID3D11Resource *depth, float jx, float jy) {
     QueryPerformanceCounter(&q1);
     QueryPerformanceFrequency(&qf);
     m_pass_ms += (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart;
+    return 1;
 }
 
 // ---- a picture of the motion vectors after the pass (bridge capture): half size, RG16F pairs, header w, h ----
@@ -584,6 +667,7 @@ void fgm_frame_end(void) {
         }
     if (m_cam_have[0]) { ID3D11DeviceContext_CopyResource(m_ctx, (ID3D11Resource *)m_cam[1], (ID3D11Resource *)m_cam[0]); m_cam_have[1] = 1; }
     m_cam_have[0] = 0;
+    m_wind_have = 0;
     m_frame++;   // the worker is idle: the next frame's records go to the other table
     m_frames++;
 }
@@ -606,6 +690,9 @@ void fgm_report(void (*log)(const char *fmt, ...)) {
             m_frames, m_draws_total, m_inst_total, m_skipped, m_skipped_full, m_skip_item, m_skip_tex, m_skip_other + m_skip_range, m_tex_max,
             all ? 100.0 * m_hit / all : 0, all ? 100.0 * m_new / all : 0, all ? 100.0 * m_badtex / all : 0, m_pass_ms / m_frames, m_draw_ticks * tick_ms / m_frames,
             m_worker_ticks * tick_ms / m_frames, (long)m_copies, (long)m_copies_unmapped, (long)m_copies_misaligned, m_maps_full);
+    if (m_frames) log("  motion pass, swaying trees and grass: %.1f draws (%.0f instances) per frame redrawn with their wind", (double)m_wind_draws / m_frames,
+                      (double)m_wind_inst / m_frames);
+    m_wind_draws = m_wind_inst = 0;
     m_frames = m_draws_total = m_inst_total = m_skipped = m_skipped_full = 0;
     m_hit = m_new = m_badtex = m_skip_item = m_skip_range = m_skip_tex = m_skip_other = 0;
     m_pass_ms = 0;
@@ -624,6 +711,13 @@ int fgm_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *mv, U
                                  &m_vsb[k], &err)) ||
             FAILED(ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(m_vsb[k]), ID3D10Blob_GetBufferSize(m_vsb[k]), NULL, &m_vs[k]))) {
             log("motion pass: vertex shader not built - off");
+            return 0;
+        }
+    static const char *const wind_entry[3] = {"tree_a", "tree_b", "grass"};
+    for (int k = 0; k < 3; k++)
+        if (FAILED(comp(wind_hlsl, strlen(wind_hlsl), "wind", NULL, NULL, wind_entry[k], "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &m_wvsb[k], &err)) ||
+            FAILED(ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(m_wvsb[k]), ID3D10Blob_GetBufferSize(m_wvsb[k]), NULL, &m_wvs[k]))) {
+            log("motion pass: wind vertex shader %s not built - off", wind_entry[k]);
             return 0;
         }
     if (FAILED(comp(motion_hlsl, strlen(motion_hlsl), "motion", NULL, NULL, "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psb, &err)) ||
@@ -647,6 +741,8 @@ int fgm_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *mv, U
     STEP("constant buffer", ID3D11Device_CreateBuffer(dev, &cbd, NULL, &m_cb));
     STEP("camera copy", ID3D11Device_CreateBuffer(dev, &camd, NULL, &m_cam[0]));
     STEP("camera copy", ID3D11Device_CreateBuffer(dev, &camd, NULL, &m_cam[1]));
+    camd.ByteWidth = 32;
+    STEP("wind copy", ID3D11Device_CreateBuffer(dev, &camd, NULL, &m_wind));
     STEP("motion vector render target view", ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)mv, &rvd, &m_mv_rtv));
     STEP("depth state", ID3D11Device_CreateDepthStencilState(dev, &dsd, &m_dss));
     STEP("rasterizer state", ID3D11Device_CreateRasterizerState(dev, &rsd, &m_rs));
@@ -673,7 +769,7 @@ int fgm_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *mv, U
         return 0;
     }
     m_on = 1;
-    log("motion pass on: animated models redrawn with their own motion (render %ux%u)", w, h);
+    log("motion pass on: animated models redrawn with their own motion, trees and grass with their wind (render %ux%u)", w, h);
     return 1;
 }
 
