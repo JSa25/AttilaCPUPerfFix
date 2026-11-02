@@ -197,6 +197,11 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.10.3:
+-Windows Defender should no longer flag dinput8.dll ("Trojan:Win32/Wacatac" or
+ "Phonzy"): a false alarm of Microsoft's automatic file check, which this build
+ passes. Same code as 6.10.2.
+
 Version 6.10.2:
 -Windows Defender no longer flags dinput8.dll as "Trojan:Win32/Wacatac.B!ml".
  That was a false alarm of Microsoft's automatic file check; the DLL now
