@@ -106,11 +106,11 @@ static void untrack(HANDLE h, int sync) {
         r_SetFilePointerEx(h, p, NULL, FILE_BEGIN);
     }
     AcquireSRWLockExclusive(&g_lock);
+    unsigned char *buf = e->buf;   // under g_lock with the slot: track() may reuse it at once
+    e->buf = NULL;
     e->h = NULL;
     InterlockedDecrement(&g_open);
     ReleaseSRWLockExclusive(&g_lock);
-    unsigned char *buf = e->buf;
-    e->buf = NULL;
     LeaveCriticalSection(&e->cs);
     VirtualFree(buf, 0, MEM_RELEASE);
 }

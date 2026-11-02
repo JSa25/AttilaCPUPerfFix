@@ -64,6 +64,8 @@ void *fgb_unhooked(void *fn);
 void fgb_set_sr(int on, UINT render_w, UINT render_h);
 void fgb_jitter(float *jx, float *jy);
 static void jit_frame_start(void), jit_frame_end(void);   // DLAA viewport jitter (below)
+static void sr_set(int mode);   // below the settings
+static int g_depth_bad;   // the game's depth is MSAA: no upscaling this session (sr_set)
 // per-object motion (fgmotion.c, AGENT_LOG 99): fgbridge_on.txt line 4 contains "motion"
 static int g_motion;              // the motion pass is set up (bridge mode); on / off: g_motion_on and the F11 panel
 static int g_motion_on;
@@ -351,6 +353,14 @@ __attribute__((force_align_arg_pointer)) static void bp_enter(unsigned id, const
             g_hud_this_frame = 1;
             if (!g_sr || g_frame_scaled) { fgb_hudless(bb, depth, g_vp); g_br_hud++; }
             else g_br_native++;
+            int fgb_depth_failed(void);
+            if (g_sr && !g_depth_bad && fgb_depth_failed()) {
+                g_depth_bad = 1;
+                sr_set(0);
+                g_log("DLSS add-on: the game's depth is multisampled (its Anti-Aliasing is on MSAA) - upscaling off for this "
+                      "session, the game renders at full size; set Anti-Aliasing to Off in the game's graphics options");
+                fgp_set_note(L"Upscaling is off: set the game's Anti-Aliasing to Off and restart the game.");
+            }
         }
         if (g_rs && sr_trip && rsl_effects(g_ctx, bb, depth)) { g_rs_frames++; fgb_hud_post(bb); }
         if (g_rs && g_vp_frame == g_frame) rsl_camera(g_vp);
@@ -845,6 +855,8 @@ static void slow_map(ID3D11Resource *r, D3D11_MAP t, UINT f, unsigned long long 
 typedef struct { ID3D11Buffer *game, *ours; void *mapped; int valid; float src[144]; } CamBuf;   // src: the game's last block
 static CamBuf g_cbuf[8];
 static unsigned g_ncbuf, g_cam_writes;
+static float g_game_t;   // the game's clock (camera_VS_PS c26.x, the wind's time) and the frame it last moved: it stops while
+static unsigned g_game_t_frame;   // the battle is paused (the settings sweep logs which)
 static ID3D11Buffer *g_ps_cb0, *g_ps_bound;   // the game's pixel shader constant buffer 0 (one reference held), what is bound
 static void (STDMETHODCALLTYPE *r_pscb)(ID3D11DeviceContext *, UINT, UINT, ID3D11Buffer *const *);
 static void (STDMETHODCALLTYPE *r_unmap)(ID3D11DeviceContext *, ID3D11Resource *, UINT);
@@ -906,6 +918,7 @@ static void cam_patch(float *f, UINT w, UINT h, UINT rw, UINT rh, float jx, floa
 
 static void cam_write(CamBuf *e, const void *src) {
     if (src != e->src) memcpy(e->src, src, sizeof e->src);
+    if (e->src[104] != g_game_t) { g_game_t = e->src[104]; g_game_t_frame = g_frame; }
     float f[144];
     memcpy(f, e->src, sizeof f);
     if (g_rw && g_rh) cam_patch(f, g_live_w, g_live_h, g_rw, g_rh, g_jx, g_jy);
@@ -930,9 +943,10 @@ static void ps_cb_apply(ID3D11DeviceContext *c) {
     if (want != g_ps_bound && r_pscb) { r_pscb(c, 0, 1, &want); g_ps_bound = want; }
 }
 
+extern volatile int g_fgm_in_pass;   // fgmotion.c: the motion pass sets its own state (not the game's: pass it on)
 static void STDMETHODCALLTYPE w_pscb(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11Buffer *const *b) {
     g_hk[HK_PSCB]++;
-    if (c != g_ctx || start != 0 || !n || !b || n > 14) { r_pscb(c, start, n, b); return; }
+    if (c != g_ctx || g_fgm_in_pass || start != 0 || !n || !b || n > 14) { r_pscb(c, start, n, b); return; }
     ID3D11Buffer *g = b[0];
     for (unsigned i = 0; i < g_ncbuf; i++)
         if (g == g_cbuf[i].ours) g = g_cbuf[i].game;   // our copy, read back by someone saving state: it stands for the game's
@@ -979,7 +993,7 @@ static void jit_apply(ID3D11DeviceContext *c, int force) {
 
 static void STDMETHODCALLTYPE w_rsvp(ID3D11DeviceContext *c, UINT n, const D3D11_VIEWPORT *v) {
     g_hk[HK_RSVP]++;
-    if (c != g_ctx || n > 16) { r_rsvp(c, n, v); return; }
+    if (c != g_ctx || g_fgm_in_pass || n > 16) { r_rsvp(c, n, v); return; }
     g_ngvp = n;
     if (n) memcpy(g_gvp, v, n * sizeof *v);
     g_jit_vp_calls++;
@@ -1037,7 +1051,7 @@ static ID3D11SamplerState *lod_sampler(ID3D11SamplerState *s, float bias) {
 
 static void(STDMETHODCALLTYPE *r_pssamp)(ID3D11DeviceContext *, UINT, UINT, ID3D11SamplerState *const *);
 static void STDMETHODCALLTYPE w_pssamp(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11SamplerState *const *s) {
-    if (c != g_ctx || g_live_state != 1 || !g_jit_on || g_rw >= g_live_w || g_lod_off || !s || !n || n > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT ||
+    if (c != g_ctx || g_fgm_in_pass || g_live_state != 1 || !g_jit_on || g_rw >= g_live_w || g_lod_off || !s || !n || n > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT ||
         !screen_part(g_rt_w, g_rt_h) || overlay_stage()) { r_pssamp(c, start, n, s); return; }
     float bias = log2f((float)g_rw / g_live_w) + g_lod_extra;
     ID3D11SamplerState *b[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
@@ -1114,7 +1128,7 @@ static void STDMETHODCALLTYPE w_omrt(ID3D11DeviceContext *c, UINT n, ID3D11Rende
     unsigned long long t0 = __rdtsc();
     r_omrt(c, n, rtv, dsv);
     g_omrt_ticks += __rdtsc() - t0;
-    if (c != g_ctx) return;
+    if (c != g_ctx || g_fgm_in_pass) return;
     dsv_changed(dsv);
     target_changed(n, rtv, dsv);
     jit_apply(c, 0);
@@ -1125,7 +1139,7 @@ static void STDMETHODCALLTYPE w_omrtuav(ID3D11DeviceContext *c, UINT n, ID3D11Re
                                         UINT us, UINT nu, ID3D11UnorderedAccessView *const *u, const UINT *ic) {
     g_hk[HK_OMRT]++;
     r_omrtuav(c, n, rtv, dsv, us, nu, u, ic);
-    if (c != g_ctx || n == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) return;
+    if (c != g_ctx || g_fgm_in_pass || n == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) return;
     dsv_changed(dsv);
     target_changed(n, rtv, dsv);
     jit_apply(c, 0);
@@ -1135,7 +1149,7 @@ static void STDMETHODCALLTYPE w_omrtuav(ID3D11DeviceContext *c, UINT n, ID3D11Re
 static void STDMETHODCALLTYPE w_omdss(ID3D11DeviceContext *c, ID3D11DepthStencilState *st, UINT ref) {
     g_hk[HK_OMDSS]++;
     r_omdss(c, st, ref);
-    if (c != g_ctx) return;
+    if (c != g_ctx || g_fgm_in_pass) return;
     if (st != g_last_dss) {
         g_last_dss = st;
         D3D11_DEPTH_STENCIL_DESC d = {0};
@@ -1149,19 +1163,40 @@ static void STDMETHODCALLTYPE w_omdss(ID3D11DeviceContext *c, ID3D11DepthStencil
 static void patch_slot(void **slot, void *to, void **old);
 static HRESULT(STDMETHODCALLTYPE *r_map)(ID3D11DeviceContext *, ID3D11Resource *, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE *);
 static HRESULT STDMETHODCALLTYPE w_map(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub, D3D11_MAP t, UINT f, D3D11_MAPPED_SUBRESOURCE *m);
+// One context slot, hooked again at every stage: d3d11 swaps its own functions back in (see mp_hook). A slot that another
+// mod hooked after us (it calls ours as its original) is left to it: hooking again would make ours call it back until the
+// stack overflows (as mp_hook and patch_once already guard; ultrareview 2026-11-02). Our own module's hooks are not foreign.
+static void ctx_slot(int i, void **slot, void *to, void **old, const char *name) {
+    static char foreign[10];
+    if (*slot == to || foreign[i]) return;
+    if (*old) {
+        HMODULE owner = NULL, self = NULL;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)*slot, &owner);
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(void *)ctx_slot, &self);
+        if (owner != GetModuleHandleW(L"d3d11.dll") && owner != self) {
+            wchar_t n[MAX_PATH] = L"?";
+            if (owner) GetModuleFileNameW(owner, n, MAX_PATH);
+            const wchar_t *b = wcsrchr(n, L'\\');
+            g_log("frame bridge: %s on the game's D3D11 context is now hooked by %ls - left to it", name, b ? b + 1 : n);
+            foreign[i] = 1;
+            return;
+        }
+    }
+    patch_slot(slot, to, old);
+}
 static void jit_install(void) {
     void **vt = *(void ***)g_ctx;
 #define SLOT(m) &vt[offsetof(ID3D11DeviceContextVtbl, m) / sizeof(void *)]
-    patch_slot(SLOT(RSSetViewports), (void *)w_rsvp, (void **)&r_rsvp);
-    patch_slot(SLOT(RSGetViewports), (void *)w_rsgetvp, (void **)&r_rsgetvp);
-    patch_slot(SLOT(OMSetRenderTargets), (void *)w_omrt, (void **)&r_omrt);
-    patch_slot(SLOT(OMSetRenderTargetsAndUnorderedAccessViews), (void *)w_omrtuav, (void **)&r_omrtuav);
-    patch_slot(SLOT(OMSetDepthStencilState), (void *)w_omdss, (void **)&r_omdss);
-    patch_slot(SLOT(PSSetConstantBuffers), (void *)w_pscb, (void **)&r_pscb);
-    patch_slot(SLOT(PSSetSamplers), (void *)w_pssamp, (void **)&r_pssamp);
-    patch_slot(SLOT(Map), (void *)w_map, (void **)&r_map);
-    patch_slot(SLOT(Unmap), (void *)w_unmap, (void **)&r_unmap);
-    patch_slot(SLOT(UpdateSubresource), (void *)w_updsub, (void **)&r_updsub);
+    ctx_slot(0, SLOT(RSSetViewports), (void *)w_rsvp, (void **)&r_rsvp, "RSSetViewports");
+    ctx_slot(1, SLOT(RSGetViewports), (void *)w_rsgetvp, (void **)&r_rsgetvp, "RSGetViewports");
+    ctx_slot(2, SLOT(OMSetRenderTargets), (void *)w_omrt, (void **)&r_omrt, "OMSetRenderTargets");
+    ctx_slot(3, SLOT(OMSetRenderTargetsAndUnorderedAccessViews), (void *)w_omrtuav, (void **)&r_omrtuav, "OMSetRenderTargetsAndUnorderedAccessViews");
+    ctx_slot(4, SLOT(OMSetDepthStencilState), (void *)w_omdss, (void **)&r_omdss, "OMSetDepthStencilState");
+    ctx_slot(5, SLOT(PSSetConstantBuffers), (void *)w_pscb, (void **)&r_pscb, "PSSetConstantBuffers");
+    ctx_slot(6, SLOT(PSSetSamplers), (void *)w_pssamp, (void **)&r_pssamp, "PSSetSamplers");
+    ctx_slot(7, SLOT(Map), (void *)w_map, (void **)&r_map, "Map");
+    ctx_slot(8, SLOT(Unmap), (void *)w_unmap, (void **)&r_unmap, "Unmap");
+    ctx_slot(9, SLOT(UpdateSubresource), (void *)w_updsub, (void **)&r_updsub, "UpdateSubresource");
 #undef SLOT
 }
 
@@ -1715,7 +1750,10 @@ static void mp_capture_end(FILE *f) {
 // the F11 panel's switches (take effect from the next frame)
 // render size per SR mode: off and DLAA native, then NVIDIA's preset scales (Quality 2/3, Balanced 0.58, Performance 1/2,
 // Ultra Performance 1/3), rounded down to even
+// the game's depth buffer cannot be copied (its Anti-Aliasing on MSAA): nothing upscales the render, so rendering below the
+// screen size would leave the scene shrunk in a corner for the whole session (ultrareview 2026-11-02); full size from then on
 static void sr_set(int mode) {
+    if (g_depth_bad) mode = 0;
     static const float scale[6] = {1, 1, 2.0f / 3, 0.58f, 0.5f, 1.0f / 3};
     float k = scale[mode >= 0 && mode < 6 ? mode : 0];
     g_sr = mode;
@@ -1741,6 +1779,7 @@ static int g_preset;
 static const char *const SHARP_KEYS[4] = {"off", "low", "medium", "high"};
 static const float SHARP_CON[4] = {0, 0.42f, 0.66f, 0.87f};
 static int g_sharp = 2;
+static int g_sharp_auto;   // sharpness still the default (or Medium from before version=5): High once AMD FSR is known to upscale
 static void shot_log(int n) {
     unsigned fgb_sr_backend(void);
     const char *tech = !g_sr ? "-" : fgb_sr_backend() == 2 ? "AMD FSR" : "NVIDIA DLSS";
@@ -1779,7 +1818,7 @@ static void settings_save(void) {
                "# fps_counter: off, top_left, top_right, bottom_left, bottom_right (rendered / shown frames per second)\n"
                "# addon: on, off (off: the add-on does nothing at all from the next game start; set on again to use it)\n"
                TECH_HELP
-               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\ndlss_preset=%s\nsharpness=%s\nvsync=%s\nfps_counter=%s\n" TECH_LINE "addon=on\nversion=4\n",
+               "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\ndlss_preset=%s\nsharpness=%s\nvsync=%s\nfps_counter=%s\n" TECH_LINE "addon=on\nversion=5\n",
             SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 2], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only",
             CAP_KEYS[g_fcap >= 0 && g_fcap < 5 ? g_fcap : 1], PRESET_KEYS[g_preset >= 0 && g_preset < 5 ? g_preset : 0],
             SHARP_KEYS[g_sharp >= 0 && g_sharp < 4 ? g_sharp : 2], VSYNC_KEYS[g_vsync != 0], FPSC_KEYS[g_fpsc >= 0 && g_fpsc < 5 ? g_fpsc : 0] TECH_ARG);
@@ -1864,12 +1903,13 @@ static void panel_fps(int corner) {
     g_log("F11 panel: frame-rate counter %s", FPSC_KEYS[g_fpsc]);
     settings_save();
 }
-static void panel_tech(int sr, int fg) {
-    g_tech = sr ? 1 : fg ? 3 : 2;
+static void tech_set(int t) {   // 0 auto, 1 fsr, 2 dlss, 3 mixed (the sweep restores auto with it)
+    g_tech = t;
     g_switch = fgb_can_restart();   // a helper that can be replaced: now (AGENT_LOG 166); otherwise the pick applies at the next start
     g_log("F11 panel: technology %s (%s)", TECH_KEYS[g_tech], g_switch ? "switching now" : "from the next game start");
     settings_save();
 }
+static void panel_tech(int sr, int fg) { tech_set(sr ? 1 : fg ? 3 : 2); }
 #define PANEL_TECH panel_tech
 // a new helper (with the picked technology in the FSR build), then every setting again (AGENT_LOG 165, 173)
 static void switch_now(void) {
@@ -1999,6 +2039,12 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             cap_apply();
             sr_set(g_sr);
             fgb_set_preset(PRESET_NGX[g_preset]);
+            if (g_sharp_auto && g_sharp == 2 && fgb_sr_backend() == 2) {
+                g_sharp = 3;
+                g_log("DLSS add-on: sharpness high, the default with AMD FSR upscaling");
+                settings_save();
+            }
+            g_sharp_auto = 0;
             fgb_set_sharpness(SHARP_CON[g_sharp]);
             fgb_set_vsync(g_vsync);
             if (!g_vsync && !fgb_helper_has_vsync()) g_log("DLSS add-on: V-Sync off needs add-on version 7 - its helper keeps V-Sync on");
@@ -2459,18 +2505,20 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         // Every first start saved the defaults, so a changed default is applied once to files from before it: per_object
         // before version=2 (players' reports: half the fps in big battles on 6-core CPUs; it mostly helps frame
         // generation), DLAA before version=3 (Quality renders smaller: faster big battles), camera_only before version=4
-        // (per object now tracks trees and grass too and is the default: "Full"; user: "its needed to look good", AGENT_LOG 179)
-        int ver = !sf ? 4 : strstr(text, "version=4") ? 4 : strstr(text, "version=3") ? 3 : strstr(text, "version=2") ? 2 : 1;
+        // (per object now tracks trees and grass too and is the default: "Full"; user: "its needed to look good", AGENT_LOG 179),
+        // medium with AMD FSR before version=5 (High now with FSR: AGENT_LOG 194; set at the bridge start, when the upscaler is known)
+        int ver = !sf ? 5 : strstr(text, "version=5") ? 5 : strstr(text, "version=4") ? 4 : strstr(text, "version=3") ? 3 : strstr(text, "version=2") ? 2 : 1;
         int reset_mv = ver < 4 && !g_motion_on, reset_sr = ver < 3 && g_sr == 1;
         if (reset_mv) g_motion_on = 1;
         if (reset_sr) g_sr = 2;
+        g_sharp_auto = !strstr(text, "sharpness=") || (ver < 5 && g_sharp == 2);
         g_live = 1;
         g_motion = 1;
         log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s, preset %s, sharpness %s, V-Sync %s (%ls%s%s)",
             SR_KEYS[g_sr], FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], PRESET_KEYS[g_preset], SHARP_KEYS[g_sharp], VSYNC_KEYS[g_vsync],
             sf ? L"settings.txt" : L"defaults",
             reset_mv ? "; camera_only was the old default, now per_object (Full)" : "", reset_sr ? "; dlaa was the old default, now quality" : "");
-        if (!sf || ver < 4) settings_save();
+        if (!sf || ver < 5) settings_save();
         g_dev_di8_created = fgp_di8_created;
     }
     if (f) {

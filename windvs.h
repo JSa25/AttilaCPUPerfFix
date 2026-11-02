@@ -13,12 +13,28 @@
 #pragma once
 
 static const char wind_hlsl[] =
-    "cbuffer motion : register(b0) { float tex_w; float prev_tex_w; float2 size; };\n"
+    // dt: seconds since the last pass, cull_px: skip what moves on its own less than this many render pixels (0: draw all;
+    // fgm_set_cull)
+    "cbuffer motion : register(b0) { float tex_w; float prev_tex_w; float2 size; float dt; float cull_px; float2 pad_; };\n"
     "cbuffer camera : register(b1) { float4 cam[27]; };\n"        // byte copies of the game's camera_VS_PS block
     "cbuffer prev_camera : register(b2) { float4 pcam[27]; };\n"
     "cbuffer wind : register(b3) { float4 wind0; float4 wind1; };\n"   // a copy of the game's wind_VS block
-    "struct VOut { float4 pos : SV_Position; float4 cur : TEXCOORD0; float4 prev : TEXCOORD1; };\n"
+    "struct VOut { float4 pos : SV_Position; float4 cur : TEXCOORD0; float4 prev : TEXCOORD1; float clipd : SV_CullDistance0; };\n"
     "float4 clip(float4 p, float4 r0, float4 r1, float4 r2, float4 r3) { return float4(dot(p, r0), dot(p, r1), dot(p, r2), dot(p, r3)); }\n"
+    // render pixels per metre at o (an object reaching r metres towards the camera; near the camera: never skipped)
+    "float px_per_m(float3 o, float r, float4 m0, float4 m1, float4 m3) {\n"
+    "  float w = dot(float4(o, 1), m3) - r;\n"
+    "  if (w <= 0.5) return 1e9;\n"
+    "  return 0.5 * max(size.x * length(m0.xyz), size.y * length(m1.xyz)) / w; }\n"
+    // an instance whose own motion this frame stays under cull_px: every vertex behind the camera, nothing drawn - its
+    // pixels keep the camera's motion from depth, which is then right within cull_px
+    "VOut culled() { VOut o; o.pos = float4(0, 0, 0, -1); o.cur = o.pos; o.prev = o.pos; o.clipd = -1; return o; }\n"
+    // a vertex's own motion in render pixels: its last pose and place (q) and this frame's (c), both through this frame's
+    // camera; the cull distance drops a triangle whose three corners all moved less than cull_px (its pixels keep the
+    // camera's motion). Not a clip distance: that cuts triangles, and their depth would no longer equal the game's (EQUAL)
+    "float own_px(float4 q, float4 c) {\n"
+    "  if (q.w <= 0 || c.w <= 0) return 1e9;\n"
+    "  return length((q.xy / q.w - c.xy / c.w) * 0.5 * size); }\n"
     // the trees' sway added to the blended position b (xyz) for weight wt (v7.w) and phase ph (v14.x)
     "float3 tree_sway(float t, float4 b, float wt, float ph) {\n"
     "  precise float4 r0; precise float r2;\n"
@@ -49,30 +65,45 @@ static const char wind_hlsl[] =
     "  r2 = r2 * wind0.w;\n"
     "  r0.w = r0.w * r2;\n"
     "  return mad(r0.www, float3(0, asfloat(0x40555555), 0), r0.xyz); }\n"   // 10/3
+    // a tree's sway between the two frames' times, at most: the side sway exactly (tree_sway's r0.x, the same for the whole
+    // instance, times weight^2 <= 1); the up-down part sin(6 (x + t)) s(t) |wind0.w| (saturate(wt - 0.7) 10/3 <= 1) with
+    // s = sin(0.3 (2 ph + t)) wind1.y the same for the instance: at most 2 |sin(3 dt)| |s(t)| + |s(t) - s(tp)|, times
+    // |wind0.w|; instance origin in TEXCOORD0..2 .w, trees up to 30 m towards the camera
+    "float tree_h(float t, float ph) { return (sin(mad(ph, 4.0, t)) * sin(t * 3.0) * wind1.x * 0.5 + 1.0) * (sin(t * 0.5) * 0.5 + 0.75) * wind1.x; }\n"
+    "bool tree_still(float4 a0, float4 a1, float4 a2, float ph) {\n"
+    "  if (cull_px <= 0) return false;\n"
+    "  float t = cam[26].x, tp = pcam[26].x;\n"
+    "  float s0 = sin(mad(ph, 2.0, t) * 0.3) * wind1.y, s1 = sin(mad(ph, 2.0, tp) * 0.3) * wind1.y;\n"
+    "  float m = (abs(tree_h(t, ph) - tree_h(tp, ph)) * length(wind0.xy) + 2.0 * abs(sin(3.0 * (t - tp))) * abs(s0) + abs(s0 - s1)) * abs(wind0.w);\n"
+    "  return m * px_per_m(float3(a0.w, a1.w, a2.w), 30.0, cam[9], cam[10], cam[12]) < cull_px; }\n"
+    // this frame's place and the last one's (o.cur, o.prev) and the cull distance from the last place through this camera
+    "VOut tree_out(float4 r1, float wt, float ph) {\n"
+    "  VOut o;\n"
+    "  o.cur = clip(float4(tree_sway(cam[26].x, r1, wt, ph), r1.w), cam[9], cam[10], cam[11], cam[12]);\n"
+    "  float4 q = float4(tree_sway(pcam[26].x, r1, wt, ph), r1.w);\n"
+    "  o.prev = clip(q, pcam[9], pcam[10], pcam[11], pcam[12]);\n"
+    "  o.clipd = cull_px > 0 ? own_px(clip(q, cam[9], cam[10], cam[11], cam[12]), o.cur) - cull_px : 1;\n"
+    "  o.pos = o.cur; return o; }\n"
     "struct TreeIn { float4 p0 : POSITION0; float4 p1 : POSITION1; float4 p6 : POSITION6; float4 p7 : POSITION7;\n"
     "  float4 a0 : TEXCOORD0; float4 a1 : TEXCOORD1; float4 a2 : TEXCOORD2; float4 b0 : TEXCOORD3; float4 b1 : TEXCOORD4;\n"
     "  float4 b2 : TEXCOORD5; float4 ph : TEXCOORD6; };\n"
     "VOut tree_a(TreeIn v) {\n"
+    "  if (tree_still(v.a0, v.a1, v.a2, v.ph.x)) return culled();\n"
     "  precise float4 r1, r2;\n"
     "  r1 = float4(dot(v.b0, v.p1), dot(v.b1, v.p1), dot(v.b2, v.p1), v.p1.w);\n"
     "  r1 = r1 * v.p6.y;\n"
     "  r2 = float4(dot(v.a0, v.p0), dot(v.a1, v.p0), dot(v.a2, v.p0), v.p0.w);\n"
     "  r1 = mad(r2, v.p6.x, r1);\n"
-    "  VOut o;\n"
-    "  o.cur = clip(float4(tree_sway(cam[26].x, r1, v.p7.w, v.ph.x), r1.w), cam[9], cam[10], cam[11], cam[12]);\n"
-    "  o.prev = clip(float4(tree_sway(pcam[26].x, r1, v.p7.w, v.ph.x), r1.w), pcam[9], pcam[10], pcam[11], pcam[12]);\n"
-    "  o.pos = o.cur; return o; }\n"
+    "  return tree_out(r1, v.p7.w, v.ph.x); }\n"
     "VOut tree_b(TreeIn v) {\n"
+    "  if (tree_still(v.a0, v.a1, v.a2, v.ph.x)) return culled();\n"
     "  precise float4 r1, r2; precise float f;\n"
     "  f = saturate(0 < v.p6.y && v.p6.y < 1 ? 1 - v.p6.y : v.p6.y);\n"
     "  r1 = float4(dot(v.b0, v.p1), dot(v.b1, v.p1), dot(v.b2, v.p1), v.p1.w);\n"
     "  r2 = float4(dot(v.a0, v.p0), dot(v.a1, v.p0), dot(v.a2, v.p0), v.p0.w);\n"
     "  r1 = r1 - r2;\n"
     "  r1 = mad(f, r1, r2);\n"
-    "  VOut o;\n"
-    "  o.cur = clip(float4(tree_sway(cam[26].x, r1, v.p7.w, v.ph.x), r1.w), cam[9], cam[10], cam[11], cam[12]);\n"
-    "  o.prev = clip(float4(tree_sway(pcam[26].x, r1, v.p7.w, v.ph.x), r1.w), pcam[9], pcam[10], pcam[11], pcam[12]);\n"
-    "  o.pos = o.cur; return o; }\n"
+    "  return tree_out(r1, v.p7.w, v.ph.x); }\n"
     "struct GrassIn { float4 pos : POSITION0; float4 col : COLOR0; float4 r0 : TEXCOORD1; float4 r1 : TEXCOORD2; float4 r2 : TEXCOORD3; };\n"
     // the grass at time t seen from camera block c (its position is in c0: the sway fades with the distance)
     "float4 grass_at(GrassIn v, float t, float4 c0) {\n"
@@ -116,7 +147,8 @@ static const char wind_hlsl[] =
     "  r1.w = 1;\n"
     "  return r1; }\n"
     "VOut grass(GrassIn v) {\n"
-    "  VOut o;\n"
+    "  VOut o; float4 q = grass_at(v, pcam[26].x, pcam[0]);\n"
     "  o.cur = clip(grass_at(v, cam[26].x, cam[0]), cam[9], cam[10], cam[11], cam[12]);\n"
-    "  o.prev = clip(grass_at(v, pcam[26].x, pcam[0]), pcam[9], pcam[10], pcam[11], pcam[12]);\n"
+    "  o.prev = clip(q, pcam[9], pcam[10], pcam[11], pcam[12]);\n"
+    "  o.clipd = cull_px > 0 ? own_px(clip(q, cam[9], cam[10], cam[11], cam[12]), o.cur) - cull_px : 1;\n"
     "  o.pos = o.cur; return o; }\n";

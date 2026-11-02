@@ -14,9 +14,9 @@ if "%WINDRES%"=="" set "WINDRES=i686-w64-mingw32-windres"
 rem dinput8.rc: the version resource (Properties > Details)
 "%WINDRES%" -O coff -o build\dinput8_res.o dinput8.rc || exit /b 1
 rem --no-insert-timestamp keeps the build reproducible: the same compiler gives the same file
-rem not stripped, a fixed timestamp and this link name (it is in the export table): the 6.10.3 release file exactly
-"%CC%" -O2 -Wall -Wextra -shared -static -Wl,-Xlink=-timestamp:1793588538 -o build\dinput8_6.10.3_C.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c pools.c passtime.c gputime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c build\rslink.o build\dinput8_res.o dinput8.def %LIBS% -lgdi32 || exit /b 1
-copy /y build\dinput8_6.10.3_C.dll build\dinput8.dll >nul
+rem not stripped, a fixed timestamp and this link name (it is in the export table): the 6.10.4 release file exactly
+"%CC%" -O2 -Wall -Wextra -shared -static -Wl,-Xlink=-timestamp:1793646898 -o build\dinput8_6.10.4_C.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c pools.c passtime.c gputime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c build\rslink.o build\dinput8_res.o dinput8.def %LIBS% -lgdi32 || exit /b 1
+copy /y build\dinput8_6.10.4_C.dll build\dinput8.dll >nul
 echo built build\dinput8.dll
 
 if /i not "%~1"=="test" exit /b 0

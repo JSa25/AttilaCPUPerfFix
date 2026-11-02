@@ -21,11 +21,13 @@ static const GUID iid_device5 = {0x8ffde202, 0xa0e7, 0x45df, {0x9e, 0x01, 0xe8, 
 static const GUID iid_context4 = {0x917600da, 0xf58c, 0x4c33, {0x98, 0xd8, 0x3e, 0x15, 0xb3, 0x90, 0xfa, 0x24}};
 static const GUID iid_fence = {0xaffde9d1, 0x1df7, 0x4bb7, {0x8a, 0x34, 0x0f, 0x46, 0x25, 0x1d, 0xab, 0x80}};
 
-// depth -> R32F and camera motion vectors from depth: world = inv(vp) x ndc, previous pixel = prev_vp x world.
+// depth -> R32F and camera motion vectors from depth: previous pixel = (prev_vp x inv(vp)) x ndc, the product made on the
+// CPU in double (fgb_make_vectors): the two steps in float on the GPU moved a still picture 0.1-0.35 px at far depth
+// with the camera ~1000 units from the origin (found in Rome 2, sweep 2026-11-02), and FSR smeared and lost its history.
 // A viewport shifted left / up by the jitter leaves the last column / row of the render undrawn (measured on an RTX 5090:
 // every pixel of it, at any jitter below 0): its depth is taken from the one before (jit_edge_fill does the colour)
 static const char *cs_src =
-    "cbuffer B : register(b0) { row_major float4x4 inv_vp; row_major float4x4 prev_vp; float2 size; float2 jit; };\n"
+    "cbuffer B : register(b0) { row_major float4x4 reproj; row_major float4x4 pad_; float2 size; float2 jit; };\n"
     "Texture2D<float> dep : register(t0);\n"
     "RWTexture2D<float> d32 : register(u0);\n"
     "RWTexture2D<float2> mv : register(u1);\n"
@@ -38,8 +40,7 @@ static const char *cs_src =
     "  d32[id.xy] = z;\n"
     "  float2 cur = float2(id.xy) + 0.5 - jit;\n"   // where this pixel's surface is without the jitter
     "  float2 ndc = float2(cur.x / size.x * 2 - 1, 1 - cur.y / size.y * 2);\n"
-    "  float4 w = mul(inv_vp, float4(ndc, z, 1)); w /= w.w;\n"
-    "  float4 p = mul(prev_vp, float4(w.xyz, 1)); p.xy /= p.w;\n"
+    "  float4 p = mul(reproj, float4(ndc, z, 1)); p.xy /= p.w;\n"
     "  float2 prev = float2((p.x * 0.5 + 0.5) * size.x, (0.5 - p.y * 0.5) * size.y);\n"
     "  mv[id.xy] = prev - cur; }\n";
 
@@ -176,20 +177,20 @@ static volatile DWORD g_present_tid;   // the thread that presents (the game's m
 
 int fgb_active(void) { return g_live && g_sh && !g_sh->error && WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT; }
 
-static int inverse4(const float *m, float *out) {   // Gauss-Jordan, row-major
-    float a[4][8];
+static int inverse4(const double *m, double *out) {   // Gauss-Jordan, row-major
+    double a[4][8];
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r);
     for (int c = 0; c < 4; c++) {
         int p = c;
-        for (int r = c + 1; r < 4; r++) if (fabsf(a[r][c]) > fabsf(a[p][c])) p = r;
-        if (fabsf(a[p][c]) < 1e-12f) return 0;
-        for (int k = 0; k < 8; k++) { float t = a[c][k]; a[c][k] = a[p][k]; a[p][k] = t; }
-        float d = a[c][c];
+        for (int r = c + 1; r < 4; r++) if (fabs(a[r][c]) > fabs(a[p][c])) p = r;
+        if (fabs(a[p][c]) < 1e-12) return 0;
+        for (int k = 0; k < 8; k++) { double t = a[c][k]; a[c][k] = a[p][k]; a[p][k] = t; }
+        double d = a[c][c];
         for (int k = 0; k < 8; k++) a[c][k] /= d;
         for (int r = 0; r < 4; r++) {
             if (r == c) continue;
-            float f = a[r][c];
+            double f = a[r][c];
             for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
         }
     }
@@ -484,6 +485,8 @@ static int g_tq_set[8], g_tq_failed;
 static UINT64 g_tq_prev_end;
 static uint32_t g_tq_prev_f = (uint32_t)-2;
 static double g_gpu_ms[4];   // frame interval, stalled waiting for the helper, HUD-less step, Present step
+static double g_gpu_cum_ms[4];   // the same since the start, never reset (the settings sweep's lines take differences)
+static unsigned g_gpu_cum_n[4];
 static unsigned g_gpu_n[4], g_gpu_lost;
 static unsigned g_wait_queued, g_wait_frames;   // wait_previous: GPU waits queued, frames
 
@@ -512,11 +515,11 @@ static void tq_read(uint32_t f) {
         if (set & 1 << k) ok = ID3D11DeviceContext_GetData(g_ctx, (ID3D11Asynchronous *)g_tq[s][k], &t[k], 8, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
     if (!ok) { g_gpu_lost++; return; }
     double ms = 1000.0 / (double)dj.Frequency;
-    if (g_tq_prev_f == f - 1) { g_gpu_ms[0] += (double)(t[TQ_END] - g_tq_prev_end) * ms; g_gpu_n[0]++; }
+    if (g_tq_prev_f == f - 1) { g_gpu_ms[0] += (double)(t[TQ_END] - g_tq_prev_end) * ms; g_gpu_n[0]++; g_gpu_cum_ms[0] += (double)(t[TQ_END] - g_tq_prev_end) * ms; g_gpu_cum_n[0]++; }
     g_tq_prev_end = t[TQ_END];
     g_tq_prev_f = f;
     if ((set & 3 << TQ_W0) == 3 << TQ_W0) { g_gpu_ms[1] += (double)(t[TQ_W1] - t[TQ_W0]) * ms; g_gpu_n[1]++; }
-    if (set & 1 << TQ_H1) { g_gpu_ms[2] += (double)(t[TQ_H1] - t[TQ_W1]) * ms; g_gpu_n[2]++; }
+    if (set & 1 << TQ_H1) { g_gpu_ms[2] += (double)(t[TQ_H1] - t[TQ_W1]) * ms; g_gpu_n[2]++; g_gpu_cum_ms[2] += (double)(t[TQ_H1] - t[TQ_W1]) * ms; g_gpu_cum_n[2]++; }
     if (set & 1 << TQ_P0) { g_gpu_ms[3] += (double)(t[TQ_END] - t[TQ_P0]) * ms; g_gpu_n[3]++; }
 }
 
@@ -525,6 +528,9 @@ void fgb_gpu_stats(double ms[4], unsigned *frames, unsigned *lost) {
     for (int i = 0; i < 4; i++) { ms[i] = g_gpu_n[i] ? g_gpu_ms[i] / g_gpu_n[i] : 0; g_gpu_ms[i] = 0; }
     *frames = g_gpu_n[0]; *lost = g_gpu_lost;
     memset(g_gpu_n, 0, sizeof g_gpu_n); g_gpu_lost = 0;
+}
+void fgb_gpu_totals(double *interval_ms, unsigned *intervals, double *hud_ms, unsigned *huds) {   // since the start
+    *interval_ms = g_gpu_cum_ms[0]; *intervals = g_gpu_cum_n[0]; *hud_ms = g_gpu_cum_ms[2]; *huds = g_gpu_cum_n[2];
 }
 void fgb_wait_stats(unsigned *queued, unsigned *frames) {   // GPU waits for the helper queued / frames (wait_previous)
     *queued = g_wait_queued; *frames = g_wait_frames;
@@ -710,6 +716,7 @@ const wchar_t *fgb_gpu_name(void) { return g_gpu_name; }
 // Returns 1 if they are made. Before writing, the GPU waits until the helper has read the previous frame's.
 static unsigned g_mv_frame = ~0u;
 static D3D11_TEXTURE2D_DESC g_dfail;   // the depth buffer the copy failed for: not tried (and logged) again every frame
+int fgb_depth_failed(void) { return g_dfail.Width != 0; }   // the game's depth could not be copied (MSAA): bridgeprobe stops scaling
 int fgb_make_vectors(ID3D11Resource *depth, const float vp[16]) {
     if (!fgb_active()) return 0;
     if (g_mv_frame == g_n) return 1;
@@ -740,13 +747,15 @@ int fgb_make_vectors(ID3D11Resource *depth, const float vp[16]) {
         g_dw = dd.Width; g_dh = dd.Height;
     }
     ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_dcopy, depth);
-    float inv[16];
-    if (!inverse4(vp, inv)) return 0;
+    double vd[16], inv[16];
+    for (int i = 0; i < 16; i++) vd[i] = vp[i];
+    if (!inverse4(vd, inv)) return 0;
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
     float *c = m.pData;
-    memcpy(c, inv, 64);
-    memcpy(c + 16, g_have_prev ? g_prev_vp : vp, 64);
+    const float *pv = g_have_prev ? g_prev_vp : vp;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) { double t = 0; for (int k = 0; k < 4; k++) t += pv[i * 4 + k] * inv[k * 4 + j]; c[i * 4 + j] = (float)t; }
     c[32] = (float)rw; c[33] = (float)rh; c[34] = jx; c[35] = jy;
     ID3D11DeviceContext_Unmap(g_ctx, (ID3D11Resource *)g_cb, 0);
     // the game's compute bindings in the slots we use, put back afterwards

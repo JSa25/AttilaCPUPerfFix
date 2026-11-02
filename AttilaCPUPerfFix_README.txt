@@ -197,6 +197,22 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.10.4:
+-Fixes from a full code review: a very long game folder path could overwrite
+ memory at start; a rare crash or failed save load when the game opened and
+ closed files in its settings folder at the same moment; the mod's memory
+ manager no longer changes Windows' last error value behind the game's back.
+-heapfix.log no longer grows without limit in long sessions with the
+ Upscaling and Framegen add-on, and writes fewer lines.
+-heapfix.ini understands on/off, true/false and yes/no (before, "on" switched
+ a fix off).
+-The crash that ends the game is always recorded in heapfix.log, even after
+ several harmless errors.
+-On a game build where the mod cannot run its per-frame checks, the rounding
+ fixes stay off instead of running without them.
+-Uses less memory: no 64 KB cache per thread up front, no permanent 2 MB
+ buffer.
+
 Version 6.10.3:
 -Windows Defender should no longer flag dinput8.dll ("Trojan:Win32/Wacatac" or
  "Phonzy"): a false alarm of Microsoft's automatic file check, which this build

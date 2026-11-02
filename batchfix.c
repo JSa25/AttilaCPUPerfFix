@@ -74,13 +74,11 @@ static void build_stubs(unsigned char *code, unsigned char *c, unsigned char *r,
     *p++ = 0xE9; put_rel(p, r + 7);
 }
 
+// the site must be writable already (install_batchfix unlocks all eight first)
 static void jump_to(unsigned char *at, int len, unsigned char *target) {
-    DWORD old;
-    VirtualProtect(at, len, PAGE_EXECUTE_READWRITE, &old);
     at[0] = 0xE9;
     put_rel(at + 1, target);
     memset(at + 5, 0x90, len - 5);
-    VirtualProtect(at, len, old, &old);
     FlushInstructionCache(GetCurrentProcess(), at, len);
 }
 
@@ -92,14 +90,29 @@ int install_batchfix(HMODULE m, void (*log)(const char *fmt, ...)) {
             log("batch fix: pass loop %d at +0x%X differs from this game version - not installed", i, SITES[i].cmp_rva);
             return 0;
         }
-    unsigned char *code = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!code) return 0;
+    // all eight sites writable first, or none patched: a VirtualProtect failure was ignored before and the write would
+    // have faulted in game code, or left a loop half patched (ultrareview 2026-11-02)
+    unsigned char *at[8];
+    DWORD old[8];
+    int len[8], open = 0;
     for (int i = 0; i < 4; i++) {
-        unsigned char *c = b + game_rva(b, SITES[i].cmp_rva), *r = b + game_rva(b, SITES[i].reset_rva), *st = code + 64 * i;
-        build_stubs(st, c, r, SITES[i].item_modrm, SITES[i].field);
-        jump_to(c, 6, st);
-        jump_to(r, 7, st + 32);
+        at[2 * i] = b + game_rva(b, SITES[i].cmp_rva); len[2 * i] = 6;
+        at[2 * i + 1] = b + game_rva(b, SITES[i].reset_rva); len[2 * i + 1] = 7;
     }
+    while (open < 8 && VirtualProtect(at[open], len[open], PAGE_EXECUTE_READWRITE, &old[open])) open++;
+    unsigned char *code = open == 8 ? VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) : NULL;
+    if (!code) {
+        while (open-- > 0) VirtualProtect(at[open], len[open], old[open], &old[open]);
+        log("batch fix: the game's code could not be made writable - not installed");
+        return 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        unsigned char *st = code + 64 * i;
+        build_stubs(st, at[2 * i], at[2 * i + 1], SITES[i].item_modrm, SITES[i].field);
+        jump_to(at[2 * i], 6, st);
+        jump_to(at[2 * i + 1], 7, st + 32);
+    }
+    for (int i = 0; i < 8; i++) VirtualProtect(at[i], len[i], old[i], &old[i]);
     FlushInstructionCache(GetCurrentProcess(), code, 4096);
     log("batch fix installed: draw items with equal variant values now share batches (4 pass loops)");
     return 4;

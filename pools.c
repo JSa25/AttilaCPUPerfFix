@@ -12,7 +12,18 @@
 // ---- dlmalloc, built for this
 #define ONLY_MSPACES 1
 #define MSPACES 1
+#ifdef POOLS_SRW   // test switch (wip/allocbench): an SRW lock, waiting in the kernel, instead of dlmalloc's spin-and-yield
+#define USE_LOCKS 2
+#define MLOCK_T SRWLOCK
+#define INITIAL_LOCK(l) (InitializeSRWLock(l), 0)
+#define DESTROY_LOCK(l) (0)
+#define ACQUIRE_LOCK(l) (AcquireSRWLockExclusive(l), 0)
+#define RELEASE_LOCK(l) ReleaseSRWLockExclusive(l)
+#define TRY_LOCK(l) TryAcquireSRWLockExclusive(l)
+static MLOCK_T malloc_global_mutex = SRWLOCK_INIT;
+#else
 #define USE_LOCKS 1
+#endif
 #define FOOTERS 1
 #define HAVE_MORECORE 0
 #define DEFAULT_GRANULARITY ((size_t)64U * (size_t)1024U)              // the game's (read from its mparams)
@@ -90,21 +101,62 @@ static DWORD g_tls = TLS_OUT_OF_INDEXES;
 
 // Per-thread cache: freed blocks of up to 2 KB by size class (16-byte steps), at most CACHE_N per class and CACHE_BYTES
 // in all, so a thread holds a bounded amount (the address space a cache keeps is the cost; 256 KB a thread).
+#ifndef CACHE_MAX   // test switch (wip/allocbench): -DCACHE_MAX=16384
 #define CACHE_MAX 2048
+#endif
 #define NCLASS (CACHE_MAX / 16 + 1)
 #define CACHE_N 32
 #define CACHE_BYTES (256u << 10)
 typedef struct { int pool; unsigned bytes; void *bin[NCLASS]; unsigned char n[NCLASS]; } Cache;
 
-static Cache *cache(void) {
+// TlsGetValue / TlsSetValue set the thread's last error to 0: the game's malloc / free must leave it as the game left it
+// (its own dlmalloc did; ultrareview 2026-11-02), as the MSVC CRT does around its own TLS reads
+static Cache *tls_cache(void) {
+    DWORD err = GetLastError();
     Cache *c = TlsGetValue(g_tls);
-    if (c) return c;
-    c = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *c);
-    if (!c) return NULL;
-    c->pool = (int)((unsigned)InterlockedIncrement(&g_next) % NPOOL);
-    TlsSetValue(g_tls, c);
+    SetLastError(err);
     return c;
 }
+static Cache *cache(void) {
+    Cache *c = tls_cache();
+    if (c) return c;
+    DWORD err = GetLastError();
+    c = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *c);
+    if (c) {
+        c->pool = (int)((unsigned)InterlockedIncrement(&g_next) % NPOOL);
+        TlsSetValue(g_tls, c);
+    }
+    SetLastError(err);
+    return c;
+}
+
+#ifdef POOLS_REMOTE
+// test switch (wip/allocbench, AGENT_LOG 199): a block freed by a thread of another pool is pushed on that pool's
+// lock-free list instead of taking its lock (its own threads' mallocs waited on it: the slow frames, AGENT_LOG 198);
+// the next thread of that pool that takes the lock anyway frees the list in one bulk free. Pushes only from other
+// threads, the whole list taken at once: no ABA.
+static void *volatile g_remote[NPOOL];
+static void remote_push(int i, void *p) {
+    void *h;
+    do { h = g_remote[i]; *(void **)p = h; } while (InterlockedCompareExchangePointer(&g_remote[i], p, h) != h);
+}
+static void remote_drain(int i) {
+    void *p = InterlockedExchangePointer(&g_remote[i], NULL), *batch[64];
+    size_t n = 0;
+    while (p) {
+        void *next = *(void **)p;   // before the block is freed
+        batch[n++] = p;
+        if (n == 64) { mspace_bulk_free(g_pool[i], batch, n); n = 0; }
+        p = next;
+    }
+    if (n) mspace_bulk_free(g_pool[i], batch, n);
+}
+static int pool_of(void *p) {   // FOOTERS: the block's mspace, as an index
+    mstate m = get_mstate_for(mem2chunk(p));
+    for (int i = 0; i < NPOOL; i++) if ((mstate)g_pool[i] == m) return i;
+    return -1;
+}
+#endif
 
 int pools_init(void) {
     if ((g_tls = TlsAlloc()) == TLS_OUT_OF_INDEXES) return 0;
@@ -120,14 +172,24 @@ void *pool_alloc(size_t n) {
         unsigned k = (unsigned)(n + 15) >> 4;   // class k holds blocks with at least k * 16 usable bytes
         if (k == 0) k = 1;
         void *p = c->bin[k];
+#ifdef POOLS_FIT   // test switch (AGENT_LOG 199): a cached block up to 12.5 % larger rather than a locked malloc
+        for (unsigned j = k + 1, top = k + k / 8 < NCLASS ? k + k / 8 : NCLASS - 1; !p && j <= top; j++)
+            if (c->bin[j]) { k = j; p = c->bin[j]; }
+#endif
         if (p) {
             c->bin[k] = *(void **)p;
             c->n[k]--;
             c->bytes -= (unsigned)mspace_usable_size(p);
             return p;
         }
+#ifdef POOLS_REMOTE
+        if (g_remote[c->pool]) remote_drain(c->pool);
+#endif
         return mspace_malloc(g_pool[c->pool], (size_t)k << 4);
     }
+#ifdef POOLS_REMOTE
+    if (g_remote[c->pool]) remote_drain(c->pool);
+#endif
     return mspace_malloc(g_pool[c->pool], n);
 }
 
@@ -145,6 +207,13 @@ void pool_free(void *p) {   // p is a pool block (pool_owns)
             return;
         }
     }
+#ifdef POOLS_REMOTE
+    if (c || (c = cache())) {
+        int i = pool_of(p);
+        if (i >= 0 && i != c->pool) { remote_push(i, p); return; }   // another pool's block: no lock
+        if (i >= 0 && g_remote[i]) remote_drain(i);
+    }
+#endif
     mspace_free(g_pool[0], p);   // FOOTERS: the block's own mspace, whichever is passed
 }
 
@@ -154,7 +223,7 @@ size_t pool_usable(const void *p) { return mspace_usable_size(p); }
 // On the game's own trim (dlmalloc_trim): this thread's cache back to its pools, then each pool gives back the 64 KB
 // pieces that are wholly free (dlmalloc's release of unused segments), as the game's heap does on its trim.
 void pool_trim(void) {
-    Cache *c = g_tls == TLS_OUT_OF_INDEXES ? NULL : TlsGetValue(g_tls);
+    Cache *c = g_tls == TLS_OUT_OF_INDEXES ? NULL : tls_cache();
     if (c) {
         for (unsigned k = 0; k < NCLASS; k++) {
             for (void *p = c->bin[k], *q; p; p = q) {
@@ -166,15 +235,21 @@ void pool_trim(void) {
         }
         c->bytes = 0;
     }
+#ifdef POOLS_REMOTE
+    for (int i = 0; i < NPOOL; i++)
+        if (g_pool[i]) remote_drain(i);
+#endif
     for (int i = 0; i < NPOOL; i++)
         if (g_pool[i]) mspace_trim(g_pool[i], 0);
 }
 
 void pool_thread_exit(void) {   // the thread's cached blocks go back to their mspaces
     if (g_tls == TLS_OUT_OF_INDEXES) return;
-    Cache *c = TlsGetValue(g_tls);
+    Cache *c = tls_cache();
     if (!c) return;
+    DWORD err = GetLastError();
     TlsSetValue(g_tls, NULL);
+    SetLastError(err);
     for (unsigned k = 0; k < NCLASS; k++)
         for (void *p = c->bin[k], *q; p; p = q) {
             q = *(void **)p;

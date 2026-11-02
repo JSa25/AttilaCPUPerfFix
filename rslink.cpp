@@ -24,7 +24,6 @@ static effect_runtime *s_rt;
 static ID3D11Texture2D *s_depth;          // our copy of the scene depth (the game's is the depth target while effects run)
 static ID3D11ShaderResourceView *s_depth_srv;
 static ID3D11RenderTargetView *s_rtv;
-static ID3D11Resource *s_rtv_of;
 static unsigned s_presents, s_effect_frames, s_bound, s_other;
 static int s_reversed = -1;               // the depth's direction from the camera (-1 unknown)
 // the far plane the mod wrote last (reshade_link.txt in the add-on's folder): ReShade saves it in the player's preset, so
@@ -106,15 +105,14 @@ int rsl_effects(ID3D11DeviceContext *ctx, ID3D11Resource *bb, ID3D11Resource *de
     if (!s_rt) return 0;
     ID3D11Device *dev = nullptr;
     ctx->GetDevice(&dev);
-    if (bb != s_rtv_of) {
-        if (s_rtv) s_rtv->Release();
-        s_rtv = nullptr; s_rtv_of = nullptr;
-        if (SUCCEEDED(dev->CreateRenderTargetView(bb, nullptr, &s_rtv))) s_rtv_of = bb;
-    }
+    // the back buffer's view for this call only (a kept one would make the game's ResizeBuffers fail; ultrareview 2026-11-02)
+    if (FAILED(dev->CreateRenderTargetView(bb, nullptr, &s_rtv))) s_rtv = nullptr;
     D3D11_TEXTURE2D_DESC dd = {}, od = {};
     if (depth) static_cast<ID3D11Texture2D *>(depth)->GetDesc(&dd);
     if (s_depth) s_depth->GetDesc(&od);
-    if (depth && (!s_depth || od.Width != dd.Width || od.Height != dd.Height || od.Format != dd.Format)) {
+    // a depth that cannot be handed over (MSAA, another format) is tried and logged once, not every frame (ultrareview)
+    static D3D11_TEXTURE2D_DESC s_dfail;
+    if (depth && memcmp(&dd, &s_dfail, sizeof dd) && (!s_depth || od.Width != dd.Width || od.Height != dd.Height || od.Format != dd.Format)) {
         if (s_depth_srv) s_depth_srv->Release();
         if (s_depth) s_depth->Release();
         s_depth = nullptr; s_depth_srv = nullptr;
@@ -126,6 +124,7 @@ int rsl_effects(ID3D11DeviceContext *ctx, ID3D11Resource *bb, ID3D11Resource *de
             FAILED(dev->CreateShaderResourceView(s_depth, &sd, &s_depth_srv))) {
             if (s_depth) s_depth->Release();
             s_depth = nullptr;
+            s_dfail = dd;
             if (s_log) s_log("ReShade: scene depth format %u (%u samples) not handed over - ReShade keeps its own depth", dd.Format, dd.SampleDesc.Count);
         }
     }
@@ -134,6 +133,8 @@ int rsl_effects(ID3D11DeviceContext *ctx, ID3D11Resource *bb, ID3D11Resource *de
     if (!s_rtv) return 0;
     resource_view v = {(uint64_t)(uintptr_t)s_rtv};
     s_rt->render_effects(s_rt->get_command_queue()->get_immediate_command_list(), v, v);
+    s_rtv->Release();
+    s_rtv = nullptr;
     s_effect_frames++;
     return 1;
 }

@@ -1,5 +1,5 @@
 // Tests logtrim.c (AGENT_LOG 73): a log over 1 MB keeps only the newest whole sessions (~256 KB), with a note at the
-// top; a short log and one giant session are left alone.
+// top; a short log is left alone; one giant session keeps its newest whole lines.
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,7 +38,7 @@ int main(void) {
     size_t n = fread(buf, 1, sizeof buf - 1, f);
     fclose(f);
     buf[n] = 0;
-    CHECK(strncmp(buf, "(older sessions removed", 23) == 0);
+    CHECK(strncmp(buf, "(older lines removed", 20) == 0);
     char *first = strstr(buf, "\n======== session ");
     CHECK(first && first == strchr(buf, '\n') + 1);             // the kept part starts at a session header (blank line + header)
     CHECK(strstr(buf, "session 0299 line 099") != NULL);          // the newest session is complete
@@ -50,14 +50,23 @@ int main(void) {
     before = fsize();
     trim_log(g_log_path);
     CHECK(fsize() == before);
-    // 3) one session longer than LOG_KEEP and over LOG_MAX: no header inside the kept part, so the file stays
+    // 3) one session longer than LOG_KEEP and over LOG_MAX: no header inside the kept part, so its newest lines are kept
     f = _wfopen(g_log_path, L"wb");
     fputs("\n======== one long session ========\n", f);
     for (int k = 0; k < 30000; k++) fprintf(f, "[00:00:00.000] line %05d xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", k);
     fclose(f);
     before = fsize();
     trim_log(g_log_path);
-    CHECK(before > LOG_MAX && fsize() == before);
+    after = fsize();
+    printf("one long session: %ld -> %ld bytes\n", before, after);
+    CHECK(before > LOG_MAX && after > 0 && after <= LOG_KEEP + 64);
+    f = _wfopen(g_log_path, L"rb");
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    CHECK(strncmp(buf, "(older lines removed", 20) == 0);
+    CHECK(strncmp(strchr(buf, '\n') + 2, "[00:00:00.000] line ", 20) == 0);   // the kept part starts at a whole line
+    CHECK(strstr(buf, "line 29999 ") != NULL);                     // the newest line is kept
     _wremove(g_log_path);
     printf("all log trim tests passed\n");
     return 0;

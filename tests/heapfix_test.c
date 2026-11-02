@@ -135,6 +135,9 @@ int main(int argc, char **argv) {
     CHECK(p != NULL);
     g_free(p);
     g_free(NULL);
+    SetLastError(1234);   // the game's malloc / free leave the thread's last error alone (pools.c tls_cache)
+    g_free(g_malloc(64));
+    CHECK(GetLastError() == 1234);
     CHECK(g_malloc(0) != NULL);
     CHECK(g_malloc(0xFFFFFFC0u) == NULL);
     char *q = g_malloc(32);

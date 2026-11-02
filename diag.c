@@ -95,10 +95,18 @@ static const char *build_name(DWORD stamp) {
          : NULL;
 }
 
-static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
+// first chance (vectored handler) and, for the one that ends the game, last chance (unhandled filter): the first chance
+// counts handled exceptions too, so the last one keeps a record of its own past MAX_RECORDS (ultrareview 2026-11-02:
+// handled ones could use up the records before the crash). The same exception is not written twice.
+static const EXCEPTION_RECORD *g_last_rec;
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
+static LONG record(EXCEPTION_POINTERS *e, int last_chance) {
     DWORD code = e->ExceptionRecord->ExceptionCode;
     const char *what = code_name(code);
-    if (!what || g_records >= MAX_RECORDS || InterlockedExchange(&g_busy, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    if (!what || g_records >= MAX_RECORDS + last_chance || (last_chance && e->ExceptionRecord == g_last_rec) ||
+        InterlockedExchange(&g_busy, 1))
+        return EXCEPTION_CONTINUE_SEARCH;
+    g_last_rec = e->ExceptionRecord;
     LONG nrec = InterlockedIncrement(&g_records);
     CONTEXT *c = e->ContextRecord;
     char *p = g_buf, *end = g_buf + sizeof g_buf - 64;
@@ -181,6 +189,11 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     dwrite(g_buf, (int)(p - g_buf));
     InterlockedExchange(&g_busy, 0);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) { return record(e, 0); }
+static LONG WINAPI on_unhandled(EXCEPTION_POINTERS *e) {
+    record(e, 1);
+    return g_prev_filter ? g_prev_filter(e) : EXCEPTION_CONTINUE_SEARCH;
 }
 
 // One preference line ("name value;") from Attila's preferences.script.txt, or "?" when absent.
@@ -546,6 +559,7 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
         log("crash logging off (crash_logging=0 in heapfix.ini)");
     else {
         AddVectoredExceptionHandler(0, on_exception);  // last in the chain; it only logs
+        g_prev_filter = SetUnhandledExceptionFilter(on_unhandled);   // the crash itself, past the record limit too
         log("crash logging on: exceptions are recorded here as EXCEPTION lines");
     }
     sampler_start(empire, dir, log);

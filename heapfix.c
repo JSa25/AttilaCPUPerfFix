@@ -111,6 +111,7 @@ void pool_free(void *p);
 void *pool_realloc(void *p, size_t n);
 size_t pool_usable(const void *p);
 void pool_thread_exit(void);
+void pool_lookup_thread_exit(void);   // pool.c
 void pool_trim(void);
 
 static void *h_alloc(size_t n) {
@@ -409,8 +410,18 @@ static void ini_create(void) {
     WriteFile(f, INI_DEFAULTS, sizeof INI_DEFAULTS - 1, &w, NULL);
     CloseHandle(f);
 }
+// numbers, or on / true / yes = 1 and off / false / no = 0 (GetPrivateProfileIntW read "on" as 0 = the fix off;
+// ultrareview 2026-11-02); anything else keeps the default
 static int ini_int(const wchar_t *section, const wchar_t *key, int def) {
-    return g_ini[0] ? (int)GetPrivateProfileIntW(section, key, def, g_ini) : def;
+    wchar_t v[32];
+    if (!g_ini[0] || !GetPrivateProfileStringW(section, key, L"", v, 32, g_ini)) return def;
+    if ((v[0] >= L'0' && v[0] <= L'9') || v[0] == L'-') return _wtoi(v);
+    static const wchar_t *const yes[3] = {L"on", L"true", L"yes"}, *const no[3] = {L"off", L"false", L"no"};
+    for (int i = 0; i < 3; i++) {
+        if (!_wcsicmp(v, yes[i])) return 1;
+        if (!_wcsicmp(v, no[i])) return 0;
+    }
+    return def;
 }
 // 1 when a fix is switched off: <key>=0 in [fixes] of heapfix.ini, or the older <name>_off.txt in the game folder.
 static int fix_off(const wchar_t *key, const wchar_t *old_file, const char *name, const char *then) {
@@ -485,9 +496,21 @@ static void install_all(HMODULE m) {
     if (fix_off(L"render_list_sorts", L"sortfix_off.txt", "render-list sorts", "not replaced")) st[S_SORTS] = FIX_SWITCHED_OFF;
     else sorts = install_sortfix(m, wlog);
     st[S_BATCH] = fix_off(L"battle_draw_batching", L"batchfix_off.txt", "batch fix", "not installed") ? FIX_SWITCHED_OFF : install_batchfix(m, wlog) > 0;
+    // the frame hook before the rounding fixes: its per-frame checks put the game's own code back when the rounding mode
+    // changes, so without it they stay out (ultrareview 2026-11-02: a failed hook was ignored)
+    wchar_t dir[MAX_PATH];
+    wcscpy(dir, g_log_path);
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    int frame_hook = 0;
+    if (slash) {
+        *slash = 0;
+        frame_hook = install_fps(m, dir, wlog);
+    }
     if (fix_off(L"campaign_rounding", L"campfix_off.txt", "campaign rounding fixes", "not installed")) camp = -1;
+    else if (!frame_hook) wlog("campaign rounding fixes not installed: no frame hook for their per-frame checks");
     else g_campfix_on = (camp = install_campfix(m, 0, wlog)) > 0;
     if (fix_off(L"x87_rounding", L"x87fix_off.txt", "x87 rounding fix", "not installed")) st[S_X87] = FIX_SWITCHED_OFF;
+    else if (!frame_hook) wlog("x87 rounding fix not installed: no frame hook for its per-frame checks");
     else g_x87fix_on = (x87 = install_x87fix(m, wlog)) > 0;
     if (g_campfix_on || g_x87fix_on) g_frame_check = frame_checks;
     // Terrain height cache: verified in game: 7.5 M queries over map, end turn, save load and battle, 0 mismatches.
@@ -522,13 +545,6 @@ static void install_all(HMODULE m) {
     if (st[S_SORTS] != FIX_SWITCHED_OFF) st[S_SORTS] = sorts == 2 ? FIX_ON : sorts ? FIX_PARTLY : FIX_INACTIVE;
     if (st[S_X87] != FIX_SWITCHED_OFF)  // the 4 campaign blocks (campfix) and the general x87 fix together
         st[S_X87] = x87 > 0 && camp == 4 ? FIX_ON : x87 > 0 || camp > 0 ? FIX_PARTLY : FIX_INACTIVE;
-    wchar_t dir[MAX_PATH];
-    wcscpy(dir, g_log_path);
-    wchar_t *slash = wcsrchr(dir, L'\\');
-    if (slash) {
-        *slash = 0;
-        install_fps(m, dir, wlog);  // the frame hook also runs the per-frame checks
-    }
     // the DLSS add-on: <game folder>\FrameBridge\ with the 64-bit helper and NVIDIA's DLLs; without it nothing is installed
     if (sl) wcscpy(sl + 1, L"FrameBridge\\helper64.exe");
     int addon = sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES;
@@ -574,7 +590,10 @@ static int wait_for_game(void) {
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     (void)r;
-    if (reason == DLL_THREAD_DETACH) pool_thread_exit();   // the thread's cached blocks go back to their pools
+    if (reason == DLL_THREAD_DETACH) {   // the thread's cached blocks go back to their pools, its lookup cache is freed
+        pool_thread_exit();
+        pool_lookup_thread_exit();
+    }
     if (reason == DLL_PROCESS_ATTACH) {
         set_log_path(h);  // thread notifications stay on: the pools take a thread's cached blocks back when it ends
         if (g_log_path[0]) log_header();

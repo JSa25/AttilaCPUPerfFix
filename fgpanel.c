@@ -245,8 +245,9 @@ static const wchar_t *const tsr_names[2] = {L"NVIDIA DLSS", L"AMD FSR"};
 static const wchar_t *const tfg_names[2] = {L"NVIDIA DLSS Frame Generation", L"AMD FSR Frame Generation"};
 // what this PC should use (always shown; the Defaults button sets it), from the GPU, the screen size and its refresh rate:
 // NVIDIA's parts where the GPU has them, AMD FSR for the rest; Attila is mostly limited by the CPU, so a strong GPU gets the
-// best image (DLAA / Native AA up to 1440p, Quality at 4K) and a weaker one more upscaling; 3x frame generation on an RTX 50
-// with a 200 Hz+ screen, else 2x; preset NVIDIA's default, sharpness Medium, V-Sync On
+// best image (DLAA / Native AA up to 1440p, Quality at 4K) and a weaker one more upscaling; frame generation 2x, never more
+// (user 2026-11-02 via Rome 2: 3x / 4x stay the player's choice); preset NVIDIA's default, sharpness Medium with DLSS and
+// High with AMD FSR (AGENT_LOG 194's sweep: FSR Quality at Medium kept 85 % of native detail, High 105 %), V-Sync On
 typedef struct { int sr_amd, fg_amd, sr, fg; } Rec;
 static int gpu_class(void) {   // 2 strong, 1 middle, 0 entry, from the name: "RTX 5090", "RX 7900 XTX", "RX 9070"
     const wchar_t *g = fgb_gpu_name(), *r = wcsstr(g, L"RTX "), *a = wcsstr(g, L"RX ");
@@ -269,8 +270,7 @@ static Rec recommended(void) {
     int fg_ok = 1;
     int c = gpu_class();
     r.sr = p_bh >= 2000 ? 4 - c : p_bh >= 1300 ? (c == 2 ? 1 : 3 - c) : (c ? 1 : 2);   // 4K: Quality / Balanced / Performance
-    const wchar_t *rtx = wcsstr(fgb_gpu_name(), L"RTX ");   // 3x needs an RTX 50 (from the name: the same whatever runs now)
-    r.fg = !fg_ok ? 0 : !r.fg_amd && rtx && wcstoul(rtx + 4, NULL, 10) >= 5000 && p_hz >= 200 ? 2 : 1;
+    r.fg = fg_ok;   // 2x
     return r;
 }
 static void redraw(void) {
@@ -382,7 +382,7 @@ static void redraw(void) {
         // line 2: the settings for the model picked in rows 9 / 10 (AMD FSR upscaling needs each soldier's own motion: its
         // reactive mask marks moving units only from per-object vectors, AGENT_LOG 163 / 171)
         int msr = p_tsr, mfg = p_tfg;
-        if (msr) _snwprintf(mdl, 200, L"With AMD FSR: motion vectors Full, sharpness Medium, V-Sync On");
+        if (msr) _snwprintf(mdl, 200, L"With AMD FSR: motion vectors Full, sharpness High, V-Sync On");
         else _snwprintf(mdl, 200, L"With NVIDIA DLSS%ls: preset Default (%lc), motion vectors Full, sharpness Medium, V-Sync On",
                         mfg ? L" and AMD FSR Frame Generation" : L"", L"-KKKML"[p_sr > 0 && p_sr < 6 ? p_sr : 2]);
         if (p_tsr != (SR_AMD ? 1 : 0) || p_tfg != (FG_AMD ? 1 : 0))   // a pick waiting for the restart: said instead, louder
@@ -431,7 +431,6 @@ static ID3D11PixelShader *p_ps;
 static ID3D11BlendState *p_blend;
 static ID3D11RasterizerState *p_rs;
 static ID3D11DepthStencilState *p_dss;
-static ID3D11Resource *p_rtv_res;
 static ID3D11RenderTargetView *p_rtv;
 
 static int pipeline(void) {
@@ -475,10 +474,13 @@ static void counter_redraw(void) {
         c_bmp = c_dc ? CreateDIBSection(c_dc, &bi, DIB_RGB_COLORS, (void **)&c_bits, NULL, 0) : NULL;
         c_rgba = malloc((size_t)c_w * c_h * 4);
         c_font = CreateFontW(-(int)(13 * p_u), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
-        D3D11_TEXTURE2D_DESC td = {(UINT)c_w, (UINT)c_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
-        if (!c_bmp || !c_rgba || FAILED(ID3D11Device_CreateTexture2D(p_dev, &td, NULL, &c_tex)) ||
-            FAILED(ID3D11Device_CreateShaderResourceView(p_dev, (ID3D11Resource *)c_tex, NULL, &c_srv))) { p_fpson = 0; return; }
+        if (!c_bmp || !c_rgba) { p_fpson = 0; return; }
         SelectObject(c_dc, c_bmp);
+    }
+    if (!c_tex) {   // on the panel's device: made again after fgp_move_device (the old device's texture is not usable)
+        D3D11_TEXTURE2D_DESC td = {(UINT)c_w, (UINT)c_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        if (FAILED(ID3D11Device_CreateTexture2D(p_dev, &td, NULL, &c_tex)) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(p_dev, (ID3D11Resource *)c_tex, NULL, &c_srv))) { p_fpson = 0; return; }
     }
     memset(c_bits, 0, (size_t)c_w * c_h * 4);
     wchar_t s[48];
@@ -510,12 +512,9 @@ static void counter_redraw(void) {
 }
 static void blend_panel(ID3D11Resource *bb, ID3D11ShaderResourceView *tex, int tx, int ty, int tw, int th) {
     ID3D11DeviceContext *c = p_ctx;
-    if (bb != p_rtv_res) {   // the back buffer's view (the same resource every frame)
-        if (p_rtv) ID3D11RenderTargetView_Release(p_rtv);
-        p_rtv = NULL;
-        p_rtv_res = SUCCEEDED(ID3D11Device_CreateRenderTargetView(p_dev, bb, NULL, &p_rtv)) ? bb : NULL;
-        if (!p_rtv) return;
-    }
+    // the back buffer's view for this call only: a view kept between frames holds a reference to the back buffer, and the
+    // game's ResizeBuffers on that swapchain would fail while it lives (ultrareview 2026-11-02)
+    if (FAILED(ID3D11Device_CreateRenderTargetView(p_dev, bb, NULL, &p_rtv))) { p_rtv = NULL; return; }
     ID3D11RenderTargetView *rtv[8] = {0}; ID3D11DepthStencilView *dsv = NULL;
     ID3D11BlendState *bs = NULL; FLOAT bf[4]; UINT mask;
     D3D11_VIEWPORT vp[16]; UINT nvp = 16;
@@ -571,6 +570,8 @@ static void blend_panel(ID3D11Resource *bb, ID3D11ShaderResourceView *tex, int t
 #define REL(x) if (x) (x)->lpVtbl->Release(x)
     REL(dsv); REL(bs); REL(rs); REL(dss); REL(vs); REL(ps); REL(gs); REL(hs); REL(ds); REL(il); REL(srv);
 #undef REL
+    ID3D11RenderTargetView_Release(p_rtv);
+    p_rtv = NULL;
 }
 
 int fgp_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh, DXGI_FORMAT fmt, int sr, int fg, int motion, FgpApply apply) {
@@ -634,8 +635,9 @@ int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT b
     if (!p_dc) return 0;   // never set up
 #define DROP(x) if (x) { (x)->lpVtbl->Release(x); (x) = NULL; }
     DROP(p_rtv); DROP(p_srv); DROP(p_tex); DROP(p_vs); DROP(p_ps); DROP(p_blend); DROP(p_rs); DROP(p_dss);
+    DROP(c_srv); DROP(c_tex);   // the FPS counter's too: counter_redraw makes them on the new device (ultrareview 2026-11-02)
 #undef DROP
-    p_rtv_res = NULL;
+    p_cdirty = 1;
     p_dev = dev; p_ctx = ctx; p_bw = bw; p_bh = bh;
     D3D11_TEXTURE2D_DESC td = {(UINT)p_w, (UINT)p_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
     p_ok = SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &p_tex)) && pipeline();
@@ -658,7 +660,7 @@ static void fgp_defaults(void) {
     if (p_motion >= 0) { SET(p_motion, 1, motion); }   // Full (per object) for everyone (AGENT_LOG 179)
     SET(p_cap, 1, cap);
     SET(p_preset, 0, preset);
-    SET(p_sharp, 2, sharp);
+    SET(p_sharp, ra ? 3 : 2, sharp);   // High with AMD FSR upscaling, Medium with DLSS
     if (p_vsync_ok) { SET(p_vsync, 1, vsync); }
 #undef SET
     if (ra != p_tsr || fa != p_tfg) { p_tsr = ra; p_tfg = fa; if (p_apply.tech) p_apply.tech(ra, fa); }

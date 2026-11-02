@@ -243,7 +243,7 @@ void passtime_report(void (*log)(const char *fmt, ...)) {
     double f = frames * g_pt_tsc_per_ms;
     log("frame budget (%ld frames, inclusive main-thread time per frame; lost frames %llu):", frames, g_pt_lost);
     for (unsigned i = 0; i < PT_N; i++)
-        log("  %-36s %6.2f ms  %8.1f calls", PT_FUNCS[i].name, t[i] / f, (double)c[i] / frames);
+        if (c[i]) log("  %-36s %6.2f ms  %8.1f calls", PT_FUNCS[i].name, t[i] / f, (double)c[i] / frames);   // the timed ones only
     // per-view breakdown: group by (caller, vtable)
     static struct { unsigned ret, vt; unsigned long long ticks; unsigned n; } g[512];
     unsigned ng = 0, vn = g_pt_vn < 65536 ? g_pt_vn : 65536;

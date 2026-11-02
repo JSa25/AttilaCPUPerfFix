@@ -38,9 +38,17 @@ static void (*m_log)(const char *fmt, ...);
 static int m_on;
 static volatile int m_enabled = 1;   // the F11 panel's switch (the copy hook stays, returning at once when off)
 void fgm_set_enabled(int on) { m_enabled = on; }
+// models and trees whose own motion this frame stays under px render pixels are not redrawn, and triangles whose three
+// corners all moved less are dropped (0: all drawn; the shaders' cull_px). Rome 2 measured 0.93-1.23 -> 0.52 ms per pass.
+static float m_cull_px = 0.125f;
+void fgm_set_cull(float px) { m_cull_px = px < 0 ? 0 : px; }
+float fgm_cull(void) { return m_cull_px; }
 
 // ---- the skinned layouts (CreateInputLayout with one of the three shaders' bytecode) ----
-#define M_MAX_LAYOUTS 64
+// the game's layout is kept referenced (AddRef): a freed one's address could otherwise come back as another layout and
+// match an old entry, drawing an unrelated model with our skin or wind shader (ultrareview 2026-11-02); 256 entries, a
+// full table logged once (new models then get the camera's motion only)
+#define M_MAX_LAYOUTS 256
 static struct { const void *game; ID3D11InputLayout *ours; int skin4, wind; } m_il[M_MAX_LAYOUTS];   // wind: 1 / 2 trees, 3 grass
 static volatile LONG m_nil;
 static ID3D11VertexShader *m_vs[2];
@@ -56,6 +64,10 @@ static int wind_kind(unsigned long long sig) {
     if (sig == 0xc272bdade21308b2ull || sig == 0x20bbbad818a85073ull) return 3;
     return 0;
 }
+static void layouts_full(void) {
+    static volatile LONG said;
+    if (!InterlockedExchange(&said, 1)) m_log("motion pass: %d input layouts recorded - models loaded from now get the camera's motion only", M_MAX_LAYOUTS);
+}
 void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT n, unsigned long long sig) {
     int wind = wind_kind(sig);
     if (wind) {   // the game's elements as they are: the wind needs no history of its own
@@ -66,7 +78,8 @@ void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT 
             return;
         }
         LONG k = InterlockedIncrement(&m_nil) - 1;
-        if (k >= M_MAX_LAYOUTS) { ID3D11InputLayout_Release(ours); return; }
+        if (k >= M_MAX_LAYOUTS) { ID3D11InputLayout_Release(ours); layouts_full(); return; }
+        ID3D11InputLayout_AddRef((ID3D11InputLayout *)il);
         m_il[k].ours = ours; m_il[k].skin4 = 0; m_il[k].wind = wind; m_il[k].game = il;
         return;
     }
@@ -87,7 +100,8 @@ void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT 
         return;
     }
     LONG k = InterlockedIncrement(&m_nil) - 1;
-    if (k >= M_MAX_LAYOUTS) { ID3D11InputLayout_Release(ours); return; }
+    if (k >= M_MAX_LAYOUTS) { ID3D11InputLayout_Release(ours); layouts_full(); return; }
+    ID3D11InputLayout_AddRef((ID3D11InputLayout *)il);
     m_il[k].ours = ours; m_il[k].skin4 = skin4; m_il[k].wind = 0; m_il[k].game = il;
 }
 
@@ -100,7 +114,28 @@ void fgm_layout_created(const void *il, const D3D11_INPUT_ELEMENT_DESC *e, UINT 
 // the game did not refill through the copy hook kept an item pointer from an earlier frame, whose unit had been freed.
 typedef struct { const void *item; unsigned gen; LONG frame; } MSlot;
 static LONG m_frame = 1;   // the frame being built (fgm_frame_end counts it)
-typedef struct { ID3D11Resource *res; unsigned char *base; UINT size; MSlot *items; unsigned gen; } MMap;
+// A table holds its slot count: the copy hook bounds its index by the table it read, not by the entry's size, which a
+// swap to a smaller buffer may have changed in between (ultrareview 2026-11-02: heap overflow). Replaced tables are
+// freed M_RETIRE_FRAMES frames later, when no copy on a job thread can still be writing to them (they leaked before).
+typedef struct { UINT n; MSlot s[]; } MTable;
+typedef struct { ID3D11Resource *res; unsigned char *base; UINT size; MTable *tab; unsigned gen; } MMap;
+#define M_RETIRED 64
+#define M_RETIRE_FRAMES 4
+static struct { MTable *t; LONG frame; } m_retired[M_RETIRED];   // main thread only (Map hook, frame end)
+static unsigned m_retire_next, m_retire_leaked;
+static void retire(MTable *t) {
+    unsigned i = m_retire_next++ % M_RETIRED;
+    if (m_retired[i].t) {   // the ring is full: free the oldest if it is old enough, else leave it (counted)
+        if (m_retired[i].frame + M_RETIRE_FRAMES <= m_frame) free(m_retired[i].t);
+        else m_retire_leaked++;
+    }
+    m_retired[i].t = t;
+    m_retired[i].frame = m_frame;
+}
+static void retire_free(void) {
+    for (unsigned i = 0; i < M_RETIRED; i++)
+        if (m_retired[i].t && m_retired[i].frame + M_RETIRE_FRAMES <= m_frame) { free(m_retired[i].t); m_retired[i].t = NULL; }
+}
 static MMap m_maps[M_MAPS];
 static unsigned long long m_map_last[M_MAPS];   // apart from m_maps: written at every Map, which the copy hook's threads read
 static CRITICAL_SECTION m_map_lock;
@@ -125,14 +160,19 @@ void fgm_mapped(ID3D11Resource *r, D3D11_MAP type, const D3D11_MAPPED_SUBRESOURC
         for (int i = 1; i < M_MAPS; i++) if (m_map_last[i] < m_map_last[k]) k = i;
         m_maps[k].base = NULL;   // the copy hook stops matching it before it changes
     }
-    // a buffer of another size: a new table; the old one is kept (a copy on a worker may still be writing to it; rare)
-    if (m_maps[k].items && m_maps[k].size != bd.ByteWidth) m_maps[k].items = NULL;
-    if (!m_maps[k].items) m_maps[k].items = calloc(bd.ByteWidth / 120 + 1, sizeof(MSlot));
+    // a buffer of another size: a new table; the old one retires (a copy on a worker may still be writing to it)
+    if (m_maps[k].tab && m_maps[k].size != bd.ByteWidth) { retire(m_maps[k].tab); m_maps[k].tab = NULL; }
+    if (!m_maps[k].tab) {
+        UINT n = bd.ByteWidth / 120 + 1;
+        MTable *t = calloc(1, sizeof *t + n * sizeof(MSlot));
+        if (t) t->n = n;
+        __atomic_store_n(&m_maps[k].tab, t, __ATOMIC_RELEASE);
+    }
     if (type == D3D11_MAP_WRITE_DISCARD || m_maps[k].res != r) m_maps[k].gen++;   // the buffer's earlier contents are gone
     if (m_maps[k].size != bd.ByteWidth) m_maps[k].size = bd.ByteWidth;   // stores only on a change: the copy hook's threads read these
     if (m_maps[k].res != r) m_maps[k].res = r;
     m_map_last[k] = ++clock;
-    if (m_maps[k].items) m_maps[k].base = m->pData;   // last: the copy hook looks for base
+    if (m_maps[k].tab) m_maps[k].base = m->pData;   // last: the copy hook looks for base
     LeaveCriticalSection(&m_map_lock);
 }
 
@@ -153,10 +193,11 @@ void *__cdecl fgm_copy(void *dst, const void *src, size_t n) {
         if (m->base && (unsigned char *)dst >= m->base && (unsigned char *)dst + 120 <= m->base + m->size) {
             UINT off = (UINT)((unsigned char *)dst - m->base);   // records start anywhere (64% not at a multiple of 120)
             if (off % 120) count(&m_copies_misaligned, &t_misaligned);
-            if (m->items) {   // records never overlap: one slot each
-                m->items[off / 120].item = (const unsigned char *)src - 0x74;
-                m->items[off / 120].gen = m->gen;
-                m->items[off / 120].frame = m_frame;
+            MTable *t = __atomic_load_n(&m->tab, __ATOMIC_ACQUIRE);
+            if (t && off / 120 < t->n) {   // records never overlap: one slot each; bounded by the table read here
+                t->s[off / 120].item = (const unsigned char *)src - 0x74;
+                t->s[off / 120].gen = m->gen;
+                t->s[off / 120].frame = m_frame;
             }
             return dst;
         }
@@ -218,7 +259,9 @@ typedef struct {
     UINT idx, inst, start_idx; INT base_v; ID3D11ShaderResourceView *anim;   // anim: NULL for the wind
     UINT st1, start_inst;   // the wind's: its instance buffer's stride, the game's first instance
     UINT first;   // index of this draw's first instance in m_items / m_prev_cpu
+    unsigned gen;   // its instance buffer's fill when recorded: refilled before the pass = other records there, skipped
 } MDraw;
+static unsigned m_skip_refill;
 static MDraw m_draws[M_MAX_DRAWS];
 static UINT m_ndraws;
 typedef struct { float cur[16]; int tex, bones; } MItem;   // a model's record, texture index and skeleton size
@@ -234,6 +277,7 @@ static ID3D11Buffer *m_prev_buf, *m_cb, *m_cam[2], *m_wind;
 static int m_cam_have[2], m_wind_have;
 static unsigned m_wind_draws, m_wind_inst;
 static ID3D11Resource *m_anim_res[M_TEX];          // the game's animation texture of each index
+static ID3D11Resource *m_anim_bad[M_TEX];          // one that does not fit (kept referenced): logged once, not at every draw
 static ID3D11Texture2D *m_prev_anim;               // their previous-frame copies (array slices)
 static ID3D11ShaderResourceView *m_prev_anim_srv;
 static int m_prev_ok[M_TEX];
@@ -348,7 +392,11 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
     UINT size = 0, off = of[1] + start_inst * 120;
     unsigned gen = 0;
     for (int i = 0; i < M_MAPS; i++)
-        if (vb[1] && m_maps[i].res == (ID3D11Resource *)vb[1]) { items = m_maps[i].items; size = m_maps[i].size; gen = m_maps[i].gen; }
+        if (vb[1] && m_maps[i].res == (ID3D11Resource *)vb[1] && m_maps[i].tab) {
+            items = m_maps[i].tab->s;
+            size = m_maps[i].tab->n * 120 - 120 < m_maps[i].size ? m_maps[i].tab->n * 120 - 120 : m_maps[i].size;   // the table's own bound
+            gen = m_maps[i].gen;
+        }
     ID3D11ShaderResourceView *anim = NULL;
     ID3D11DeviceContext_VSGetShaderResources(c, 0, 1, &anim);
     int ok = vb[0] && vb[1] && st[1] == 120 && items && off + inst * 120 <= size && anim;
@@ -363,7 +411,8 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
     if (ok && tex >= 0 && tex < M_TEX) {   // the texture of this index; a new one (another battle) starts without history
         ID3D11Resource *res = NULL;
         ID3D11ShaderResourceView_GetResource(anim, &res);
-        if (res != m_anim_res[tex]) {
+        if (res == m_anim_bad[tex]) tex = M_TEX;
+        else if (res != m_anim_res[tex]) {
             D3D11_TEXTURE2D_DESC td;
             ID3D11Texture2D_GetDesc((ID3D11Texture2D *)res, &td);
             m_log("motion pass: animation texture %d: %ux%u format %u%s", tex, td.Width, td.Height, td.Format, m_anim_res[tex] ? " (replaced)" : "");
@@ -372,7 +421,12 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
                 m_anim_res[tex] = res;
                 res = NULL;
                 m_prev_ok[tex] = 0;
-            } else tex = M_TEX;   // does not fit the previous-frame slices: skipped
+            } else {   // does not fit the previous-frame slices: skipped
+                if (m_anim_bad[tex]) ID3D11Resource_Release(m_anim_bad[tex]);
+                m_anim_bad[tex] = res;
+                res = NULL;
+                tex = M_TEX;
+            }
         }
         if (res) ID3D11Resource_Release(res);
     }
@@ -387,7 +441,7 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
         return;
     }
     MDraw *d = &m_draws[m_ndraws++];
-    d->li = li; d->vb0 = vb[0]; d->st0 = st[0]; d->of0 = of[0]; d->vb1 = vb[1]; d->of1 = off; d->anim = anim;
+    d->li = li; d->vb0 = vb[0]; d->st0 = st[0]; d->of0 = of[0]; d->vb1 = vb[1]; d->of1 = off; d->anim = anim; d->gen = gen;
     ID3D11DeviceContext_IAGetIndexBuffer(c, &d->ib, &d->ib_fmt, &d->ib_off);
     d->idx = idx; d->inst = inst; d->start_idx = start_idx; d->base_v = base_v;
     d->first = (UINT)m_queued;
@@ -546,6 +600,10 @@ static void restore_state(GameState *g) {
 }
 
 UINT fgb_render_w(void), fgb_render_h(void);   // fgbridge.c
+// set while the pass sets its own state: bridgeprobe's context hooks pass those calls straight on instead of taking them
+// for the game's (its saved viewport and PS constant buffer went stale on the D3D11.1 path, whose state swap back does
+// not go through the hooks; ultrareview 2026-11-02)
+volatile int g_fgm_in_pass;
 
 int fgm_pass(ID3D11Resource *depth, float jx, float jy) {   // 1: models were drawn into the vectors
     if (!m_on || !m_ndraws) return 0;
@@ -565,11 +623,16 @@ int fgm_pass(ID3D11Resource *depth, float jx, float jy) {   // 1: models were dr
     if (m_queued) ID3D11DeviceContext_UpdateSubresource(m_ctx, (ID3D11Resource *)m_prev_buf, 0, &box, m_prev_cpu, 0, 0);
     if (!m_cam_have[1]) { ID3D11DeviceContext_CopyResource(m_ctx, (ID3D11Resource *)m_cam[1], (ID3D11Resource *)m_cam[0]); m_cam_have[1] = 1; }
     UINT rw = fgb_render_w(), rh = fgb_render_h();   // the game's render size (below the screen with the lower DLSS presets)
-    float prm[4] = {768, 768, (float)rw, (float)rh};   // animation texture width (the only size taken, see fgm_draw)
+    static LARGE_INTEGER last;   // the models' limb allowance: seconds since the last pass (0.1 at most)
+    QueryPerformanceFrequency(&qf);
+    float dt = last.QuadPart ? (float)(q0.QuadPart - last.QuadPart) / qf.QuadPart : 0.1f;
+    last = q0;
+    float prm[8] = {768, 768, (float)rw, (float)rh, dt > 0.1f ? 0.1f : dt, m_cull_px, 0, 0};   // animation texture width (the only size taken, see fgm_draw)
     ID3D11DeviceContext_UpdateSubresource(m_ctx, (ID3D11Resource *)m_cb, 0, NULL, prm, 0, 0);
     GameState gs;
     if (m_state) ID3D11DeviceContext1_SwapDeviceContextState(m_ctx1, m_state, &m_game_state);
     else save_state(&gs);
+    g_fgm_in_pass = 1;
     D3D11_VIEWPORT v = {jx, jy, (float)rw, (float)rh, 0, 1};
     ID3D11Buffer *cbs[4] = {m_cb, m_cam[0], m_cam[1], m_wind};
     ID3D11DeviceContext_RSSetViewports(m_ctx, 1, &v);
@@ -599,6 +662,10 @@ int fgm_pass(ID3D11Resource *depth, float jx, float jy) {   // 1: models were dr
     for (UINT i = 0; i < m_ndraws; i++) {
         MDraw *d = &m_draws[i];
         if (m_il[d->li].wind) continue;
+        int refilled = 0;   // (ultrareview 2026-11-02)
+        for (int k = 0; k < M_MAPS; k++)
+            if (m_maps[k].res == (ID3D11Resource *)d->vb1) { refilled = m_maps[k].gen != d->gen; break; }
+        if (refilled) { m_skip_refill++; continue; }
         ID3D11Buffer *vbs[3] = {d->vb0, d->vb1, m_prev_buf};
         UINT st[3] = {d->st0, 120, 64}, of[3] = {d->of0, d->of1, d->first * 64};
         ID3D11ShaderResourceView *srv[2] = {d->anim, m_prev_anim_srv};
@@ -609,6 +676,7 @@ int fgm_pass(ID3D11Resource *depth, float jx, float jy) {   // 1: models were dr
         ID3D11DeviceContext_VSSetShaderResources(m_ctx, 0, 2, srv);
         ID3D11DeviceContext_DrawIndexedInstanced(m_ctx, d->idx, d->inst, d->start_idx, d->base_v, 0);
     }
+    g_fgm_in_pass = 0;
     if (m_state) {
         ID3D11DeviceContext1_SwapDeviceContextState(m_ctx1, m_game_state, NULL);
         ID3DDeviceContextState_Release(m_game_state);
@@ -669,6 +737,7 @@ void fgm_frame_end(void) {
     m_cam_have[0] = 0;
     m_wind_have = 0;
     m_frame++;   // the worker is idle: the next frame's records go to the other table
+    retire_free();
     m_frames++;
 }
 
@@ -686,10 +755,11 @@ void fgm_report(void (*log)(const char *fmt, ...)) {
     if (m_frames)
         log("  motion pass: %u frames, %u model draws (%u instances) redrawn, %u draws skipped (%u full, %u an unknown record, %u texture index, %u "
             "other; highest animation texture index %d); previous model found within 0.35 m %.1f%%, none %.1f%%, no texture copy %.1f%%; per frame: pass %.3f ms, draw recording %.3f ms (main thread), "
-            "worker %.3f ms (own thread); records copied %ld (%ld outside a known buffer, %ld misaligned); %u instance buffer entries handed over",
+            "worker %.3f ms (own thread); records copied %ld (%ld outside a known buffer, %ld misaligned); %u instance buffer entries handed over (%u slot tables left unfreed); %u draws refilled before the pass, not redrawn",
             m_frames, m_draws_total, m_inst_total, m_skipped, m_skipped_full, m_skip_item, m_skip_tex, m_skip_other + m_skip_range, m_tex_max,
             all ? 100.0 * m_hit / all : 0, all ? 100.0 * m_new / all : 0, all ? 100.0 * m_badtex / all : 0, m_pass_ms / m_frames, m_draw_ticks * tick_ms / m_frames,
-            m_worker_ticks * tick_ms / m_frames, (long)m_copies, (long)m_copies_unmapped, (long)m_copies_misaligned, m_maps_full);
+            m_worker_ticks * tick_ms / m_frames, (long)m_copies, (long)m_copies_unmapped, (long)m_copies_misaligned, m_maps_full, m_retire_leaked, m_skip_refill);
+    m_skip_refill = 0;
     if (m_frames) log("  motion pass, swaying trees and grass: %.1f draws (%.0f instances) per frame redrawn with their wind", (double)m_wind_draws / m_frames,
                       (double)m_wind_inst / m_frames);
     m_wind_draws = m_wind_inst = 0;
@@ -727,7 +797,7 @@ int fgm_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *mv, U
     }
     ID3D10Blob_Release(psb);
     D3D11_BUFFER_DESC bd = {M_MAX_INST * 64, D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0};
-    D3D11_BUFFER_DESC cbd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+    D3D11_BUFFER_DESC cbd = {32, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
     D3D11_BUFFER_DESC camd = {576, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
     D3D11_RENDER_TARGET_VIEW_DESC rvd = {DXGI_FORMAT_R16G16_FLOAT, D3D11_RTV_DIMENSION_TEXTURE2D, {{0}}};
     D3D11_DEPTH_STENCIL_DESC dsd = {TRUE, D3D11_DEPTH_WRITE_MASK_ZERO, D3D11_COMPARISON_EQUAL, FALSE, 0, 0, {0}, {0}};

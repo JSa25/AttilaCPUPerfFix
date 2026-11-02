@@ -19,7 +19,13 @@ static const unsigned SIZES_B[19] = {0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0
 
 #define CACHE_SLOTS 4096
 struct centry { struct cls *pool; unsigned page; struct node *n; unsigned char k; };
-static __thread struct centry t_cache[CACHE_SLOTS];
+// allocated at a thread's first pool free, freed when it ends (pool_lookup_thread_exit): a static __thread array was
+// 64 KB of TLS for every thread in the process, most never freeing a pool object (ultrareview 2026-11-02)
+static __thread struct centry *t_cache;
+void pool_lookup_thread_exit(void) {
+    if (t_cache) HeapFree(GetProcessHeap(), 0, t_cache);
+    t_cache = NULL;
+}
 
 static unsigned char take(struct cls *c, struct node **link, struct node *n, unsigned size, char *p, unsigned *out) {
     if (link != &c->chunks) {  // move to front
@@ -35,7 +41,13 @@ static unsigned char take(struct cls *c, struct node **link, struct node *n, uns
 
 static unsigned char pool_free(struct cls *pool, const unsigned *sizes, int ncls, char *p, unsigned *out) {
     unsigned page = (unsigned)(UINT_PTR)p >> 12;
-    struct centry *e = &t_cache[(page ^ ((unsigned)(UINT_PTR)pool >> 4) * 0x9E3779B1u) & (CACHE_SLOTS - 1)];
+    if (!t_cache) {
+        DWORD err = GetLastError();   // the game's free must not change it (as pools.c)
+        t_cache = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, CACHE_SLOTS * sizeof *t_cache);
+        SetLastError(err);
+    }
+    struct centry none = {0};   // no memory for the cache: the full search, nothing remembered
+    struct centry *e = t_cache ? &t_cache[(page ^ ((unsigned)(UINT_PTR)pool >> 4) * 0x9E3779B1u) & (CACHE_SLOTS - 1)] : &none;
     if (e->pool == pool && e->page == page && e->k < ncls) {
         struct cls *c = &pool[e->k];
         for (struct node **link = &c->chunks, *n; (n = *link) != NULL; link = &n->next)
