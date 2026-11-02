@@ -1,0 +1,54 @@
+# Uploads a new version of the Upscaling and Framegen add-on's Nexus Mods file (mod page 171, API file ID 8282826).
+# The add-on zip carries NVIDIA's and AMD's DLLs, which are not in this repository: attach it to a draft release
+# (never published), then run this by hand with the draft's tag, the zip's SHA-256, the version and the changelog.
+# Refuses to upload unless the downloaded zip has that SHA-256. Needs the repository secret NEXUSMODS_API_KEY.
+name: Upload the add-on to Nexus Mods
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of the draft release that holds UpscalingFramegenAttila_beta.zip"
+        required: true
+      sha256:
+        description: "SHA-256 of UpscalingFramegenAttila_beta.zip"
+        required: true
+      version:
+        description: "Add-on version (shown on Nexus)"
+        required: true
+      changelog:
+        description: "Changelog for this version (shown on Nexus)"
+        required: true
+
+permissions:
+  contents: write  # a draft release is only visible with write access
+
+jobs:
+  nexus:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the zip from the draft release, check it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          WANT: ${{ inputs.sha256 }}
+        run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p UpscalingFramegenAttila_beta.zip
+          got=$(sha256sum UpscalingFramegenAttila_beta.zip | cut -d' ' -f1)
+          [ "$got" = "$(echo "$WANT" | tr A-F a-f)" ] || { echo "zip SHA-256 $got is not $WANT"; exit 1; }
+          echo "### Nexus add-on upload" >> "$GITHUB_STEP_SUMMARY"
+          echo "Version ${{ inputs.version }}, zip SHA-256 \`$got\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to Nexus Mods
+        uses: Nexus-Mods/upload-action@v1.0.0-beta.10
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          mod_id: 14130442404011  # "Unique Mod ID" (game 3290 << 32 | 171); the page number is 171
+          file_id: 8282826  # "API File ID" of the main file, not the number in page links
+          filename: UpscalingFramegenAttila_beta.zip
+          version: ${{ inputs.version }}
+          display_name: Upscaling and Framegen for Attila
+          description: "dinput8.dll (the Attila Engine Performance Fix, needed) + the FrameBridge folder + README. Close the game, copy dinput8.dll and FrameBridge into the game folder (the folder with Attila.exe). SHA-256 of the zip: ${{ inputs.sha256 }}"
+          changelog: ${{ inputs.changelog }}
+          archive_existing_version: true
+          update_mod_version: true
