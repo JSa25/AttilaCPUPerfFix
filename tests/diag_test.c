@@ -37,12 +37,22 @@ static __attribute__((noinline)) int deep(volatile int n) {
 }
 static DWORD WINAPI overflow_thread(void *x) { (void)x; return (DWORD)deep(0); }
 
+static int __cdecl stab_version(void) { return 140; }   // stands in for the export of Mat's DLL
+
 int main(void) {
     GetModuleFileNameW(NULL, g_path, MAX_PATH);
     wcscpy(wcsrchr(g_path, L'\\') + 1, L"diag_test.log");
     DeleteFileW(g_path);
     diag_startup(NULL, g_path, say);                     // not the game: one explanation, no handler
     diag_startup(GetModuleHandleW(NULL), g_path, say);   // "the game": full startup lines + handler
+    wchar_t dir[MAX_PATH], ini[MAX_PATH];
+    wcscpy(dir, g_path);
+    *wcsrchr(dir, L'\\') = 0;
+    swprintf(ini, MAX_PATH, L"%ls\\attila_stability.ini", dir);
+    WritePrivateProfileStringW(L"stability", L"address_reserve_mb", L"0", ini);   // one setting changed, rest default
+    stability_fix(NULL, dir, say);                       // no Stability Fix: no line
+    stability_fix(stab_version, dir, say);
+    DeleteFileW(ini);
     AddVectoredExceptionHandler(0, recover);             // after diag's, like the game's own handling
     HANDLE th = CreateThread(NULL, 0, overflow_thread, NULL, 0, NULL);   // record 1: a runaway recursion
     WaitForSingleObject(th, INFINITE);
@@ -64,6 +74,9 @@ int main(void) {
     CHECK(strstr(text, "system: Windows ") && strstr(text, "logical CPUs"));
     CHECK(strstr(text, "game: empire.retail.dll build"));
     CHECK(strstr(text, "other hook DLLs in the game folder:"));
+    char *sf = strstr(text, "Attila Stability Fix 1.4 (Mat's xinput1_3.dll, version code 140) is loaded: "
+                            "address_reserve_mb=0, large_top_down=1, park_big_holes=1, clear_shader_cache=1");
+    CHECK(sf && !strstr(sf + 1, "Attila Stability Fix 1.4"));   // once: the NULL call logged nothing
     CHECK(recs == MAX_RECORDS);
     CHECK(strstr(text, "0xC0000005 access violation at exe+0x"));
     CHECK(strstr(text, "write to address 00000000"));

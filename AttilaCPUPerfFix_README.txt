@@ -197,6 +197,14 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 6.10.6:
+-heapfix.log notes when Mat's Attila Stability Fix is installed, with its
+ version and settings.
+-With the Upscaling and Framegen add-on: when it cannot start, a short pop-up
+ says so and points to F8.
+-With the add-on: on a graphics card without Direct3D 12 feature level 12_0,
+ the F8 panel names the card and says DLSS and AMD FSR cannot run on it.
+
 Version 6.10.5:
 -With the Upscaling and Framegen add-on: its settings panel opens with F8 now
  (it was F11, which Attila 4K UI Scale 2.1.1 and newer use for their

@@ -711,6 +711,22 @@ void fgb_gpu_caps(int *dlss_sr, int *dlss_fg) {
     if (g_sh && g_sh->helper_ok && g_sh->fg_max && fgb_fg_backend_nv()) *dlss_fg = 1;
 }
 const wchar_t *fgb_gpu_name(void) { return g_gpu_name; }
+
+// After a failed start only (it loads D3D12 into the 32-bit game): 0 when the game's card has no Direct3D 12 feature
+// level 12_0, which the helper's device needs for DLSS and AMD FSR (NVIDIA Kepler / early Maxwell and older; a player's
+// helper log ended at D3D12CreateDevice 0x887a0004, 2026-11-02). No device is made (NULL out pointer: a test only).
+int fgb_d3d12_ok(ID3D11Device *dev) {
+    static const GUID iid_dxgi_device = {0x54ec77fa, 0x1377, 0x44e6, {0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}};
+    static const GUID iid_d3d12_device = {0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7}};
+    HMODULE m = LoadLibraryExA("d3d12.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    PFN_D3D12_CREATE_DEVICE create = m ? (PFN_D3D12_CREATE_DEVICE)(void *)GetProcAddress(m, "D3D12CreateDevice") : NULL;
+    IDXGIDevice *xd = NULL; IDXGIAdapter *ad = NULL;
+    if (!create || FAILED(ID3D11Device_QueryInterface(dev, &iid_dxgi_device, (void **)&xd))) return !create ? 0 : 1;   // no D3D12 at all: not ok
+    HRESULT hr = SUCCEEDED(IDXGIDevice_GetAdapter(xd, &ad)) ? create((IUnknown *)ad, D3D_FEATURE_LEVEL_12_0, &iid_d3d12_device, NULL) : S_OK;
+    if (ad) IDXGIAdapter_Release(ad);
+    IDXGIDevice_Release(xd);
+    return SUCCEEDED(hr);
+}
 // This frame's depth copy for DLSS and motion vectors (camera, then the per-object pass): once per frame, at the first
 // call - fgb_motion_vectors() (another mod's early effects, right after the scene's geometry) or the HUD-less point.
 // Returns 1 if they are made. Before writing, the GPU waits until the helper has read the previous frame's.

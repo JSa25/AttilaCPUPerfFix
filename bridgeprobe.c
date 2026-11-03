@@ -58,6 +58,8 @@ void rsl_camera(const float vp[16]);
 void fgp_set_note(const wchar_t *note);   // fgpanel.c
 int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh);
 IDXGISwapChain *fgb_fallback_sc(void);
+const wchar_t *fgb_gpu_name(void);
+int fgb_d3d12_ok(ID3D11Device *dev);   // fgbridge.c: the card has Direct3D 12 feature level 12_0
 HWND fgb_fallback_window(void);
 void *fgb_vt_original(void **vt, size_t slot);
 void *fgb_unhooked(void *fn);
@@ -1991,7 +1993,15 @@ static void start_failed_panel(IDXGISwapChain *sc) {
         ID3D11Resource_GetDevice(bb, &d);
         if (d) ID3D11Device_GetImmediateContext(d, &c);
         ok = wnd && c && panel_setup(d, c, td.Width, td.Height, td.Format, -1);   // the panel keeps d and c
-        if (ok) fgp_set_note(L"The upscaling add-on did not start - see heapfix.log in the game folder. Choices made here are saved.");
+        static wchar_t gpu_note[200];
+        int d12 = !d || fgb_d3d12_ok(d);
+        if (!d12) {   // the card itself: said by name, in the pop-up too
+            _snwprintf(gpu_note, 200, L"%ls can't run DLSS or AMD FSR: it lacks DirectX 12 feature level 12_0.",
+                       fgb_gpu_name()[0] ? fgb_gpu_name() : L"This graphics card");
+            g_log("DLSS add-on: the game's graphics card (%ls) has no Direct3D 12 feature level 12_0 - DLSS and AMD FSR cannot run on it",
+                  fgb_gpu_name());
+        }
+        if (ok) fgp_set_note(d12 ? L"The upscaling add-on did not start - see heapfix.log in the game folder. Choices made here are saved." : gpu_note);
         else { if (c) ID3D11DeviceContext_Release(c); if (d) ID3D11Device_Release(d); }
         g_log("F11 panel: %s over the game's frames (the add-on did not start)", ok ? "available" : "NOT available");
     }

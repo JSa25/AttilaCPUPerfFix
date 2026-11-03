@@ -209,6 +209,22 @@ static void pref(const char *text, const char *name, char *out, int cap) {
     }
 }
 
+// Mat's Attila Stability Fix (xinput1_3.dll next to the game, Workshop 3832772653): it hooks the address-space calls
+// (reserves 192 MB, parks big holes, empties the NVIDIA shader cache each start), so a report should say it is there.
+// Its version export returns a constant (140 = 1.4), safe before its own DllMain has run.
+static void stability_fix(int(__cdecl *ver)(void), const wchar_t *dir, void (*log)(const char *fmt, ...)) {
+    if (!ver) return;
+    int v = ver();
+    wchar_t ini[MAX_PATH];
+    swprintf(ini, MAX_PATH, L"%ls\\attila_stability.ini", dir);
+    log("Attila Stability Fix %d.%d (Mat's xinput1_3.dll, version code %d) is loaded: address_reserve_mb=%u, "
+        "large_top_down=%u, park_big_holes=%u, clear_shader_cache=%u (attila_stability.log has its own lines)",
+        v / 100, v % 100 / 10, v, GetPrivateProfileIntW(L"stability", L"address_reserve_mb", 192, ini),
+        GetPrivateProfileIntW(L"stability", L"large_top_down", 1, ini),
+        GetPrivateProfileIntW(L"stability", L"park_big_holes", 1, ini),
+        GetPrivateProfileIntW(L"stability", L"clear_shader_cache", 1, ini));
+}
+
 // ---- Main-thread sampler (AGENT_LOG 109: ~65 fps with the DLSS add-on in a big battle, 120-135 without, while the
 // add-on's own measured work is ~2 ms of GPU and < 0.5 ms of main thread per frame). With sample_on.txt in the game
 // folder, the main thread is paused every ~1 ms: its instruction pointer is counted per module, with the innermost game
@@ -554,6 +570,8 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
             fl += snprintf(found + fl, sizeof found - fl, " %ls", hooks[i]);
     }
     log("other hook DLLs in the game folder:%s", fl ? found : " none");
+    HMODULE xi = GetModuleHandleW(L"xinput1_3.dll");   // empire.retail.dll imports it, so it is mapped
+    stability_fix(xi ? (void *)GetProcAddress(xi, "AttilaStabilityFixVersion") : NULL, dir, log);
 
     if (!g_crash_logging)
         log("crash logging off (crash_logging=0 in heapfix.ini)");
