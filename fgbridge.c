@@ -15,6 +15,7 @@
 #include <string.h>
 #include <math.h>
 #include "fgb_proto.h"
+#include "fgb_handles.h"
 
 static const GUID iid_dxgi_resource1 = {0x30961379, 0x4609, 0x4a41, {0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1}};
 static const GUID iid_device5 = {0x8ffde202, 0xa0e7, 0x45df, {0x9e, 0x01, 0xe8, 0x37, 0x80, 0x1b, 0x5e, 0xa0}};
@@ -57,6 +58,8 @@ static ID3D11ComputeShader *g_cs;
 static ID3D11Buffer *g_cb;
 static HANDLE g_handles[9], g_map, g_wake, g_wake2, g_helper;   // wake: the helper SR thread, wake2: its present thread
 static FgbShared *g_sh;
+static HANDLE g_handle_map;
+static FgbHandles *g_handle_sidecar;
 static HWND g_hwnd;           // the game's window (the helper presents into it)
 static UINT g_w, g_h, g_dw, g_dh;
 static uint32_t g_n;          // the frame being built
@@ -257,6 +260,48 @@ static int amd_files(const wchar_t *helper_exe) {
     return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
 }
 
+// Publish while no helper is running; a restarted helper sees fresh fence handles.
+static int publish_handles(DWORD pid) {
+    if (!g_handle_sidecar) {
+        wchar_t name[64];
+        _snwprintf(name, 64, L"Local\\fgb_%lu_handles", (unsigned long)pid);
+        g_handle_map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(FgbHandles), name);
+        DWORD error = GetLastError();
+        if (!g_handle_map || error == ERROR_ALREADY_EXISTS) {
+            g_log("frame bridge: create handle sidecar failed (%lu) - off", error);
+            if (g_handle_map) { CloseHandle(g_handle_map); g_handle_map = NULL; }
+            return 0;
+        }
+        g_handle_sidecar = MapViewOfFile(g_handle_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(FgbHandles));
+        if (!g_handle_sidecar) {
+            g_log("frame bridge: map handle sidecar failed (%lu) - off", GetLastError());
+            CloseHandle(g_handle_map); g_handle_map = NULL; return 0;
+        }
+    }
+    FgbHandles data = { FGB_HANDLES_VERSION, sizeof(FgbHandles), pid, FGB_HANDLE_COUNT, {0} };
+    for (unsigned i = 0; i < 9; ++i) data.handles[i] = (uint64_t)(uintptr_t)g_handles[i];
+    data.handles[9] = (uint64_t)(uintptr_t)g_react_handle;
+    memcpy(g_handle_sidecar, &data, sizeof data);
+    return 1;
+}
+
+// Source handles may only be replaced once the importing process really exited.
+static int wait_helper_stopped(void) {
+    if (!g_helper) return 1;
+    DWORD wait = WaitForSingleObject(g_helper, 5000);
+    if (wait == WAIT_TIMEOUT) {
+        if (!TerminateProcess(g_helper, 1)) {
+            g_log("frame bridge: terminate helper failed (%lu)", GetLastError()); return 0;
+        }
+        wait = WaitForSingleObject(g_helper, 5000);
+    }
+    if (wait != WAIT_OBJECT_0) {
+        g_log("frame bridge: helper exit not confirmed (%lu), retaining source handles", wait); return 0;
+    }
+    CloseHandle(g_helper); g_helper = NULL;
+    return 1;
+}
+
 // the helper: helper64.exe bridge <pid> <streamline dir> <log dir>, killed with this process (job object); waits up to
 // 10 s for it to be ready (fgb_start, fgb_restart)
 static int launch_helper(void) {
@@ -278,8 +323,8 @@ static int launch_helper(void) {
         Sleep(1);
     if (!g_sh->helper_ok) {   // a slow start must not leave the helper running with the game's window
         TerminateProcess(g_helper, 1);
-        WaitForSingleObject(g_helper, 1000);
-        g_log("frame bridge: helper did not start Streamline - off (see its log)");
+        wait_helper_stopped();
+        g_log("frame bridge: helper bridge initialization failed - off (see fgbridge_helper.log)");
         return 0;
     }
     return 1;
@@ -408,6 +453,8 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     g_sh->fg_test_limit = g_fg_test_limit;
     g_sh->tech = g_tech;
     g_sh->proto = FGB_PROTO;
+
+    if (!publish_handles(pid)) return 0;
 
     // the helper (launch_helper)
     _snwprintf(g_cmd, sizeof g_cmd / sizeof *g_cmd, L"\"%ls\" bridge %lu \"%ls\" \"%ls\"", helper_exe, (unsigned long)pid, sl_dir, log_dir);
@@ -1149,8 +1196,7 @@ int fgb_restart(unsigned tech) {
     __atomic_store_n(&g_sh->frames, FGB_QUIT, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);
-    if (WaitForSingleObject(g_helper, 5000) == WAIT_TIMEOUT) TerminateProcess(g_helper, 1);
-    CloseHandle(g_helper);
+    if (!wait_helper_stopped()) { g_live = 0; release_gpu_waits(); return -1; }
     // a fresh window for the new helper's swapchain: on the game window Windows refuses another process' swapchain once the
     // old helper had one there (0x80070005 for a plain flip swapchain too, AGENT_LOG 166). A child over the client area,
     // click-through like the fallback's. shortcut: it keeps its size if the game window changes size; follow WM_SIZE if a
@@ -1171,6 +1217,7 @@ int fgb_restart(unsigned tech) {
     g_sh->sr_backend = g_sh->fg_backend = 0;
     g_tech = tech; g_sh->tech = tech;
     if (!make_fences(f)) { g_log("frame bridge: switch fences not made - off"); g_live = 0; return -1; }
+    if (!publish_handles(GetCurrentProcessId())) { g_live = 0; release_gpu_waits(); return -1; }
     g_sh->done = f;   // the new helper starts here
     __atomic_store_n(&g_sh->frames, f, __ATOMIC_RELEASE);
     g_reset_next = 1;   // no DLSS / FSR history across the switch
@@ -1192,7 +1239,10 @@ void fgb_stop(void) {
     __atomic_store_n(&g_sh->frames, FGB_QUIT, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);
-    if (g_helper && WaitForSingleObject(g_helper, 5000) == WAIT_TIMEOUT) TerminateProcess(g_helper, 1);   // frozen: not left on the window
+    if (wait_helper_stopped()) {
+        if (g_handle_sidecar) { UnmapViewOfFile(g_handle_sidecar); g_handle_sidecar = NULL; }
+        if (g_handle_map) { CloseHandle(g_handle_map); g_handle_map = NULL; }
+    }
     g_live = 0;
     release_gpu_waits();
 }
