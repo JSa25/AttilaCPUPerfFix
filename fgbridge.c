@@ -357,7 +357,11 @@ static void cleanup_failed_start(void) {
 int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UINT h, DXGI_FORMAT fmt, const wchar_t *helper_exe,
               const wchar_t *sl_dir, const wchar_t *log_dir, uint32_t fg_frames, void (*log)(const char *fmt, ...)) {
     g_log = log;
-    if (g_dev || g_helper) { log("frame bridge: previous bridge resources are still in use - off"); return 0; }
+    if (g_dev || g_helper) {
+        // a failed start keeps its resources for a helper that was stuck: once it has exited, they can go
+        if (g_helper && WaitForSingleObject(g_helper, 0) == WAIT_OBJECT_0) cleanup_failed_start();
+        if (g_dev || g_helper) { log("frame bridge: previous bridge resources are still in use - off"); return 0; }
+    }
     // NVIDIA only (DLSS runs on NVIDIA RTX GPUs): the game's own adapter is checked before anything is made or started, so
     // on an AMD or Intel GPU (or a laptop whose game runs on the integrated GPU) the game runs exactly as without the bridge
     IDXGIDevice *xd = NULL; IDXGIAdapter *ad = NULL; DXGI_ADAPTER_DESC adesc;
@@ -1247,13 +1251,13 @@ int fgb_restart(unsigned tech) {
     g_sh->helper_ok = 0; g_sh->error = 0; g_sh->helper_caps = 0; g_sh->fg_max = 0; g_sh->driver_vsync = 0;
     g_sh->sr_backend = g_sh->fg_backend = 0;
     g_tech = tech; g_sh->tech = tech;
-    if (!make_fences(f)) { g_log("frame bridge: switch fences not made - off"); g_live = 0; return -1; }
-    if (!publish_handles(GetCurrentProcessId())) { g_live = 0; release_gpu_waits(); return -1; }
+    if (!make_fences(f)) { g_log("frame bridge: switch fences not made - off"); g_live = 0; if (g_sw_wnd) { DestroyWindow(g_sw_wnd); g_sw_wnd = NULL; } return -1; }
+    if (!publish_handles(GetCurrentProcessId())) { g_live = 0; release_gpu_waits(); if (g_sw_wnd) { DestroyWindow(g_sw_wnd); g_sw_wnd = NULL; } return -1; }
     g_sh->done = f;   // the new helper starts here
     __atomic_store_n(&g_sh->frames, f, __ATOMIC_RELEASE);
     g_reset_next = 1;   // no DLSS / FSR history across the switch
     if (!wcsstr(g_cmd, L" append")) wcscat(g_cmd, L" append");   // the new helper's log goes on after the old one's
-    if (!launch_helper()) { g_live = 0; release_gpu_waits(); return -1; }
+    if (!launch_helper()) { g_live = 0; release_gpu_waits(); if (g_sw_wnd) { DestroyWindow(g_sw_wnd); g_sw_wnd = NULL; } return -1; }
     HANDLE wd = CreateThread(NULL, 0, watchdog, (void *)(UINT_PTR)g_gen, 0, NULL);
     if (wd) CloseHandle(wd);
     if (g_sh->fg_frames > g_sh->fg_max) g_sh->fg_frames = g_sh->fg_max;
