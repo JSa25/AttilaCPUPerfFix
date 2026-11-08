@@ -15,6 +15,7 @@
 #include <string.h>
 #include <math.h>
 #include "fgb_proto.h"
+#include "fgb_handles.h"
 
 static const GUID iid_dxgi_resource1 = {0x30961379, 0x4609, 0x4a41, {0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1}};
 static const GUID iid_device5 = {0x8ffde202, 0xa0e7, 0x45df, {0x9e, 0x01, 0xe8, 0x37, 0x80, 0x1b, 0x5e, 0xa0}};
@@ -55,8 +56,10 @@ static ID3D11UnorderedAccessView *g_d32_uav, *g_mv_uav;
 static ID3D11ShaderResourceView *g_dcopy_srv;
 static ID3D11ComputeShader *g_cs;
 static ID3D11Buffer *g_cb;
-static HANDLE g_handles[9], g_map, g_wake, g_wake2, g_helper;   // wake: the helper SR thread, wake2: its present thread
+static HANDLE g_handles[9], g_map, g_wake, g_wake2, g_helper, g_job;   // wake: the helper SR thread, wake2: its present thread
 static FgbShared *g_sh;
+static HANDLE g_handle_map;
+static FgbHandles *g_handle_sidecar;
 static HWND g_hwnd;           // the game's window (the helper presents into it)
 static UINT g_w, g_h, g_dw, g_dh;
 static uint32_t g_n;          // the frame being built
@@ -257,6 +260,49 @@ static int amd_files(const wchar_t *helper_exe) {
     return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
 }
 
+// Publish while no helper is running; a restarted helper sees fresh fence handles.
+static int publish_handles(DWORD pid) {
+    if (!g_handle_sidecar) {
+        wchar_t name[64];
+        _snwprintf(name, 64, L"Local\\fgb_%lu_handles", (unsigned long)pid);
+        g_handle_map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(FgbHandles), name);
+        DWORD error = GetLastError();
+        if (!g_handle_map || error == ERROR_ALREADY_EXISTS) {
+            g_log("frame bridge: create handle sidecar failed (%lu) - off", error);
+            if (g_handle_map) { CloseHandle(g_handle_map); g_handle_map = NULL; }
+            return 0;
+        }
+        g_handle_sidecar = MapViewOfFile(g_handle_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(FgbHandles));
+        if (!g_handle_sidecar) {
+            g_log("frame bridge: map handle sidecar failed (%lu) - off", GetLastError());
+            CloseHandle(g_handle_map); g_handle_map = NULL; return 0;
+        }
+    }
+    FgbHandles data = { FGB_HANDLES_VERSION, sizeof(FgbHandles), pid, FGB_HANDLE_COUNT, {0} };
+    for (unsigned i = 0; i < 9; ++i) data.handles[i] = (uint64_t)(uintptr_t)g_handles[i];
+    data.handles[9] = (uint64_t)(uintptr_t)g_react_handle;
+    memcpy(g_handle_sidecar, &data, sizeof data);
+    return 1;
+}
+
+// Source handles may only be replaced once the importing process really exited.
+static int wait_helper_stopped(void) {
+    if (!g_helper) return 1;
+    DWORD wait = WaitForSingleObject(g_helper, 5000);
+    if (wait == WAIT_TIMEOUT) {
+        if (!TerminateProcess(g_helper, 1)) {
+            g_log("frame bridge: terminate helper failed (%lu)", GetLastError()); return 0;
+        }
+        wait = WaitForSingleObject(g_helper, 5000);
+    }
+    if (wait != WAIT_OBJECT_0) {
+        g_log("frame bridge: helper exit not confirmed (%lu), retaining source handles", wait); return 0;
+    }
+    CloseHandle(g_helper); g_helper = NULL;
+    if (g_job) { CloseHandle(g_job); g_job = NULL; }
+    return 1;
+}
+
 // the helper: helper64.exe bridge <pid> <streamline dir> <log dir>, killed with this process (job object); waits up to
 // 10 s for it to be ready (fgb_start, fgb_restart)
 static int launch_helper(void) {
@@ -268,6 +314,7 @@ static int launch_helper(void) {
     PROCESS_INFORMATION pi;
     if (!CreateProcessW(NULL, g_cmd, NULL, NULL, FALSE, CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) { g_log("frame bridge: helper not started (%lu) - off", GetLastError()); CloseHandle(job); return 0; }
     AssignProcessToJobObject(job, pi.hProcess);
+    g_job = job;
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
     g_helper = pi.hProcess;
@@ -278,16 +325,43 @@ static int launch_helper(void) {
         Sleep(1);
     if (!g_sh->helper_ok) {   // a slow start must not leave the helper running with the game's window
         TerminateProcess(g_helper, 1);
-        WaitForSingleObject(g_helper, 1000);
-        g_log("frame bridge: helper did not start Streamline - off (see its log)");
+        wait_helper_stopped();
+        g_log("frame bridge: helper bridge initialization failed - off (see fgbridge_helper.log)");
         return 0;
     }
     return 1;
 }
 
+// Failed startup has submitted no frame work. Do not release shared resources until
+// the helper has exited: it may still be importing their source handles.
+static void cleanup_failed_start(void) {
+    if (!wait_helper_stopped()) return;
+    if (g_handle_sidecar) { UnmapViewOfFile(g_handle_sidecar); g_handle_sidecar = NULL; }
+    if (g_handle_map) { CloseHandle(g_handle_map); g_handle_map = NULL; }
+    if (g_sh) { UnmapViewOfFile(g_sh); g_sh = NULL; }
+    if (g_map) { CloseHandle(g_map); g_map = NULL; }
+    if (g_wake) { CloseHandle(g_wake); g_wake = NULL; }
+    if (g_wake2) { CloseHandle(g_wake2); g_wake2 = NULL; }
+    for (int i = 0; i < 9; i++) if (g_handles[i]) { CloseHandle(g_handles[i]); g_handles[i] = NULL; }
+    if (g_react_handle) { CloseHandle(g_react_handle); g_react_handle = NULL; }
+#define RELEASE_START(x) do { if (x) { IUnknown_Release((IUnknown *)(x)); (x) = NULL; } } while (0)
+    RELEASE_START(g_react_cb); RELEASE_START(g_react_cs); RELEASE_START(g_react_rtv); RELEASE_START(g_react_uav); RELEASE_START(g_react);
+    RELEASE_START(g_fill_cb); RELEASE_START(g_mvobj_srv); RELEASE_START(g_mvcam_srv); RELEASE_START(g_mvobj); RELEASE_START(g_mvcam); RELEASE_START(g_fill_cs);
+    RELEASE_START(g_sharp_cb); RELEASE_START(g_srout_srv[1]); RELEASE_START(g_srout_srv[0]); RELEASE_START(g_sharp_uav); RELEASE_START(g_sharp); RELEASE_START(g_sharp_cs);
+    RELEASE_START(g_cb); RELEASE_START(g_cs); RELEASE_START(g_mv_uav); RELEASE_START(g_d32_uav);
+    RELEASE_START(g_srout[1]); RELEASE_START(g_srout[0]); RELEASE_START(g_mv); RELEASE_START(g_d32); RELEASE_START(g_hud); RELEASE_START(g_final);
+    RELEASE_START(g_fdone); RELEASE_START(g_fsr); RELEASE_START(g_fence); RELEASE_START(g_ctx4); RELEASE_START(g_ctx); RELEASE_START(g_dev);
+#undef RELEASE_START
+}
+
 int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UINT h, DXGI_FORMAT fmt, const wchar_t *helper_exe,
               const wchar_t *sl_dir, const wchar_t *log_dir, uint32_t fg_frames, void (*log)(const char *fmt, ...)) {
     g_log = log;
+    if (g_dev || g_helper) {
+        // a failed start keeps its resources for a helper that was stuck: once it has exited, they can go
+        if (g_helper && WaitForSingleObject(g_helper, 0) == WAIT_OBJECT_0) cleanup_failed_start();
+        if (g_dev || g_helper) { log("frame bridge: previous bridge resources are still in use - off"); return 0; }
+    }
     // NVIDIA only (DLSS runs on NVIDIA RTX GPUs): the game's own adapter is checked before anything is made or started, so
     // on an AMD or Intel GPU (or a laptop whose game runs on the integrated GPU) the game runs exactly as without the bridge
     IDXGIDevice *xd = NULL; IDXGIAdapter *ad = NULL; DXGI_ADAPTER_DESC adesc;
@@ -315,7 +389,7 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     ID3D11DeviceContext_AddRef(ctx);
     ID3D11Device5 *d5 = NULL;
     if (FAILED(ID3D11DeviceContext_QueryInterface(ctx, &iid_context4, (void **)&g_ctx4)) ||
-        FAILED(ID3D11Device_QueryInterface(dev, &iid_device5, (void **)&d5))) { log("frame bridge: no D3D11.4 device - off"); return 0; }
+        FAILED(ID3D11Device_QueryInterface(dev, &iid_device5, (void **)&d5))) { log("frame bridge: no D3D11.4 device - off"); if (d5) ID3D11Device5_Release(d5); goto fail; }
     DWORD pid = GetCurrentProcessId();
     wchar_t n[11][64];
     static const wchar_t *const what[11] = {L"map", L"wake", L"fence", L"fsr", L"fdone", L"final", L"hudless", L"depth", L"mvec",
@@ -331,18 +405,21 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
          (g_srout[0] = shared_tex(w, h, fmt, rw, n[9], &g_handles[7])) && (g_srout[1] = shared_tex(w, h, fmt, rw, n[10], &g_handles[8])) &&
          SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)g_d32, NULL, &g_d32_uav)) &&
          SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)g_mv, NULL, &g_mv_uav));
-    if (!ok) { log("frame bridge: shared fence / textures not created - off"); return 0; }
+    if (!ok) { log("frame bridge: shared fence / textures not created - off"); goto fail; }
     pD3DCompile comp = (pD3DCompile)(void *)GetProcAddress(LoadLibraryExA("d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32), "D3DCompile");
     ID3DBlob *b = NULL, *err = NULL;
     if (!comp || FAILED(comp(cs_src, strlen(cs_src), "fgb", NULL, NULL, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, &err)) ||
         FAILED(ID3D11Device_CreateComputeShader(dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &g_cs))) {
         log("frame bridge: compute shader not built - off");
-        return 0;
+        if (b) ID3D10Blob_Release(b);
+        if (err) ID3D10Blob_Release(err);
+        goto fail;
     }
     ID3D10Blob_Release(b);
+    if (err) ID3D10Blob_Release(err);
     g_rw = w; g_rh = h;
     D3D11_BUFFER_DESC cbd = {144, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
-    if (FAILED(ID3D11Device_CreateBuffer(dev, &cbd, NULL, &g_cb))) return 0;
+    if (FAILED(ID3D11Device_CreateBuffer(dev, &cbd, NULL, &g_cb))) goto fail;
     {   // the sharpening pass: without it the output goes out as DLSS made it
         D3D11_TEXTURE2D_DESC sd = {w, h, 1, 1, fmt, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, 0, 0};
         D3D11_BUFFER_DESC sbd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
@@ -355,7 +432,7 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
                   SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)g_srout[1], NULL, &g_srout_srv[1])) &&
                   SUCCEEDED(ID3D11Device_CreateBuffer(dev, &sbd, NULL, &g_sharp_cb));
         if (sb) ID3D10Blob_Release(sb);
-        if (!sok) { g_sharp_cs = NULL; log("frame bridge: sharpening not available (back buffer format %u)", fmt); }
+        if (!sok) { if (g_sharp_cs) { ID3D11ComputeShader_Release(g_sharp_cs); g_sharp_cs = NULL; } log("frame bridge: sharpening not available (back buffer format %u)", fmt); }
     }
     {   // the hole fill after the per-object pass (fill_src): the two copies of the vectors it reads
         D3D11_TEXTURE2D_DESC md = {w, h, 1, 1, DXGI_FORMAT_R16G16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
@@ -368,7 +445,7 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
                   SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)g_mvobj, NULL, &g_mvobj_srv)) &&
                   SUCCEEDED(ID3D11Device_CreateBuffer(dev, &fbd, NULL, &g_fill_cb));
         if (fb) ID3D10Blob_Release(fb);
-        if (!fok) { g_fill_cs = NULL; log("frame bridge: motion vector hole fill not available"); }
+        if (!fok) { if (g_fill_cs) { ID3D11ComputeShader_Release(g_fill_cs); g_fill_cs = NULL; } log("frame bridge: motion vector hole fill not available"); }
     }
 
     {   // the reactive mask for AMD FSR (react_src): shared as "react"; an older helper does not open it
@@ -383,7 +460,7 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
                   SUCCEEDED(ID3D11Device_CreateComputeShader(dev, ID3D10Blob_GetBufferPointer(rb), ID3D10Blob_GetBufferSize(rb), NULL, &g_react_cs)) &&
                   SUCCEEDED(ID3D11Device_CreateBuffer(dev, &rbd, NULL, &g_react_cb));
         if (rb) ID3D10Blob_Release(rb);
-        if (!rok) { g_react_cs = NULL; log("frame bridge: AMD FSR reactive mask not available"); }
+        if (!rok) { if (g_react_cs) { ID3D11ComputeShader_Release(g_react_cs); g_react_cs = NULL; } log("frame bridge: AMD FSR reactive mask not available"); }
         else { float z[4] = {0}; ID3D11DeviceContext_ClearUnorderedAccessViewFloat(ctx, g_react_uav, z); }
     }
     // each named object must be new: one made first by another process under our name would be read and written by us
@@ -397,8 +474,8 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     _snwprintf(n2, 72, L"%ls2", n[1]);
     g_wake2 = CreateEventW(NULL, FALSE, FALSE, n2);
     taken |= GetLastError() == ERROR_ALREADY_EXISTS;
-    if (taken) { log("frame bridge: a shared object with the bridge's name already exists - off"); return 0; }
-    if (!g_sh || !g_wake || !g_wake2) return 0;
+    if (taken) { log("frame bridge: a shared object with the bridge's name already exists - off"); goto fail; }
+    if (!g_sh || !g_wake || !g_wake2) goto fail;
     memset(g_sh, 0, sizeof *g_sh);
     g_sh->width = w; g_sh->height = h; g_sh->format = fmt; g_sh->hwnd = (uint32_t)(UINT_PTR)hwnd;
     g_hwnd = hwnd;
@@ -409,9 +486,11 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     g_sh->tech = g_tech;
     g_sh->proto = FGB_PROTO;
 
+    if (!publish_handles(pid)) goto fail;
+
     // the helper (launch_helper)
     _snwprintf(g_cmd, sizeof g_cmd / sizeof *g_cmd, L"\"%ls\" bridge %lu \"%ls\" \"%ls\"", helper_exe, (unsigned long)pid, sl_dir, log_dir);
-    if (!launch_helper()) return 0;
+    if (!launch_helper()) goto fail;
     g_live = 1;
     HANDLE wd = CreateThread(NULL, 0, watchdog, (void *)(UINT_PTR)g_gen, 0, NULL);
     if (wd) CloseHandle(wd);
@@ -425,6 +504,9 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     log("frame bridge: upscaling %s, frame generation %s%s", be[fgb_sr_backend() % 3], be[fgb_fg_backend() % 3],
         g_tech && !(g_sh->helper_caps & FGB_CAP_FSR) ? " (the add-on's helper is older and has no AMD FSR)" : "");
     return 1;
+fail:
+    cleanup_failed_start();
+    return 0;
 }
 
 void fgb_set_fg(uint32_t frames_to_generate) { if (g_sh) g_sh->fg_frames = frames_to_generate > g_sh->fg_max ? g_sh->fg_max : frames_to_generate; }
@@ -1149,8 +1231,7 @@ int fgb_restart(unsigned tech) {
     __atomic_store_n(&g_sh->frames, FGB_QUIT, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);
-    if (WaitForSingleObject(g_helper, 5000) == WAIT_TIMEOUT) TerminateProcess(g_helper, 1);
-    CloseHandle(g_helper);
+    if (!wait_helper_stopped()) { g_live = 0; release_gpu_waits(); return -1; }
     // a fresh window for the new helper's swapchain: on the game window Windows refuses another process' swapchain once the
     // old helper had one there (0x80070005 for a plain flip swapchain too, AGENT_LOG 166). A child over the client area,
     // click-through like the fallback's. shortcut: it keeps its size if the game window changes size; follow WM_SIZE if a
@@ -1170,12 +1251,13 @@ int fgb_restart(unsigned tech) {
     g_sh->helper_ok = 0; g_sh->error = 0; g_sh->helper_caps = 0; g_sh->fg_max = 0; g_sh->driver_vsync = 0;
     g_sh->sr_backend = g_sh->fg_backend = 0;
     g_tech = tech; g_sh->tech = tech;
-    if (!make_fences(f)) { g_log("frame bridge: switch fences not made - off"); g_live = 0; return -1; }
+    if (!make_fences(f)) { g_log("frame bridge: switch fences not made - off"); g_live = 0; if (g_sw_wnd) { DestroyWindow(g_sw_wnd); g_sw_wnd = NULL; } return -1; }
+    if (!publish_handles(GetCurrentProcessId())) { g_live = 0; release_gpu_waits(); if (g_sw_wnd) { DestroyWindow(g_sw_wnd); g_sw_wnd = NULL; } return -1; }
     g_sh->done = f;   // the new helper starts here
     __atomic_store_n(&g_sh->frames, f, __ATOMIC_RELEASE);
     g_reset_next = 1;   // no DLSS / FSR history across the switch
     if (!wcsstr(g_cmd, L" append")) wcscat(g_cmd, L" append");   // the new helper's log goes on after the old one's
-    if (!launch_helper()) { g_live = 0; release_gpu_waits(); return -1; }
+    if (!launch_helper()) { g_live = 0; release_gpu_waits(); if (g_sw_wnd) { DestroyWindow(g_sw_wnd); g_sw_wnd = NULL; } return -1; }
     HANDLE wd = CreateThread(NULL, 0, watchdog, (void *)(UINT_PTR)g_gen, 0, NULL);
     if (wd) CloseHandle(wd);
     if (g_sh->fg_frames > g_sh->fg_max) g_sh->fg_frames = g_sh->fg_max;
@@ -1192,7 +1274,10 @@ void fgb_stop(void) {
     __atomic_store_n(&g_sh->frames, FGB_QUIT, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);
-    if (g_helper && WaitForSingleObject(g_helper, 5000) == WAIT_TIMEOUT) TerminateProcess(g_helper, 1);   // frozen: not left on the window
+    if (wait_helper_stopped()) {
+        if (g_handle_sidecar) { UnmapViewOfFile(g_handle_sidecar); g_handle_sidecar = NULL; }
+        if (g_handle_map) { CloseHandle(g_handle_map); g_handle_map = NULL; }
+    }
     g_live = 0;
     release_gpu_waits();
 }
