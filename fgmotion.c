@@ -844,3 +844,16 @@ int fgm_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *mv, U
 }
 
 int fgm_active(void) { return m_on; }
+
+// The bridge is off for the session: the pass stops, and its views and copies go so the video memory is freed (its
+// render target view holds the bridge's shared motion-vector texture). Round 2 R1.
+void fgm_release(void) {
+    if (!m_dev) return;
+    m_on = 0;
+    m_enabled = 0;
+    if (m_mv_rtv) { ID3D11RenderTargetView_Release(m_mv_rtv); m_mv_rtv = NULL; }
+    if (m_dsv) { ID3D11DepthStencilView_Release(m_dsv); m_dsv = NULL; }
+    m_depth = NULL;
+    if (m_prev_anim_srv) { ID3D11ShaderResourceView_Release(m_prev_anim_srv); m_prev_anim_srv = NULL; }
+    if (m_prev_anim) { ID3D11Texture2D_Release(m_prev_anim); m_prev_anim = NULL; }
+}

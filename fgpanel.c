@@ -328,7 +328,7 @@ static void redraw(void) {
     // Default: NVIDIA's documented preset for the mode (Streamline 2.14.16 reports none in use, and the NVIDIA app's override
     // can change it): DLAA / Quality / Balanced K, Performance M, Ultra Performance L
     if (SR_AMD) _snwprintf(cap[4], 64, L"NVIDIA DLSS only");
-    else if (!p_presets_ok) _snwprintf(cap[4], 64, L"Update the DLSS add-on for this");
+    else if (!p_presets_ok) _snwprintf(cap[4], 64, p_note ? L"The add-on is not running" : L"Update the DLSS add-on for this");   // p_note: it did not start or is off
     else if (!p_sr) _snwprintf(cap[4], 64, L"Needs Super Resolution or DLAA");
     else if (!p_preset) _snwprintf(cap[4], 64, L"NVIDIA's pick here: %lc", L"-KKKML"[p_sr < 6 ? p_sr : 0]);
     else _snwprintf(cap[4], 64, L"%ls", preset_caps[p_preset]);
@@ -336,7 +336,7 @@ static void redraw(void) {
     else _snwprintf(cap[5], 64, !p_sr ? L"Needs Super Resolution or DLAA" : p_sharp ? L"Crisper DLSS output" : L"DLSS output as it is");
     _snwprintf(cap[6], 64, L"Test build only, not saved");
     _snwprintf(cap[7], 64, p_vsync_driver == 2 ? L"Forced On in NVIDIA's settings" : p_vsync_driver == 3 ? L"Forced Off in NVIDIA's settings"
-               : p_vsync_driver == 4 ? L"Fast Sync in NVIDIA's settings" : !p_vsync_ok ? L"Update the DLSS add-on for this"
+               : p_vsync_driver == 4 ? L"Fast Sync in NVIDIA's settings" : !p_vsync_ok ? (p_note ? L"The add-on is not running" : L"Update the DLSS add-on for this")
                : p_vsync ? L"No tearing, up to the screen's rate"
                                                                                      : L"No cap, the picture may tear");
     static const wchar_t *const label[11] = {L"Super Resolution", L"Frame Generation", L"Motion Vectors", L"Frame Cap", L"DLSS Preset",

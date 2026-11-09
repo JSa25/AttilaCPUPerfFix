@@ -197,6 +197,34 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 7.0:
+-Plugins: other mods' DLLs load from a plugins folder in the game folder, under
+ any name (for example plugins\smoke.dll), so a mod no longer has to take a DLL
+ name such as xinput1_3.dll that another mod already uses. heapfix.log lists
+ each one. To switch them off: plugins=0 in heapfix.ini.
+-Lua scripts: .lua files in a lua_ext folder in the game folder run in every
+ script environment the game opens, and Ctrl+` opens a Lua console window
+ (ext_print and errors also go to lua_ext\lua_ext.log). Nothing runs without
+ the folder.
+-Crash reports: when the game crashes, a small crash dump
+ (crash_<date>_<time>.dmp) is saved in the game folder - please attach it to a
+ crash report. heapfix.log also notes how long the game ran, which mods were
+ on, and where the game was stuck when it froze for 20 seconds.
+-heapfix.log starts with your graphics card, driver, display, memory and free
+ space on the game drive, and warns when the game is running out of memory
+ address space.
+-Frame-time log: create an empty fps_on.txt in the game folder before starting
+ the game, and fps_log.csv records FPS, 1% low and the slowest frame for every
+ second, plus a summary (delete fps_on.txt to stop).
+-Smoother on CPUs with few cores: threads waiting for the memory pools give
+ the CPU back instead of spinning. heapfix.ini [tuning] pool_lock=srw is an
+ alternative to try if the game stutters on an Intel CPU with efficiency cores.
+-With the Upscaling and Framegen add-on: switching technology with F8 works
+ even when the add-on's helper has stopped responding, and the add-on frees
+ its video memory when it turns off. Its helper may take up to 30 seconds to
+ start (slow laptops needed more than the old 10).
+-GOG version: two add-on addresses corrected.
+
 Version 6.10.6:
 -heapfix.log notes when Mat's Attila Stability Fix is installed, with its
  version and settings.

@@ -1859,10 +1859,16 @@ static FORCEINLINE void x86_clear_lock(int* sl) {
 #endif /* ... gcc spins locks ... */
 
 /* How to yield for a spin lock */
+#ifndef SPINS_PER_YIELD   /* heapfix: settable (pools.c), a mask: yield every SPINS_PER_YIELD + 1 spins */
 #define SPINS_PER_YIELD       63
+#endif
 #if defined(_MSC_VER)
 #define SLEEP_EX_DURATION     50 /* delay for yield/sleep */
 #define SPIN_LOCK_YIELD  SleepEx(SLEEP_EX_DURATION, FALSE)
+#elif defined(WIN32) && !defined(POOLS_NOYIELD)
+/* heapfix (AGENT_LOG 219): clang / mingw is not _MSC_VER and WIN32 sets LACKS_SCHED_H, so the yield below was empty
+   and waiting threads spun through whole time slices. Give the core away like the game's own heap lock does. */
+#define SPIN_LOCK_YIELD  SleepEx(0, FALSE)
 #elif defined (__SVR4) && defined (__sun) /* solaris */
 #define SPIN_LOCK_YIELD   thr_yield();
 #elif !defined(LACKS_SCHED_H)
@@ -1876,6 +1882,9 @@ static FORCEINLINE void x86_clear_lock(int* sl) {
 static int spin_acquire_lock(int *sl) {
   int spins = 0;
   while (*(volatile int *)sl != 0 || CAS_LOCK(sl)) {
+#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)) && !defined(POOLS_NOYIELD)
+    __builtin_ia32_pause();   /* heapfix: tells the CPU this is a spin (frees the SMT sibling, saves power) */
+#endif
     if ((++spins & SPINS_PER_YIELD) == 0) {
       SPIN_LOCK_YIELD;
     }

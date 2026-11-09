@@ -40,12 +40,15 @@ typedef char(__thiscall *vbool_fn)(void *);
 static unsigned hq_state(void *terrain) {
     unsigned char *b = g_hq_base;
     unsigned char early = AT(b + game_rva(b, 0x2A78008), 0x48, unsigned char);  // FUN_100c0130(0x12A78008)
+    // the original returns 0 at once when this is set, before it reads anything else: let it (review E3)
+    if (early) return 0;
     void *td = AT(terrain, 0x794, void *);
     if (!td) return 1;
     void *mode_obj = AT(td, 0x18, void *);                          // FUN_10161660(td)
     unsigned char mode = mode_obj ? AT(mode_obj, 0x7C, unsigned char) : 0xEE;  // FUN_1059d310
     unsigned ydiv = AT(b + game_rva(b, 0x2A77BF8), 0x48, unsigned);              // FUN_100c0100(0x12A77BF8)
     void *game = AT(b + game_rva(b, 0x2A21D18), 0, void *);                      // DAT_12a21d18
+    if (!game) return 0;   // not set up (or torn down): the original decides, uncached
     char sw = ((vbool_fn)(*(void ***)game)[0x2C4 / 4])(game);
     void *water = AT(terrain, 0x128, void *);
     if (sw && water) return 0;

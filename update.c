@@ -40,6 +40,28 @@ static int file_version(const wchar_t *path) {
     return v;
 }
 
+// 1 if the file is at least as long as its own PE header says (the end of its last section): a Workshop download Steam
+// has not finished passes the version marker, which sits early in the file (review E4, AGENT_LOG 219)
+static int pe_complete(const wchar_t *path) {
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    static unsigned char h[4096];
+    DWORD n = 0, size = GetFileSize(f, NULL);
+    BOOL ok = ReadFile(f, h, sizeof h, &n, NULL);
+    CloseHandle(f);
+    if (!ok || n < 0x40 || h[0] != 'M' || h[1] != 'Z') return 0;
+    DWORD pe = *(DWORD *)(h + 0x3C);
+    if (pe > n - sizeof(IMAGE_NT_HEADERS32)) return 0;
+    IMAGE_NT_HEADERS32 *nt = (IMAGE_NT_HEADERS32 *)(h + pe);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    DWORD end = 0;
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if ((unsigned char *)(sec + i + 1) > h + n) return 0;
+        if (sec[i].PointerToRawData + sec[i].SizeOfRawData > end) end = sec[i].PointerToRawData + sec[i].SizeOfRawData;
+    }
+    return end && size != INVALID_FILE_SIZE && size >= end;
+}
+
 // self = this DLL's path, ws = the Workshop copy. Returns 1 if the game folder now holds the newer version.
 int update_from(const wchar_t *self, const wchar_t *ws, int mine, void (*log)(const char *fmt, ...)) {
     wchar_t old_[MAX_PATH], new_[MAX_PATH];
@@ -50,7 +72,11 @@ int update_from(const wchar_t *self, const wchar_t *ws, int mine, void (*log)(co
     if (GetFileAttributesW(ws) == INVALID_FILE_ATTRIBUTES) return 0;  // not subscribed on the Workshop
     int theirs = file_version(ws);
     if (theirs <= mine) return 0;
-    if (!CopyFileW(ws, new_, FALSE) || file_version(new_) != theirs) {
+    if (!pe_complete(ws)) {
+        log("update: the Workshop has version %d, but its file is not complete yet (Steam still downloading?) - next start", theirs);
+        return 0;
+    }
+    if (!CopyFileW(ws, new_, FALSE) || file_version(new_) != theirs || !pe_complete(new_)) {
         log("update: the Workshop has version %d, but copying it failed (error %lu) - run install.bat in the Workshop "
             "folder to update", theirs, GetLastError());
         DeleteFileW(new_);

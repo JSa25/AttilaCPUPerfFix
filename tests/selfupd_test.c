@@ -18,18 +18,30 @@ static void say(const char *fmt, ...) {
 
 static wchar_t g_dir[MAX_PATH], g_self[MAX_PATH], g_ws[MAX_PATH];
 
-// A minimal fake DLL: "MZ", padding, then the version marker (0 = none), or `body` alone if given.
-static void make(const wchar_t *path, int version, const char *body) {
+// A minimal fake DLL: "MZ" and a PE header with one section that ends at 0x400 (or past the file's end with `cut`, a
+// download Steam has not finished), then the version marker (0 = none); or `body` alone if given.
+static void make_(const wchar_t *path, int version, const char *body, int cut) {
     FILE *f = _wfopen(path, L"wb");
     if (body) {
         fputs(body, f);
     } else {
-        static char pad[0x400] = "MZ";
+        static char pad[0x400];
+        memset(pad, 0, sizeof pad);
+        pad[0] = 'M'; pad[1] = 'Z';
+        *(DWORD *)(pad + 0x3C) = 0x80;
+        IMAGE_NT_HEADERS32 *nt = (IMAGE_NT_HEADERS32 *)(pad + 0x80);
+        nt->Signature = IMAGE_NT_SIGNATURE;
+        nt->FileHeader.NumberOfSections = 1;
+        nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER32);
+        IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+        sec->PointerToRawData = 0x200;
+        sec->SizeOfRawData = cut ? 0x10000 : 0x200;
         fwrite(pad, 1, sizeof pad, f);
         if (version) fprintf(f, "AttilaCPUPerfFix-version:%d", version);
     }
     fclose(f);
 }
+static void make(const wchar_t *path, int version, const char *body) { make_(path, version, body, 0); }
 
 static int exists(const wchar_t *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
 
@@ -65,6 +77,10 @@ int main(void) {
     make(g_ws, 0, "AttilaCPUPerfFix-version:9 but not a PE file");
     CHECK(update_from(g_self, g_ws, 4, say) == 0);   // not a DLL
     CHECK(g_logged == 0 && file_version(g_self) == 4);
+    make_(g_ws, 5, NULL, 1);
+    CHECK(update_from(g_self, g_ws, 4, say) == 0);   // newer but cut short: left for the next start
+    CHECK(g_logged == 1 && strstr(g_last, "not complete yet") && file_version(g_self) == 4);
+    g_logged = 0;
 
     make(g_ws, 5, NULL);
     CHECK(update_from(g_self, g_ws, 4, say) == 1);   // newer: installed while the old file is in use

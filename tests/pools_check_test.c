@@ -19,6 +19,15 @@ int main(int argc, char **argv) {
     signal(SIGABRT, caught);
     AddVectoredExceptionHandler(1, fault);
     if (!pools_init()) return 1;
+    if (argc > 1 && !strcmp(argv[1], "uaf")) {   // a use-after-free write of a valid pool pointer into a cached block
+        void *a = pool_alloc(32), *b = pool_alloc(32), *live = pool_alloc(32);
+        pool_free(b);
+        pool_free(a);               // cache: a -> b
+        *(void **)a = live;         // the game writes a live block's address into freed a
+        void *x = pool_alloc(32), *y = pool_alloc(32);
+        printf("uaf: first %s, second %s\n", x == a ? "a" : "?", y == live ? "THE LIVE BLOCK (corruption)" : "not the live block");
+        return x == a && y != live ? 0 : 5;   // 0 = handled
+    }
     if (argc > 1 && !strcmp(argv[1], "double")) {
         void *p = pool_alloc(4000);
         pool_free(p);

@@ -18,7 +18,50 @@ static long fsize(void) {
     return n;
 }
 
+// two writers on one log, as diag.c's and heapfix.c's copies of log_append (two handles): no line may be lost
+static wchar_t g_race[MAX_PATH];
+static DWORD WINAPI race_a(void *x) {
+    (void)x;
+    char line[64];
+    for (int i = 0; i < 5000; i++) { int n = snprintf(line, sizeof line, "A %05d the quick brown fox\r\n", i); log_append(g_race, line, n); }
+    return 0;
+}
+static DWORD WINAPI race_b(void *x) {
+    (void)x;
+    HANDLE h = CreateFileW(g_race, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, 0, NULL);
+    char line[64];
+    DWORD w;
+    for (int i = 0; i < 5000; i++) { int n = snprintf(line, sizeof line, "B %05d jumps over the lazy dog\r\n", i); WriteFile(h, line, n, &w, NULL); }
+    CloseHandle(h);
+    return 0;
+}
+
 int main(void) {
+    {   // log_append: concurrent appends keep every line
+        GetTempPathW(MAX_PATH, g_race);
+        wcscat(g_race, L"logappend_race.log");
+        DeleteFileW(g_race);
+        HANDLE t[2] = {CreateThread(NULL, 0, race_a, NULL, 0, NULL), CreateThread(NULL, 0, race_b, NULL, 0, NULL)};
+        WaitForMultipleObjects(2, t, TRUE, INFINITE);
+        CloseHandle(t[0]); CloseHandle(t[1]);
+        CloseHandle(log_append_h); log_append_h = NULL;
+        FILE *f = _wfopen(g_race, L"rb");
+        static char buf[1 << 20];
+        size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        int a = 0, b = 0;
+        for (char *q = buf; *q;) {
+            if (q[0] == 'A' && q[1] == ' ') a++;
+            if (q[0] == 'B' && q[1] == ' ') b++;
+            char *e = strstr(q, "\r\n");
+            if (!e) break;
+            q = e + 2;
+        }
+        printf("log_append race: %d of 5000 A lines, %d of 5000 B lines\n", a, b);
+        CHECK(a == 5000 && b == 5000);
+        DeleteFileW(g_race);
+    }
     GetTempPathW(MAX_PATH, g_log_path);
     wcscat(g_log_path, L"logtrim_test.log");
     // 1) many sessions, 2.4 MB: trimmed to the newest sessions

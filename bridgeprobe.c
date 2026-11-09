@@ -56,6 +56,9 @@ int rsl_attach(HMODULE self, HMODULE reshade, void (*log)(const char *, ...), in
 int rsl_effects(ID3D11DeviceContext *ctx, ID3D11Resource *bb, ID3D11Resource *depth);
 void rsl_camera(const float vp[16]);
 void fgp_set_note(const wchar_t *note);   // fgpanel.c
+// weak: the offline tests that include this file stub the bridge without them
+void fgb_release_gpu(void) __attribute__((weak));
+void fgm_release(void) __attribute__((weak));
 int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh);
 IDXGISwapChain *fgb_fallback_sc(void);
 const wchar_t *fgb_gpu_name(void);
@@ -507,6 +510,7 @@ static void bridge_off(void) {
         fgm_set_enabled(0);
         fgm_frame_end();
         g_motion = 0;
+        if (fgm_release) fgm_release();   // its view of the bridge's motion-vector texture and its own copies (round 2 R1)
     }
 }
 
@@ -572,7 +576,7 @@ static void fallback_panel(ID3D11Resource *bb) {
         fgp_set_note(g_off_note);
         if (pdev) ID3D11Device_Release(pdev);
         pdev = d;   // GetDevice's reference
-        g_log("F11 panel: %s over the frames the mod shows (DLSS off until the game restarts)", ok ? "available" : "NOT available");
+        g_log("settings panel: %s over the frames the mod shows (DLSS off until the game restarts)", ok ? "available" : "NOT available");
     } else
         ID3D11Device_Release(d);
     if (ok) fgp_frame(bb, g_out_hwnd);
@@ -1852,7 +1856,7 @@ static int settings_value(const char *text, const char *key, const char *const *
 static void panel_sr(int mode) {
     static const char *const names[6] = {"off", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"};
     sr_set(mode);
-    g_log("F11 panel: super resolution %s, render %ux%u", names[mode >= 0 && mode < 6 ? mode : 0], g_rw, g_rh);
+    g_log("settings panel: super resolution %s, render %ux%u", names[mode >= 0 && mode < 6 ? mode : 0], g_rw, g_rh);
     settings_save();
 }
 // The frame cap on rendered frames, through NVIDIA Reflex's limiter in the helper (from Rome 2's add-on). Auto (the
@@ -1891,38 +1895,38 @@ static void panel_cap(int choice) {
 static void panel_fg(int n) {
     g_fg = (unsigned)n;
     fgb_set_fg((unsigned)n);
-    g_log("F11 panel: frame generation %s", n ? (n == 1 ? "2x" : n == 2 ? "3x" : "4x") : "off");
+    g_log("settings panel: frame generation %s", n ? (n == 1 ? "2x" : n == 2 ? "3x" : "4x") : "off");
     cap_apply();   // Auto and the fixed caps depend on the frames shown per rendered frame
     settings_save();
 }
 static void panel_motion(int on) {
     g_motion_on = on;
     if (g_motion) fgm_set_enabled(on);
-    g_log("F11 panel: per-object motion %s", on ? "on" : "off");
+    g_log("settings panel: per-object motion %s", on ? "on" : "off");
     settings_save();
 }
 #define PANEL_VIEW NULL
 static void panel_preset(int choice) {
     g_preset = choice >= 0 && choice < 5 ? choice : 0;
     fgb_set_preset(PRESET_NGX[g_preset]);
-    g_log("F11 panel: DLSS preset %s", PRESET_KEYS[g_preset]);
+    g_log("settings panel: DLSS preset %s", PRESET_KEYS[g_preset]);
     settings_save();
 }
 static void panel_sharp(int choice) {
     g_sharp = choice >= 0 && choice < 4 ? choice : 2;
     fgb_set_sharpness(SHARP_CON[g_sharp]);
-    g_log("F11 panel: sharpness %s", SHARP_KEYS[g_sharp]);
+    g_log("settings panel: sharpness %s", SHARP_KEYS[g_sharp]);
     settings_save();
 }
 static void panel_fps(int corner) {
     g_fpsc = corner >= 0 && corner < 5 ? corner : 0;
-    g_log("F11 panel: frame-rate counter %s", FPSC_KEYS[g_fpsc]);
+    g_log("settings panel: frame-rate counter %s", FPSC_KEYS[g_fpsc]);
     settings_save();
 }
 static void tech_set(int t) {   // 0 auto, 1 fsr, 2 dlss, 3 mixed (the sweep restores auto with it)
     g_tech = t;
     g_switch = fgb_can_restart();   // a helper that can be replaced: now (AGENT_LOG 166); otherwise the pick applies at the next start
-    g_log("F11 panel: technology %s (%s)", TECH_KEYS[g_tech], g_switch ? "switching now" : "from the next game start");
+    g_log("settings panel: technology %s (%s)", TECH_KEYS[g_tech], g_switch ? "switching now" : "from the next game start");
     settings_save();
 }
 static void panel_tech(int sr, int fg) { tech_set(sr ? 1 : fg ? 3 : 2); }
@@ -1950,7 +1954,7 @@ static void switch_now(void) {
 static void panel_vsync(int on) {
     g_vsync = on != 0;
     fgb_set_vsync(g_vsync);
-    g_log("F11 panel: V-Sync %s", VSYNC_KEYS[g_vsync]);
+    g_log("settings panel: V-Sync %s", VSYNC_KEYS[g_vsync]);
     settings_save();
 }
 
@@ -2003,7 +2007,7 @@ static void start_failed_panel(IDXGISwapChain *sc) {
         }
         if (ok) fgp_set_note(d12 ? L"The upscaling add-on did not start - see heapfix.log in the game folder. Choices made here are saved." : gpu_note);
         else { if (c) ID3D11DeviceContext_Release(c); if (d) ID3D11Device_Release(d); }
-        g_log("F11 panel: %s over the game's frames (the add-on did not start)", ok ? "available" : "NOT available");
+        g_log("settings panel: %s over the game's frames (the add-on did not start)", ok ? "available" : "NOT available");
     }
     if (ok) {
         static LARGE_INTEGER t0, qf;   // the FPS counter: the game's own frames (all of them are shown)
@@ -2106,7 +2110,11 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
         g_live_state = g_ctx && (hid = hidden_window(g_live_w, g_live_h)) &&
                                fgb_start(g_dev, g_ctx, d->OutputWindow, g_live_w, g_live_h, d->BufferDesc.Format, g_helper, g_sl, g_logdir, g_fg, g_log)
                            ? 1 : 2;
-        if (g_live_state != 1) { g_motion = 0; g_start_failed = 1; }   // bridge off: no per-stage draw hooks either
+        if (g_live_state != 1) {   // bridge off: no per-stage draw hooks either, and its textures go (round 2 R2)
+            g_motion = 0; g_start_failed = 1;
+            if (fgm_release) fgm_release();
+            if (fgb_release_gpu) fgb_release_gpu();
+        }
         if (g_live_state == 1) {
             dd.OutputWindow = hid; dd.BufferDesc.Width = g_live_w; dd.BufferDesc.Height = g_live_h;
             if (!dd.Windowed) {   // see w_setfs: exclusive fullscreen on the hidden window would cover the screen
@@ -2130,7 +2138,7 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             fgb_set_vsync(g_vsync);
             if (!g_vsync && !fgb_helper_has_vsync()) g_log("DLSS add-on: V-Sync off needs add-on version 7 - its helper keeps V-Sync on");
             if (fgb_driver_vsync() >= 2)   // the driver's choice wins over the panel's (AGENT_LOG 157)
-                g_log("DLSS add-on: V-Sync is %s in NVIDIA's settings (Control Panel / app, global profile) - the F11 V-Sync choice has no effect",
+                g_log("DLSS add-on: V-Sync is %s in NVIDIA's settings (Control Panel / app, global profile) - the panel's V-Sync choice has no effect",
                       fgb_driver_vsync() == 2 ? "forced on" : fgb_driver_vsync() == 3 ? "forced off" : "Fast Sync");
             if (!fgb_helper_has_presets())   // the engine fix updated, the add-on not (or a hand install of an older one)
                 g_log("DLSS add-on: its helper is older than this engine fix (add-on version 4 or older) - the DLSS preset choice "
@@ -2160,7 +2168,7 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
                 } else g_motion = 0;
             }
             if (!panel_setup(g_dev, g_ctx, g_live_w, g_live_h, d->BufferDesc.Format, g_motion ? g_motion_on : no_fg ? -2 : -1))
-                g_log("frame bridge: F11 panel not available (back buffer format %u)", d->BufferDesc.Format);
+                g_log("frame bridge: settings panel not available (back buffer format %u)", d->BufferDesc.Format);
         }
         else if (hid) DestroyWindow(hid);
     }
@@ -2361,6 +2369,7 @@ void *__cdecl fgb_d3d11_original(unsigned slot) {
     return owner == d3d ? fn : NULL;
 }
 
+int bp_bridge_running(void) { return g_live && g_live_state == 1; }   // heapfix.c: how often to report
 static void bp_report(void (*log)(const char *fmt, ...)) {
     log("bridge probe: %u presents (%u not on the main thread), sync interval 0/1/2/3/more: %u/%u/%u/%u/%u, captures %d%s",
         g_presents, g_present_other_thread, g_sync[0], g_sync[1], g_sync[2], g_sync[3], g_sync[4], g_captures,
@@ -2394,8 +2403,9 @@ static void bp_report(void (*log)(const char *fmt, ...)) {
         static unsigned sharp0;
         unsigned sh = fgb_sharp_frames();
         log("  sharpness %s: %u frames sharpened; DLSS preset %s%s; V-Sync %s%s", SHARP_KEYS[g_sharp], sh - sharp0, PRESET_KEYS[g_preset],
-            fgb_helper_has_presets() ? "" : " (the add-on's helper is too old to apply it)", VSYNC_KEYS[g_vsync],
-            g_vsync || fgb_helper_has_vsync() ? "" : " (the add-on's helper keeps it on)");
+            // "too old" only for a helper that runs without the feature; one that never started is said so (improvement)
+            g_live_state != 1 ? " (the add-on is not running)" : fgb_helper_has_presets() ? "" : " (the add-on's helper is too old to apply it)",
+            VSYNC_KEYS[g_vsync], g_vsync || g_live_state != 1 || fgb_helper_has_vsync() ? "" : " (the add-on's helper keeps it on)");
         sharp0 = sh;
     }
     if (g_live_state == 1) {
@@ -2613,7 +2623,7 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         g_motion = g_live;   // set up whenever the bridge runs, so the F11 panel can switch it on
         log("frame bridge %s: helper %s, Streamline %s, frame generation %ux, DLSS %s", g_live ? "armed" : "NOT armed (bad fgbridge_on.txt)",
             l[0], l[1], g_fg + 1, (const char *[]){"off", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"}[g_sr]);
-        log("  per-object motion vectors: %s (F11 panel switches it)", g_motion_on ? "on" : "off");
+        log("  per-object motion vectors: %s (the settings panel switches it)", g_motion_on ? "on" : "off");
         if (g_live) g_dev_di8_created = fgp_di8_created;   // the panel hides the game's mouse buttons while the cursor is over it
     }
     if (g_live && cam_hook(m, log)) log("frame bridge: camera read through a jump hook on FUN_1177bb10");

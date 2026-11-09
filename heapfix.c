@@ -22,17 +22,18 @@
 static wchar_t g_log_path[MAX_PATH];
 
 static void wlog(const char *fmt, ...) {
-    FILE *f = _wfopen(g_log_path, L"a");
-    if (!f) return;
+    if (!g_log_path[0]) return;
+    char buf[4096];
     SYSTEMTIME t;
     GetLocalTime(&t);
-    fprintf(f, "[%02d:%02d:%02d.%03d] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    int n = snprintf(buf, sizeof buf, "[%02d:%02d:%02d.%03d] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
     va_list a;
     va_start(a, fmt);
-    vfprintf(f, fmt, a);
+    int m = vsnprintf(buf + n, sizeof buf - n - 2, fmt, a);
     va_end(a);
-    fputc('\n', f);
-    fclose(f);
+    n += m < 0 ? 0 : m < (int)sizeof buf - n - 2 ? m : (int)sizeof buf - n - 3;   // a longer line is cut
+    buf[n++] = '\r'; buf[n++] = '\n';   // as the text-mode file had it
+    log_append(g_log_path, buf, n);     // logtrim.h: one atomic append, no file open per line (round 2)
 }
 
 
@@ -317,6 +318,10 @@ int install_fileio(HMODULE m, void (*log)(const char *fmt, ...));     // fileio.
 int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...));  // attrcache.c
 int install_texfix(HMODULE m, int verify, void (*log)(const char *fmt, ...));    // texfix.c
 int install_uikeep(HMODULE m, void (*log)(const char *fmt, ...));                // uikeep.c
+int install_memwatch(HMODULE m, void (*trim)(void), void (*log)(const char *fmt, ...));   // memwatch.c
+static void trim_all(void) { hf_trim(0); }   // memwatch: give spare memory back before retrying a failed file map
+int install_scriptext(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...));  // scriptext.c
+void scriptext_frame(void);                                                      // scriptext.c
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...));  // diag.c
 void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
 extern unsigned g_uikeep_keep;                                       // uikeep.c: closed menus kept (heapfix.ini)
@@ -331,22 +336,26 @@ extern int g_pt_force_bridge;                                                   
 volatile LONG g_geo_frame;
 static int g_passtime_on;
 
-static int g_campfix_on, g_x87fix_on;
+static int g_campfix_on, g_x87fix_on, g_scriptext_on;
 
 // Per-frame checks on the main thread (called from the frame hook in fps.c).
 static void frame_checks(void) {
     if (g_campfix_on) campfix_frame();
     if (g_x87fix_on) x87fix_frame();
+    if (g_scriptext_on) scriptext_frame();
     if (g_passtime_on)   // release: the frame bridge's frame counter
     {
         g_geo_frame++;
         if (g_gt_frame) g_gt_frame();  // gputime.c: close the GPU frame, open the next
     }
     if (g_passtime_on) {  // the game exits without DLL_PROCESS_DETACH: report every 30 s
+        // while the add-on runs; every 5 min when it is off or never started - its numbers do not change then, and the
+        // same block every 30 s filled players' logs (improvement, AGENT_LOG 220)
+        extern int bp_bridge_running(void) __attribute__((weak));
         static DWORD last;
         DWORD now = GetTickCount();
         if (!last) last = now;
-        if (now - last >= 30000) {
+        if (now - last >= (!bp_bridge_running || bp_bridge_running() ? 30000u : 300000u)) {
             passtime_report(wlog);
             last = now;
         }
@@ -396,12 +405,17 @@ static const char INI_DEFAULTS[] =
     "self_update=1\r\n"
     "; record crashes in heapfix.log (EXCEPTION lines)\r\n"
     "crash_logging=1\r\n"
+    "; load other mods' DLLs from the plugins folder in the game folder (any name, e.g. plugins\\smoke.dll)\r\n"
+    "plugins=1\r\n"
     "\r\n"
     "[tuning]\r\n"
     "; how many closed menus keep their textures (1-1024; fewer uses less memory)\r\n"
     "menu_textures_kept=1024\r\n"
+    "; the memory pools' lock: yield (default) or srw (Windows' SRW lock: try it if the game stutters on an Intel CPU\r\n"
+    "; with efficiency cores)\r\n"
+    "pool_lock=yield\r\n"
     "\r\n"
-    "; The DLSS add-on has its own settings: FrameBridge\\settings.txt (F11 in game).\r\n";
+    "; The DLSS add-on has its own settings: FrameBridge\\settings.txt (F8 in game).\r\n";
 static void ini_create(void) {
     if (!g_ini[0]) return;
     HANDLE f = CreateFileW(g_ini, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);  // only when missing
@@ -473,6 +487,7 @@ static void log_status(const int st[S_N]) {
 }
 
 // Everything that patches the game, run once empire.retail.dll is in memory and before its own startup code.
+static int g_late_install;   // install_all runs from the DLL load notification (on_dll_loaded), not from DllMain
 static void install_all(HMODULE m) {
     static int done;
     if (done) return;
@@ -490,6 +505,14 @@ static void install_all(HMODULE m) {
     wchar_t *sl = wcsrchr(off, L'\\');
     // Switching the heap or the pool lookup off tells whether a crash depends on them. This runs before the game's
     // first allocation, so leaving the heap alone is always safe.
+    {   // the pools' lock, before they start (pools.c, AGENT_LOG 220)
+        wchar_t v[16] = L"";
+        if (g_ini[0]) GetPrivateProfileStringW(L"tuning", L"pool_lock", L"yield", v, 16, g_ini);
+        int srw = !_wcsicmp(v, L"srw");
+        void pools_set_lock(int srw);
+        pools_set_lock(srw);
+        if (srw) wlog("memory pools: SRW lock (pool_lock=srw in heapfix.ini)");
+    }
     st[S_HEAP] = fix_off(L"memory_allocator", L"heapfix_off.txt", "memory allocator", "the game keeps its own heap") ? FIX_SWITCHED_OFF : install_into(m) > 0;
     st[S_POOL] = fix_off(L"small_object_pools", L"pool_off.txt", "pool free lookup", "not replaced") ? FIX_SWITCHED_OFF : install_pool(m, wlog) > 0;
     int sorts = 0, camp = 0, x87 = 0;
@@ -512,7 +535,9 @@ static void install_all(HMODULE m) {
     if (fix_off(L"x87_rounding", L"x87fix_off.txt", "x87 rounding fix", "not installed")) st[S_X87] = FIX_SWITCHED_OFF;
     else if (!frame_hook) wlog("x87 rounding fix not installed: no frame hook for its per-frame checks");
     else g_x87fix_on = (x87 = install_x87fix(m, wlog)) > 0;
-    if (g_campfix_on || g_x87fix_on) g_frame_check = frame_checks;
+    // script extender: only with a lua_ext folder in the game folder (scriptext.c)
+    if (frame_hook) g_scriptext_on = install_scriptext(m, dir, wlog);
+    if (g_campfix_on || g_x87fix_on || g_scriptext_on) g_frame_check = frame_checks;
     // Terrain height cache: verified in game: 7.5 M queries over map, end turn, save load and battle, 0 mismatches.
     st[S_HEIGHT] = fix_off(L"terrain_height_cache", L"heightcache_off.txt", "height cache", "not installed") ? FIX_SWITCHED_OFF
                                                                                                     : install_heightcache(m, 2, wlog) > 0;
@@ -542,6 +567,8 @@ static void install_all(HMODULE m) {
     g_uikeep_keep = keep < 1 ? 1 : keep > 1024 ? 1024 : (unsigned)keep;
     st[S_MENUS] = fix_off(L"menu_textures", L"uikeep_off.txt", "menu textures fix", "freed when closed, as the game does") ? FIX_SWITCHED_OFF
                                                                                                                      : install_uikeep(m, wlog) > 0;
+    // address-space watch: failed file maps / VirtualAllocs logged, a failed map retried after a trim (memwatch.c)
+    if (g_crash_logging) install_memwatch(m, st[S_HEAP] == 1 ? trim_all : NULL, wlog);
     if (st[S_SORTS] != FIX_SWITCHED_OFF) st[S_SORTS] = sorts == 2 ? FIX_ON : sorts ? FIX_PARTLY : FIX_INACTIVE;
     if (st[S_X87] != FIX_SWITCHED_OFF)  // the 4 campaign blocks (campfix) and the general x87 fix together
         st[S_X87] = x87 > 0 && camp == 4 ? FIX_ON : x87 > 0 || camp > 0 ? FIX_PARTLY : FIX_INACTIVE;
@@ -563,6 +590,15 @@ static void install_all(HMODULE m) {
         g_passtime_on = install_passtime(m, wlog) > 0;
         if (g_passtime_on) g_frame_check = frame_checks;
     }
+    {   // other mods' DLLs from <game>\plugins (plugins.c), after every fix is in
+        int load_plugins(const wchar_t *dir, void (*log)(const char *fmt, ...));
+        if (!ini_int(L"mod", L"plugins", 1)) wlog("plugins off (plugins=0 in heapfix.ini)");
+        // from the load notification (another program loaded this DLL first) Windows refuses LoadLibrary (error 1168);
+        // later, on a thread, the game would already be running. shortcut: not loaded then; seen in 0 of 5 player logs
+        else if (g_late_install) wlog("plugins NOT loaded: another program loaded dinput8.dll before the game, and Windows "
+                                      "allows no DLL loading at that point - this game start runs without the plugins folder");
+        else if (slash) load_plugins(dir, wlog);
+    }
     log_status(st);  // last, so the summary closes the startup lines
 }
 
@@ -579,6 +615,7 @@ static VOID CALLBACK on_dll_loaded(ULONG reason, const NOTIF_DATA *d, PVOID ctx)
     if (reason != 1 || !d || !d->BaseDllName || d->BaseDllName->Length != sizeof want - sizeof(wchar_t)) return;
     if (_wcsnicmp(d->BaseDllName->Buffer, want, d->BaseDllName->Length / sizeof(wchar_t)) != 0) return;
     wlog("empire.retail.dll is loading now - installing the fixes");
+    g_late_install = 1;
     install_all((HMODULE)d->DllBase);
 }
 

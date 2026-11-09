@@ -12,18 +12,36 @@
 // ---- dlmalloc, built for this
 #define ONLY_MSPACES 1
 #define MSPACES 1
-#ifdef POOLS_SRW   // test switch (wip/allocbench): an SRW lock, waiting in the kernel, instead of dlmalloc's spin-and-yield
+// The pools' locks (AGENT_LOG 220): one word, zero = free, used either as a spin lock or as an SRW lock - chosen once
+// at start by heapfix.ini [tuning] pool_lock (pools_set_lock, before pools_init), so one DLL can A/B both in game.
+//   yield (default): spin with the CPU's pause hint, give the core away (SleepEx(0)) every 2048 spins. Benchmark
+//     (wip/allocbench/step4_locks.txt, 8 threads): lowest average on 32, 4 and 2 CPUs and the fewest calls over 1 ms;
+//     the old spin without a yield (clang compiled dlmalloc's yield away) had 0.2-0.6 s stalls on 2 CPUs.
+//   srw: Windows' SRW lock, waiting in the kernel: ~1.7-2x the average on all cores, tight worst cases; it fixed a
+//     12900K player's stutter against the old no-yield spin (AGENT_LOG 214).
+// POOLS_SRW (test switch) makes srw the default.
 #define USE_LOCKS 2
 #define MLOCK_T SRWLOCK
+static int g_pool_srw
+#ifdef POOLS_SRW
+    = 1
+#endif
+    ;
+void pools_set_lock(int srw) { g_pool_srw = srw; }
+static int pool_spin(SRWLOCK *l) {
+    volatile LONG *w = (volatile LONG *)l;
+    for (unsigned spins = 0; *w != 0 || InterlockedExchange(w, 1) != 0;) {
+        __builtin_ia32_pause();
+        if ((++spins & 2047) == 0) SleepEx(0, FALSE);
+    }
+    return 0;
+}
 #define INITIAL_LOCK(l) (InitializeSRWLock(l), 0)
 #define DESTROY_LOCK(l) (0)
-#define ACQUIRE_LOCK(l) (AcquireSRWLockExclusive(l), 0)
-#define RELEASE_LOCK(l) ReleaseSRWLockExclusive(l)
-#define TRY_LOCK(l) TryAcquireSRWLockExclusive(l)
+#define ACQUIRE_LOCK(l) (g_pool_srw ? (AcquireSRWLockExclusive(l), 0) : pool_spin(l))
+#define RELEASE_LOCK(l) (g_pool_srw ? ReleaseSRWLockExclusive(l) : (void)InterlockedExchange((volatile LONG *)(l), 0))
+#define TRY_LOCK(l) (g_pool_srw ? TryAcquireSRWLockExclusive(l) : InterlockedExchange((volatile LONG *)(l), 1) == 0)
 static MLOCK_T malloc_global_mutex = SRWLOCK_INIT;
-#else
-#define USE_LOCKS 1
-#endif
 #define FOOTERS 1
 #define HAVE_MORECORE 0
 #define DEFAULT_GRANULARITY ((size_t)64U * (size_t)1024U)              // the game's (read from its mparams)
@@ -91,6 +109,18 @@ static int pool_munmap(void *a, size_t s) {   // as dlmalloc's win32munmap: the 
 }
 
 int pool_owns(const void *p) { return g_own[(UINT_PTR)p >> 16]; }
+// A cached block's link to the next one is in its own first 4 bytes: a game write after the free (a use-after-free)
+// would turn it into a wild pointer. One that is not a pool block ends the list (the rest leak; nothing is handed out
+// twice or read from garbage). Review E2, AGENT_LOG 219.
+// Round 2: a stale write is most often a valid pointer to another pool block, which passes that check; so the link is
+// also kept XOR a per-session cookie in bytes 4-7 (every cached block has at least 16 usable bytes): both must agree.
+static UINT_PTR g_cache_cookie = 0x9E3779B9u;   // pools_init makes it per session
+static inline void cache_link(void *p, void *next) { ((void **)p)[0] = next; ((UINT_PTR *)p)[1] = (UINT_PTR)next ^ g_cache_cookie; }
+static inline void *cache_next(const void *p) {
+    void *n = ((void *const *)p)[0];
+    if (((UINT_PTR)n ^ g_cache_cookie) != ((const UINT_PTR *)p)[1]) return NULL;
+    return n && (((UINT_PTR)n & 7) || !pool_owns(n)) ? NULL : n;
+}
 unsigned pool_mb(void) { return (unsigned)(g_pool_kb >> 10); }
 
 // ---- the mspaces and the threads' share of them
@@ -159,6 +189,9 @@ static int pool_of(void *p) {   // FOOTERS: the block's mspace, as an index
 #endif
 
 int pools_init(void) {
+    LARGE_INTEGER t;   // before any block is cached
+    QueryPerformanceCounter(&t);
+    g_cache_cookie ^= (UINT_PTR)t.QuadPart * 2654435761u ^ (UINT_PTR)(t.QuadPart >> 32) ^ GetCurrentProcessId();
     if ((g_tls = TlsAlloc()) == TLS_OUT_OF_INDEXES) return 0;
     for (int i = 0; i < NPOOL; i++)
         if (!(g_pool[i] = create_mspace(0, 1))) return 0;
@@ -177,9 +210,14 @@ void *pool_alloc(size_t n) {
             if (c->bin[j]) { k = j; p = c->bin[j]; }
 #endif
         if (p) {
-            c->bin[k] = *(void **)p;
-            c->n[k]--;
+            void *next = cache_next(p);
+            c->bin[k] = next;
             c->bytes -= (unsigned)mspace_usable_size(p);
+            if (--c->n[k] && !next) {   // the list was cut: its other blocks leak, and no longer count against the cache
+                unsigned lost = c->n[k] * (k << 4);
+                c->bytes = c->bytes > lost ? c->bytes - lost : 0;
+                c->n[k] = 0;
+            }
             return p;
         }
 #ifdef POOLS_REMOTE
@@ -200,7 +238,7 @@ void pool_free(void *p) {   // p is a pool block (pool_owns)
         unsigned k = (unsigned)(u >> 4);
         if (k > NCLASS - 1) k = NCLASS - 1;
         if (k && c->n[k] < CACHE_N && c->bytes + u <= CACHE_BYTES) {
-            *(void **)p = c->bin[k];
+            cache_link(p, c->bin[k]);
             c->bin[k] = p;
             c->n[k]++;
             c->bytes += (unsigned)u;
@@ -227,7 +265,7 @@ void pool_trim(void) {
     if (c) {
         for (unsigned k = 0; k < NCLASS; k++) {
             for (void *p = c->bin[k], *q; p; p = q) {
-                q = *(void **)p;
+                q = cache_next(p);
                 mspace_free(g_pool[0], p);
             }
             c->bin[k] = NULL;
@@ -252,7 +290,7 @@ void pool_thread_exit(void) {   // the thread's cached blocks go back to their m
     SetLastError(err);
     for (unsigned k = 0; k < NCLASS; k++)
         for (void *p = c->bin[k], *q; p; p = q) {
-            q = *(void **)p;
+            q = cache_next(p);
             mspace_free(g_pool[0], p);
         }
     HeapFree(GetProcessHeap(), 0, c);
