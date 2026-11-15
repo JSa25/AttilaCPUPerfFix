@@ -197,6 +197,19 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 7.1:
+-Unit detail cull: small parts of far-away soldiers (belts, quivers, bridles,
+ crests) are not drawn. On by default, set to "light". Change it in the F8 panel, or with culling= in heapfix.ini (off, light,
+ normal, strong).
+-The unit cards are drawn from a cache instead of every frame: redrawn about
+ 15 times a second, when a key or mouse button goes down or comes up, and
+ while the cursor is over them. Holding a button or key - turning the camera,
+ drag-selecting, Space - does not keep them redrawing.
+-Sound crash guard: a sound the game has no free buffer for is skipped instead
+ of crashing the battle.
+-F8 opens a panel on the game's own frames without the Upscaling and Framegen
+ add-on: the culling setting and What's new.
+
 Version 7.0:
 -Plugins: other mods' DLLs load from a plugins folder in the game folder, under
  any name (for example plugins\smoke.dll), so a mod no longer has to take a DLL
