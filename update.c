@@ -16,6 +16,10 @@ static const char MARKER[] = "AttilaCPUPerfFix-version:";
 #define STR(x) STR_(x)
 __attribute__((used)) static const char g_marker[] = "AttilaCPUPerfFix-version:" STR(MOD_VERSION_NUM);
 
+// What the check found, for the pop-up after the game starts (fgpanel.c): 1 a newer version was installed for the next
+// start, 2 the Workshop has a newer version that could not be installed (run install.bat).
+int g_update_state;
+
 // The version marker in a file, or 0 (missing, unreadable, not a PE file, or no marker).
 static int marker_in(const char *buf, size_t n) {
     if (n < 0x400 || buf[0] != 'M' || buf[1] != 'Z') return 0;
@@ -80,12 +84,14 @@ int update_from(const wchar_t *self, const wchar_t *ws, int mine, void (*log)(co
         log("update: the Workshop has version %d, but copying it failed (error %lu) - run install.bat in the Workshop "
             "folder to update", theirs, GetLastError());
         DeleteFileW(new_);
+        g_update_state = 2;
         return 0;
     }
     if (!MoveFileExW(self, old_, MOVEFILE_REPLACE_EXISTING)) {
         log("update: the Workshop has version %d, but this DLL could not be renamed (error %lu) - run install.bat",
             theirs, GetLastError());
         DeleteFileW(new_);
+        g_update_state = 2;
         return 0;
     }
     if (!MoveFileExW(new_, self, MOVEFILE_REPLACE_EXISTING)) {
@@ -93,9 +99,11 @@ int update_from(const wchar_t *self, const wchar_t *ws, int mine, void (*log)(co
         MoveFileExW(old_, self, MOVEFILE_REPLACE_EXISTING);  // put ours back
         DeleteFileW(new_);
         log("update: installing version %d failed (error %lu) - run install.bat", theirs, e);
+        g_update_state = 2;
         return 0;
     }
     log("update: installed version %d from the Steam Workshop; it takes effect the next time the game starts", theirs);
+    g_update_state = 1;
     return 1;
 }
 

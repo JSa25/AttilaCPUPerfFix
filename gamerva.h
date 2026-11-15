@@ -58,6 +58,29 @@ static inline DWORD fnv1a(const unsigned char *b, DWORD n) {
     return h;
 }
 
+// FNV-1a of the code as on disk: these functions hold absolute addresses, which the loader moves with the DLL
+// (it is never at its preferred base 0x10000000 in game). The relocation table says where they are.
+static inline DWORD fnv1a_unreloc(const unsigned char *b, DWORD rva, DWORD n) {
+    unsigned char buf[0x200];
+    if (n + 8 > sizeof buf) return 0;
+    memcpy(buf, b + rva - 4, n + 8);  // 4 bytes either side: an address can straddle the start or end
+    DWORD delta = (DWORD)(UINT_PTR)b - 0x10000000u;
+    const IMAGE_NT_HEADERS32 *nt = (const IMAGE_NT_HEADERS32 *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    for (DWORD off = 0; delta && off + 8 <= dir->Size;) {
+        const IMAGE_BASE_RELOCATION *r = (const IMAGE_BASE_RELOCATION *)(b + dir->VirtualAddress + off);
+        if (r->SizeOfBlock < 8) break;
+        const WORD *e = (const WORD *)(r + 1);
+        for (DWORD i = 0; i < (r->SizeOfBlock - 8) / 2; i++) {
+            DWORD at = r->VirtualAddress + (e[i] & 0xFFF);
+            if (e[i] >> 12 == IMAGE_REL_BASED_HIGHLOW && at >= rva - 4 && at + 4 <= rva + n + 4)
+                *(DWORD *)(buf + at - (rva - 4)) -= delta;
+        }
+        off += r->SizeOfBlock;
+    }
+    return fnv1a(buf + 4, n);
+}
+
 // Points the IAT entry of `name` (imported from KERNEL32.dll by module m) at `to`; returns the old target or NULL.
 static inline void *iat_hook(HMODULE m, const char *name, void *to) {
     unsigned char *b = (unsigned char *)m;

@@ -238,11 +238,16 @@ static void build_grid(LONG f) {   // the previous frame's models into the grid
 static const MEnt *nearest(LONG f, float x, float y, float z, int bones) {
     const MEnt *e = m_ent[(f - 1) & 1], *best = NULL;
     float bd = M_RADIUS * M_RADIUS;
-    int cx = cell(x), cy = cell(y), cz = cell(z);
-    for (int dx = -1; dx <= 1; dx++)
-        for (int dy = -1; dy <= 1; dy++)
-            for (int dz = -1; dz <= 1; dz++)   // at most 16 per cell: models piled at one place (zeroed / NaN) would make it n^2
-                for (int k = m_bucket[cell_hash(cx + dx, cy + dy, cz + dz)], c = 0; k >= 0 && c < 16; k = e[k].next, c++) {
+    // only the cells the search sphere reaches (AGENT_LOG 228: all 27 neighbours cost ~8 ms of CPU a frame over the
+    // lookup threads at ~39,000 models; a model within the radius lies in one of these, so the result is the same). The
+    // margin covers float rounding at a cell edge; the order of the cells is the old one, so equal distances pick alike.
+    const float R = M_RADIUS + 0.001f;
+    int x0 = cell(x - R), x1 = cell(x + R), y0 = cell(y - R), y1 = cell(y + R), z0 = cell(z - R), z1 = cell(z + R);
+    if (x1 - x0 > 2 || y1 - y0 > 2 || z1 - z0 > 2 || x1 < x0 || y1 < y0 || z1 < z0) return NULL;   // NaN / huge: as before, nothing within reach
+    for (int cx = x0; cx <= x1; cx++)
+        for (int cy = y0; cy <= y1; cy++)
+            for (int cz = z0; cz <= z1; cz++)   // at most 16 per cell: models piled at one place (zeroed / NaN) would make it n^2
+                for (int k = m_bucket[cell_hash(cx, cy, cz)], c = 0; k >= 0 && c < 16; k = e[k].next, c++) {
                     if (e[k].bones != bones) continue;
                     float ax = e[k].x - x, ay = e[k].y - y, az = e[k].z - z, d = ax * ax + ay * ay + az * az;
                     if (d < bd) { bd = d; best = &e[k]; }
@@ -267,11 +272,21 @@ static UINT m_ndraws;
 typedef struct { float cur[16]; int tex, bones; } MItem;   // a model's record, texture index and skeleton size
 static MItem m_items[M_MAX_INST];
 static float (*m_prev_cpu)[16];   // M_MAX_INST previous records (64 bytes)
-static volatile LONG m_queued, m_done;   // instances handed to / finished by the worker
-static HANDLE m_wake, m_thread;
-static unsigned m_hit, m_new, m_badtex, m_skip_item, m_skip_range, m_skip_tex, m_skip_other;
+// The history lookup (nearest previous model per instance) runs on M_WORKERS threads plus the main thread while it waits:
+// one worker took ~5 ms a frame for ~24,000 instances in a big 1212 battle and the pass waited for it (AGENT_LOG / notes
+// part_cull_design.md). Instances are claimed in chunks; each one's result and its entry for the next frame go to its own
+// index, in the order the single worker wrote them, so the lookups match bit for bit (fgmotion_par_test).
+#define M_WORKERS 3
+#define M_CHUNK 256
+static volatile LONG m_queued, m_done, m_claim;   // instances handed over / finished / claimed
+static LONG m_ent_base;   // this frame's entries before the current queue (the pass empties the queue mid-frame)
+static HANDLE m_wakes[M_WORKERS], m_threads[M_WORKERS];
+static volatile LONG m_sleeping[M_WORKERS];
+static SRWLOCK m_grid_lock = SRWLOCK_INIT;
+static volatile LONG m_hit, m_new, m_badtex;
+static unsigned m_skip_item, m_skip_range, m_skip_tex, m_skip_other;
 static int m_tex_max = -1;
-static unsigned long long m_worker_ticks;
+static volatile LONG64 m_worker_ticks;
 
 static ID3D11Buffer *m_prev_buf, *m_cb, *m_cam[2], *m_wind;
 static int m_cam_have[2], m_wind_have;
@@ -285,49 +300,79 @@ static unsigned m_frames, m_draws_total, m_inst_total, m_skipped, m_skipped_full
 static double m_pass_ms;
 static unsigned long long m_draw_ticks;
 
-static DWORD WINAPI worker(void *arg) {
-    (void)arg;
-    for (;;) {
-        WaitForSingleObject(m_wake, INFINITE);
-        LONG q;
-        while ((q = m_queued) != m_done) {
-            unsigned long long t0 = __rdtsc();
-            LONG f = m_frame;
-            if (m_grid_frame != f) build_grid(f);
-            MEnt *ce = m_ent[f & 1];
-            for (LONG i = m_done; i < q; i++) {
-                const MItem *it = &m_items[i];   // copied at the draw (fgm_draw): the game's own records may be gone by now
-                int tex = it->tex, bones = it->bones;
-                const float *cur = it->cur;
-                float *out = m_prev_cpu[i];
-                const MEnt *h = nearest(f, cur[3], cur[7], cur[11], bones);
-                if (h && h->tex >= 0 && h->tex < M_TEX && m_prev_ok[h->tex]) {
-                    memcpy(out, h->rec, 52);
-                    out[13] = (float)h->tex;
-                    out[14] = out[15] = 0;
-                    m_hit++;
-                } else {   // no history: the shader takes the current pose and place (bone base < 0), only the camera moves it
-                    memcpy(out, cur, 64);
-                    out[12] = -1;
-                    if (h) m_badtex++; else m_new++;
-                }
-                if (m_nent[f & 1] < M_ENTS) {
-                    MEnt *e = &ce[m_nent[f & 1]++];
-                    e->x = cur[3]; e->y = cur[7]; e->z = cur[11]; e->bones = bones; e->tex = tex;
-                    memcpy(e->rec, cur, 52);
-                }
-            }
-            m_worker_ticks += __rdtsc() - t0;
-            InterlockedExchange(&m_done, q);
+// instances [from, to) of frame f: each one's previous record, and its entry for the next frame at its own index
+static void lookup_range(LONG f, LONG from, LONG to) {
+    unsigned long long t0 = __rdtsc();
+    if (m_grid_frame != f) {   // the previous frame's grid, once a frame, before any lookup of this frame
+        AcquireSRWLockExclusive(&m_grid_lock);
+        if (m_grid_frame != f) build_grid(f);
+        ReleaseSRWLockExclusive(&m_grid_lock);
+    }
+    MEnt *ce = m_ent[f & 1];
+    LONG hit = 0, nw = 0, bad = 0;
+    for (LONG i = from; i < to; i++) {
+        const MItem *it = &m_items[i];   // copied at the draw (fgm_draw): the game's own records may be gone by now
+        int tex = it->tex, bones = it->bones;
+        const float *cur = it->cur;
+        float *out = m_prev_cpu[i];
+        const MEnt *h = nearest(f, cur[3], cur[7], cur[11], bones);
+        if (h && h->tex >= 0 && h->tex < M_TEX && m_prev_ok[h->tex]) {
+            memcpy(out, h->rec, 52);
+            out[13] = (float)h->tex;
+            out[14] = out[15] = 0;
+            hit++;
+        } else {   // no history: the shader takes the current pose and place (bone base < 0), only the camera moves it
+            memcpy(out, cur, 64);
+            out[12] = -1;
+            if (h) bad++; else nw++;
         }
+        if (m_ent_base + i < M_ENTS) {
+            MEnt *e = &ce[m_ent_base + i];
+            e->x = cur[3]; e->y = cur[7]; e->z = cur[11]; e->bones = bones; e->tex = tex;
+            memcpy(e->rec, cur, 52);
+        }
+    }
+    InterlockedExchangeAdd(&m_hit, hit);
+    InterlockedExchangeAdd(&m_new, nw);
+    InterlockedExchangeAdd(&m_badtex, bad);
+    InterlockedExchangeAdd64(&m_worker_ticks, (LONG64)(__rdtsc() - t0));
+}
+
+// claims and does one chunk of what is queued; 0 when nothing is left to claim
+static int lookup_chunk(void) {
+    for (;;) {
+        LONG start = m_claim, q = m_queued;
+        if (start >= q) return 0;
+        LONG end = q - start > M_CHUNK ? start + M_CHUNK : q;
+        if (InterlockedCompareExchange(&m_claim, end, start) != start) continue;
+        lookup_range(*(volatile LONG *)&m_frame, start, end);   // the frame advances only while all are idle
+        InterlockedExchangeAdd(&m_done, end - start);
+        return 1;
+    }
+}
+
+static DWORD WINAPI worker(void *arg) {
+    int k = (int)(UINT_PTR)arg;
+    for (;;) {
+        while (lookup_chunk()) {}
+        InterlockedExchange(&m_sleeping[k], 1);
+        if (m_claim < m_queued) { InterlockedExchange(&m_sleeping[k], 0); continue; }   // queued meanwhile: no lost wake
+        WaitForSingleObject(m_wakes[k], INFINITE);
+        InterlockedExchange(&m_sleeping[k], 0);
     }
     return 0;
 }
 
+static void wake_workers(void) {
+    for (int k = 0; k < M_WORKERS; k++)
+        if (m_sleeping[k]) SetEvent(m_wakes[k]);
+}
+
 static void verify_draw(ID3D11Buffer *vb1, UINT off, const MSlot *items, UINT inst);   // check (below)
 
-static void wait_worker(void) {
-    for (int i = 0; m_done != m_queued; i++) if (i > 64) Sleep(0); else YieldProcessor();
+static void wait_worker(void) {   // the main thread helps with what is left instead of only waiting
+    for (int i = 0; m_done != m_queued; i++)
+        if (!lookup_chunk()) { if (i > 64) Sleep(0); else YieldProcessor(); }
 }
 
 static void cam_copy(ID3D11DeviceContext *c) {   // this frame's camera block, as the game's shader reads it
@@ -457,7 +502,7 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
     }
     verify_draw(vb[1], off, &items[off / 120], inst);
     InterlockedExchangeAdd(&m_queued, (LONG)inst);
-    SetEvent(m_wake);
+    wake_workers();
     cam_copy(c);
     m_draws_total++;
     m_inst_total += inst;
@@ -523,7 +568,13 @@ static void release_draws(void) {
         if (d->anim) ID3D11ShaderResourceView_Release(d->anim);
     }
     m_ndraws = 0;
-    m_queued = m_done = 0;
+    m_ent_base += m_queued;   // all done (waited above): later draws this frame add after them, as the single worker did
+    m_queued = m_done = m_claim = 0;
+}
+// frame end: this frame's entries become the previous frame's for the next one's lookups
+static void close_entries(void) {
+    if (m_grid_frame == m_frame) m_nent[m_frame & 1] = m_ent_base < M_ENTS ? m_ent_base : M_ENTS;
+    m_ent_base = 0;
 }
 
 static wchar_t m_dump[MAX_PATH];   // bridge capture: a picture of the motion vectors after the pass (below)
@@ -725,7 +776,8 @@ static void dump_mv(void) {
 // ---- frame end (Present): this frame becomes the previous one ----
 void fgm_frame_end(void) {
     if (!m_on) return;
-    release_draws();   // waits for the worker (also in a frame without a HUD-less point)
+    release_draws();   // waits for the workers (also in a frame without a HUD-less point)
+    close_entries();
     if (m_verify_report) verify_report();
     if (m_grid_frame != m_frame) m_nent[m_frame & 1] = 0;   // no models this frame: the next one starts without history
     for (int t = 0; t < M_TEX && m_enabled; t++)
@@ -755,7 +807,7 @@ void fgm_report(void (*log)(const char *fmt, ...)) {
     if (m_frames)
         log("  motion pass: %u frames, %u model draws (%u instances) redrawn, %u draws skipped (%u full, %u an unknown record, %u texture index, %u "
             "other; highest animation texture index %d); previous model found within 0.35 m %.1f%%, none %.1f%%, no texture copy %.1f%%; per frame: pass %.3f ms, draw recording %.3f ms (main thread), "
-            "worker %.3f ms (own thread); records copied %ld (%ld outside a known buffer, %ld misaligned); %u instance buffer entries handed over (%u slot tables left unfreed); %u draws refilled before the pass, not redrawn",
+            "lookup %.3f ms (all its threads); records copied %ld (%ld outside a known buffer, %ld misaligned); %u instance buffer entries handed over (%u slot tables left unfreed); %u draws refilled before the pass, not redrawn",
             m_frames, m_draws_total, m_inst_total, m_skipped, m_skipped_full, m_skip_item, m_skip_tex, m_skip_other + m_skip_range, m_tex_max,
             all ? 100.0 * m_hit / all : 0, all ? 100.0 * m_new / all : 0, all ? 100.0 * m_badtex / all : 0, m_pass_ms / m_frames, m_draw_ticks * tick_ms / m_frames,
             m_worker_ticks * tick_ms / m_frames, (long)m_copies, (long)m_copies_unmapped, (long)m_copies_misaligned, m_maps_full, m_retire_leaked, m_skip_refill);
@@ -833,9 +885,11 @@ int fgm_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *mv, U
     m_ent[1] = calloc(M_ENTS, sizeof(MEnt));
     m_bucket = malloc(M_BUCKETS * sizeof(int));
     m_prev_cpu = calloc(M_MAX_INST, 64);
-    m_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!m_ent[0] || !m_ent[1] || !m_bucket || !m_prev_cpu || !m_wake || !(m_thread = CreateThread(NULL, 0, worker, NULL, 0, NULL))) {
-        log("motion pass: no memory / worker thread - off");
+    int threads_ok = 1;
+    for (int k = 0; k < M_WORKERS && threads_ok; k++)
+        threads_ok = (m_wakes[k] = CreateEventW(NULL, FALSE, FALSE, NULL)) && (m_threads[k] = CreateThread(NULL, 0, worker, (void *)(UINT_PTR)k, 0, NULL));
+    if (!m_ent[0] || !m_ent[1] || !m_bucket || !m_prev_cpu || !threads_ok) {
+        log("motion pass: no memory / worker threads - off");
         return 0;
     }
     m_on = 1;

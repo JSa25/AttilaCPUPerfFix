@@ -318,6 +318,9 @@ int install_fileio(HMODULE m, void (*log)(const char *fmt, ...));     // fileio.
 int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...));  // attrcache.c
 int install_texfix(HMODULE m, int verify, void (*log)(const char *fmt, ...));    // texfix.c
 int install_uikeep(HMODULE m, void (*log)(const char *fmt, ...));                // uikeep.c
+int install_uicache(HMODULE m, const char *names, void *test_draw, void (*log)(const char *fmt, ...));  // uicache.c
+int install_partcull(HMODULE m, void (*log)(const char *fmt, ...));              // partcull.c
+int install_soundguard(HMODULE m, void (*log)(const char *fmt, ...));            // soundguard.c
 int install_memwatch(HMODULE m, void (*trim)(void), void (*log)(const char *fmt, ...));   // memwatch.c
 static void trim_all(void) { hf_trim(0); }   // memwatch: give spare memory back before retrying a failed file map
 int install_scriptext(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...));  // scriptext.c
@@ -393,12 +396,15 @@ static const char INI_DEFAULTS[] =
     "terrain_height_cache=1\r\n"
     "small_memory_copies=1\r\n"
     "render_loop_prefetch=1\r\n"
+    "battle_ui_cache=1\r\n"
     "; loading\r\n"
     "file_reading=1\r\n"
     "missing_file_cache=1\r\n"
     "battle_textures=1\r\n"
     "; menus\r\n"
     "menu_textures=1\r\n"
+    "; stability\r\n"
+    "sound_crash_guard=1\r\n"
     "\r\n"
     "[mod]\r\n"
     "; copy a newer version from the Steam Workshop into the game folder at startup\r\n"
@@ -414,6 +420,9 @@ static const char INI_DEFAULTS[] =
     "; the memory pools' lock: yield (default) or srw (Windows' SRW lock: try it if the game stutters on an Intel CPU\r\n"
     "; with efficiency cores)\r\n"
     "pool_lock=yield\r\n"
+    "; Culling: small parts of far-away soldiers (belts, quivers, bridles) are not drawn, for more fps in big battles:\r\n"
+    "; off, light, normal or strong (also in the F8 panel, which saves its pick here)\r\n"
+    "culling=light\r\n"
     "\r\n"
     "; The DLSS add-on has its own settings: FrameBridge\\settings.txt (F8 in game).\r\n";
 static void ini_create(void) {
@@ -463,14 +472,35 @@ static void log_header(void) {
     fclose(f);
 }
 
+// Culling (partcull.c): Off / Light / Normal / Strong, from heapfix.ini [tuning] culling=; the F8 panel's pick is saved
+// there (the one line the mod ever changes in that file). The threshold per choice is the panel's (fgpanel.c).
+static const wchar_t *const CULL_KEYS[4] = {L"off", L"light", L"normal", L"strong"};
+static int g_culling, g_culling_ok;
+void fgp_set_cull(int choice), fgp_set_cull_available(int ok);   // fgpanel.c
+void culling_choose(int c) {
+    extern volatile LONG g_partcull_on;
+    extern float g_partcull_px;
+    extern const float g_fgp_cull_px[4];
+    g_culling = c >= 0 && c < 4 ? c : 0;
+    if (g_culling) g_partcull_px = g_fgp_cull_px[g_culling];
+    InterlockedExchange(&g_partcull_on, g_culling > 0);
+}
+void culling_pick(int c) {   // from the F8 panel: applied now and saved
+    culling_choose(c);
+    if (g_ini[0]) WritePrivateProfileStringW(L"tuning", L"culling", CULL_KEYS[g_culling], g_ini);
+    wlog("culling: %ls (picked in the F8 panel, saved in heapfix.ini)", CULL_KEYS[g_culling]);
+}
+
 // The plain-language summary after the install lines (those stay as the details for bug reports).
 enum { FIX_SWITCHED_OFF = -1, FIX_INACTIVE = 0, FIX_ON = 1, FIX_PARTLY = 2 };
-enum { S_HEAP, S_POOL, S_SORTS, S_BATCH, S_X87, S_HEIGHT, S_COPY, S_PREFETCH, S_FILES, S_MISSING, S_TEXTURES, S_MENUS, S_N };
+enum { S_HEAP, S_POOL, S_SORTS, S_BATCH, S_X87, S_HEIGHT, S_COPY, S_PREFETCH, S_UI, S_FILES, S_MISSING, S_TEXTURES, S_MENUS, S_SOUND, S_N };
 static const char *const g_fix_names[S_N] = {
     "FPS: memory allocator (heap)", "FPS: small-object pools", "FPS: render-list sorts", "FPS: battle draw batching",
     "FPS: x87 rounding", "FPS: terrain height cache", "FPS: small memory copies", "FPS: render-loop prefetch",
+    "FPS: battle UI (unit cards drawn from a cache)",
     "Loading: file reading", "Loading: missing-file cache", "Loading: battle textures (sieges)",
-    "Menus: textures stay loaded (no stutter on reopening)"};
+    "Menus: textures stay loaded (no stutter on reopening)", "Stability: sound crash guard (huge battles)"
+};
 
 static void log_status(const int st[S_N]) {
     int on = 0;
@@ -503,6 +533,19 @@ static void install_all(HMODULE m) {
     wchar_t off[MAX_PATH];
     wcscpy(off, g_log_path);
     wchar_t *sl = wcsrchr(off, L'\\');
+    {   // the pop-ups after the game starts (fgpanel.c): a newer version installed, and What's new on the first start of
+        // this one (the last version started is in heapfix_seen.txt)
+        extern int g_update_state;   // update.c
+        void fgp_set_update(int state), fgp_show_whatsnew(void);
+        fgp_set_update(g_update_state);
+        char t[16] = {0};
+        FILE *f = sl ? (wcscpy(sl + 1, L"heapfix_seen.txt"), _wfopen(off, L"rb")) : NULL;
+        if (f) { fread(t, 1, sizeof t - 1, f); fclose(f); }
+        if (sl && atoi(t) != MOD_VERSION_NUM) {
+            fgp_show_whatsnew();
+            if ((f = _wfopen(off, L"wb"))) { fprintf(f, "%d\n", MOD_VERSION_NUM); fclose(f); }
+        }
+    }
     // Switching the heap or the pool lookup off tells whether a crash depends on them. This runs before the game's
     // first allocation, so leaving the heap alone is always safe.
     {   // the pools' lock, before they start (pools.c, AGENT_LOG 220)
@@ -567,6 +610,30 @@ static void install_all(HMODULE m) {
     g_uikeep_keep = keep < 1 ? 1 : keep > 1024 ? 1024 : (unsigned)keep;
     st[S_MENUS] = fix_off(L"menu_textures", L"uikeep_off.txt", "menu textures fix", "freed when closed, as the game does") ? FIX_SWITCHED_OFF
                                                                                                                      : install_uikeep(m, wlog) > 0;
+    // Battles: a soldier's small parts are not drawn once they would be a few pixels tall (partcull.c).
+    // Light by default (16 px bodies, 9 px heads): +12.3 fps on its own and +20.0 with the UI cache in a 1212
+    // battle, with no pop-in at twice that threshold (notes/bench_cache_cull_2x2.md, notes/part_cull_design.md).
+    // The F8 panel or [tuning] culling= changes it; partcull_off.txt leaves it out entirely.
+    if (sl) wcscpy(sl + 1, L"partcull_off.txt");
+    if (sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES) wlog("culling not installed (partcull_off.txt)");
+    else g_culling_ok = install_partcull(m, wlog) > 0;
+    if (g_culling_ok) {
+        wchar_t v[16] = L"";
+        if (g_ini[0]) GetPrivateProfileStringW(L"tuning", L"culling", L"light", v, 16, g_ini);
+        int c = v[0] >= L'0' && v[0] <= L'3' ? v[0] - L'0' : 0;
+        for (int i = 1; i < 4; i++) if (!_wcsicmp(v, CULL_KEYS[i])) c = i;
+        culling_choose(c);
+    }
+    fgp_set_cull_available(g_culling_ok);
+    fgp_set_cull(g_culling);
+    // Huge battles: a sound the game's full sound pool gave no buffer is skipped instead of crashing (soundguard.c).
+    st[S_SOUND] = fix_off(L"sound_crash_guard", L"soundguard_off.txt", "sound crash guard", "not installed") ? FIX_SWITCHED_OFF
+                                                                                                    : install_soundguard(m, wlog) > 0;
+    // Battles: the unit cards are not walked and drawn every frame but shown from a cache that is redrawn a few times
+    // a second and on input (uicache.c; +11 fps at 110 in a paused battle, notes/ui_cache.md).
+    st[S_UI] = fix_off(L"battle_ui_cache", L"uicache_off.txt", "battle UI cache", "the unit cards are drawn every frame, as the game does")
+                   ? FIX_SWITCHED_OFF
+                   : install_uicache(m, NULL, NULL, wlog) > 0;
     // address-space watch: failed file maps / VirtualAllocs logged, a failed map retried after a trim (memwatch.c)
     if (g_crash_logging) install_memwatch(m, st[S_HEAP] == 1 ? trim_all : NULL, wlog);
     if (st[S_SORTS] != FIX_SWITCHED_OFF) st[S_SORTS] = sorts == 2 ? FIX_ON : sorts ? FIX_PARTLY : FIX_INACTIVE;
@@ -589,6 +656,9 @@ static void install_all(HMODULE m) {
         g_pt_force_bridge = 1;
         g_passtime_on = install_passtime(m, wlog) > 0;
         if (g_passtime_on) g_frame_check = frame_checks;
+    } else {   // without the add-on: the F8 panel (Culling, What's new) and the pop-ups on the game's own frames (overlay.c)
+        int install_overlay(HMODULE m, void (*log)(const char *fmt, ...));
+        install_overlay(m, wlog);
     }
     {   // other mods' DLLs from <game>\plugins (plugins.c), after every fix is in
         int load_plugins(const wchar_t *dir, void (*log)(const char *fmt, ...));
@@ -600,6 +670,8 @@ static void install_all(HMODULE m) {
         else if (slash) load_plugins(dir, wlog);
     }
     log_status(st);  // last, so the summary closes the startup lines
+    wlog("  Culling: %ls%s", g_culling_ok ? CULL_KEYS[g_culling] : L"not available",
+         g_culling_ok ? " (optional; F8 panel or heapfix.ini [tuning] culling=)" : "");
 }
 
 // Something else in the process (an overlay, another hook DLL) can load dinput8.dll before the game loads

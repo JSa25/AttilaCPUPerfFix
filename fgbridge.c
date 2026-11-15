@@ -295,9 +295,26 @@ static int launch_helper(void) {
     return 1;
 }
 
+// frames the game may run ahead of the helper (fgb_present's pace wait): <game>gbridge_ahead.txt holding 1..3, else 1
+static unsigned g_ahead = 1;
+static void read_ahead(void) {
+    HMODULE self = NULL;
+    wchar_t p[MAX_PATH];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(void *)read_ahead, &self) ||
+        !GetModuleFileNameW(self, p, MAX_PATH)) return;
+    wchar_t *sl = wcsrchr(p, L'\\');
+    if (!sl || _snwprintf(sl + 1, MAX_PATH - (sl + 1 - p), L"fgbridge_ahead.txt") < 0) return;
+    FILE *f = _wfopen(p, L"r");
+    if (!f) return;
+    unsigned v = 0;
+    if (fscanf(f, "%u", &v) == 1 && v >= 1 && v <= 3) g_ahead = v;
+    fclose(f);
+    if (g_log) g_log("frame bridge: the game may run %u frame(s) ahead of the helper (fgbridge_ahead.txt)", g_ahead);
+}
 int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UINT h, DXGI_FORMAT fmt, const wchar_t *helper_exe,
               const wchar_t *sl_dir, const wchar_t *log_dir, uint32_t fg_frames, void (*log)(const char *fmt, ...)) {
     g_log = log;
+    read_ahead();
     // NVIDIA only (DLSS runs on NVIDIA RTX GPUs): the game's own adapter is checked before anything is made or started, so
     // on an AMD or Intel GPU (or a laptop whose game runs on the integrated GPU) the game runs exactly as without the bridge
     IDXGIDevice *xd = NULL; IDXGIAdapter *ad = NULL; DXGI_ADAPTER_DESC adesc;
@@ -578,6 +595,7 @@ void fgb_cpu_stats(double *hud_ms, double *present_ms, double *pace_ms, unsigned
     *hud_ms = g_hud_ms; *present_ms = g_present_ms; *pace_ms = g_pace_ms; *frames = g_cpu_frames;
     g_hud_ms = g_present_ms = g_pace_ms = 0; g_cpu_frames = 0;
 }
+#define PL(stage)
 static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]);
 static void depth_upscale(void);
 // after the render's copy into dst: with the viewport shifted left (jx < 0) / up (jy < 0) the render's last column / row
@@ -818,6 +836,7 @@ int fgb_make_vectors(ID3D11Resource *depth, const float vp[16]) {
 static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]) {
     if (!fgb_active()) return;
     wait_previous();
+    PL(PS_HPREV);
     if (g_react_uav && g_react_frame != g_n) { float z[4] = {0}; ID3D11DeviceContext_ClearUnorderedAccessViewFloat(g_ctx, g_react_uav, z); }   // no effects stage this frame
     int sr = g_sr;
     UINT rw = sr ? g_rw : g_w, rh = sr ? g_rh : g_h;
@@ -825,7 +844,9 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
     D3D11_BOX box = {0, 0, 0, rw, rh, 1};
     ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)g_hud, 0, 0, 0, 0, backbuffer, 0, &box);
     jit_edge_fill(g_ctx, (ID3D11Resource *)g_hud, backbuffer, rw, rh, jx, jy);
+    PL(PS_HCOPY);
     if (!fgb_make_vectors(depth, vp)) return;
+    PL(PS_HMV);
     g_hud_done = 1;
     if (!sr) return;
     // DLSS SR round trip: inputs ready (2n+1) -> the helper's DLSS output n % 2 (SR fence n+1) -> into the back buffer, then the UI
@@ -835,6 +856,7 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
     __atomic_store_n(&g_sh->sr_frames, g_n + 1, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);
+    PL(PS_HSUBMIT);
     // the GPU wait below must never wait for a helper that is gone (a D3D11 fence cannot be signalled from the CPU):
     // wait on the CPU until the helper has submitted its DLSS pass (its SR queue signals n+1 when done)
     LARGE_INTEGER q0, q1, qf;
@@ -863,6 +885,7 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
     g_sr_wait_ms += ms;
     if (ms > g_sr_wait_max) g_sr_wait_max = ms;
     g_sr_frames++;
+    PL(PS_HWAIT);
     ID3D11DeviceContext4_Wait(g_ctx4, g_fsr, g_n + 1);
     if (g_sharpness > 0 && g_sharp_cs) {   // the game's compute bindings in the slots used, put back afterwards
         float k[4] = {g_sharpness, 0, 0, 0};
@@ -896,6 +919,7 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
         g_sharp_frames++;
     } else ID3D11DeviceContext_CopyResource(g_ctx, backbuffer, (ID3D11Resource *)g_srout[g_n % 2]);
     if (rw < g_w || rh < g_h) depth_upscale();
+    PL(PS_HBACK);
 }
 
 // Below native size (AGENT_LOG 103) the game's depth buffer holds the scene shrunk into its top-left corner, but what the
@@ -1011,8 +1035,10 @@ void fgb_present(ID3D11Resource *backbuffer) {
     tq(TQ_END);
     if (!g_tq_failed && g_tq[g_n % 8][TQ_DIS]) ID3D11DeviceContext_End(g_ctx, (ID3D11Asynchronous *)g_tq[g_n % 8][TQ_DIS]);
     if (g_n >= 6) tq_read(g_n - 6);
+    PL(PS_PCOPY);
     ID3D11DeviceContext4_Signal(g_ctx4, g_fence, 2ull * g_n + 2);
     ID3D11DeviceContext_Flush(g_ctx);
+    PL(PS_PSUBMIT);
     g_sh->reset = !g_hud_done || g_reset_next;
     g_reset_next = 0;
     // frame generation's HUD-less image after SR: the game's own (fgb_hud_post) or the helper's SR output
@@ -1024,13 +1050,18 @@ void fgb_present(ID3D11Resource *backbuffer) {
     __atomic_store_n(&g_sh->frames, g_n + 1, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);
-    // at most one frame ahead of the helper (the Reflex sleep in the helper paces it)
+    // at most g_ahead frames ahead of the helper (the Reflex sleep in the helper paces it). 1 = the helper has presented
+    // the previous frame before the game starts the next; with 2 the game prepares frame n+1 while the helper still
+    // presents n-1 (one more frame of latency): in CPU-bound battles the 1-frame wait was ~25 % of the main thread
+    // (notes/part_cull_design.md). The shared textures stay safe: the game's GPU waits for g_fdone before it writes them
+    // again (wait_previous) and the SR output is double-buffered. Dev switch fgbridge_ahead.txt holding 1..3.
     ULONGLONG tick0 = GetTickCount64();
     QueryPerformanceCounter(&tp);
-    for (int i = 0; __atomic_load_n(&g_sh->done, __ATOMIC_ACQUIRE) + 1 < g_n + 1; i++) {
+    for (int i = 0; __atomic_load_n(&g_sh->done, __ATOMIC_ACQUIRE) + g_ahead < g_n + 1; i++) {
         if (g_sh->error || ((i & 63) == 0 && GetTickCount64() - tick0 > 250)) { g_pace_timeouts++; break; }
         if (i < 200) YieldProcessor(); else Sleep(0);
     }
+    PL(PS_PACE);
     g_pace_ms += ms_since(tp);
     g_present_ms += ms_since(t0);
     g_cpu_frames++;

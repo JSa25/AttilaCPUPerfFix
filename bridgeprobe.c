@@ -77,7 +77,7 @@ static int g_motion_on;
 unsigned fgb_sr_backend(void);
 static int g_copy_patched;         // the game's instance record copy calls fgm_copy (stays patched for the session)
 // the F11 panel (fgpanel.c)
-typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*sharp)(int choice); void (*view)(int choice); void (*vsync)(int on); void (*fps)(int on); void (*tech)(int sr, int fg); } FgpApply;
+typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*sharp)(int choice); void (*view)(int choice); void (*vsync)(int on); void (*fps)(int on); void (*tech)(int sr, int fg); void (*cull)(int choice); } FgpApply;
 void fgp_set_cap(int choice, unsigned fps);
 void fgp_set_preset(int choice);
 void fgp_set_sharp(int choice);
@@ -260,6 +260,7 @@ static int g_vdump_left, g_mp_on;
 static int g_shot_armed, g_shots;   // shot_take (AGENT_LOG 182)
 static float g_lod_extra;   // fsrtest.txt "bias=": added to the texture mip bias (AGENT_LOG 183)
 static unsigned g_vdump_frame;
+static unsigned g_vdump_counts[512], g_vdump_ncounts;   // extra index counts to dump (verts_counts.txt)
 static FILE *g_vdump;
 static int g_switch;   // a new helper after this frame's Present: an F11 pick of upscaler / frame generation, or recovery
 static void switch_now(void);
@@ -1252,10 +1253,14 @@ static unsigned long long fnv64(const void *p, size_t n) {
     return h;
 }
 
+
 static HRESULT STDMETHODCALLTYPE w_cvs(ID3D11Device *d, const void *bc, SIZE_T len, ID3D11ClassLinkage *cl, ID3D11VertexShader **out) {
-    HRESULT hr = r_cvs(d, bc, len, cl, out);
-    if (FAILED(hr) || !out || !*out) return hr;
     unsigned long long h = fnv64(bc, len);
+    {
+        HRESULT hr = r_cvs(d, bc, len, cl, out);
+        if (!g_mp_on || FAILED(hr) || !out || !*out) return hr;
+    }
+    HRESULT hr = S_OK;
     EnterCriticalSection(&g_mp_lock);
     unsigned i = (unsigned)(((UINT_PTR)*out >> 4) * 2654435761u) & 32767;
     for (unsigned k = 0; k < 32768; k++, i = (i + 1) & 32767)
@@ -1343,7 +1348,8 @@ static void mp_device(IUnknown *dev) {
     ID3D11Device *d = NULL;
     if (FAILED(IUnknown_QueryInterface(dev, &iid_dev, (void **)&d))) return;
     void **vt = *(void ***)d;
-    if (g_mp_on) patch_slot(&vt[offsetof(ID3D11DeviceVtbl, CreateVertexShader) / sizeof(void *)], (void *)w_cvs, (void **)&r_cvs);
+    if (g_mp_on)
+        patch_slot(&vt[offsetof(ID3D11DeviceVtbl, CreateVertexShader) / sizeof(void *)], (void *)w_cvs, (void **)&r_cvs);
     patch_slot(&vt[offsetof(ID3D11DeviceVtbl, CreateInputLayout) / sizeof(void *)], (void *)w_cil, (void **)&r_cil);
     patch_slot(&vt[offsetof(ID3D11DeviceVtbl, CreatePixelShader) / sizeof(void *)], (void *)w_cps, (void **)&r_cps);
     ID3D11Device_Release(d);
@@ -1389,7 +1395,9 @@ static void vdump_draw(ID3D11DeviceContext *c, UINT count, UINT start_idx, INT b
     ID3D11DeviceContext_VSGetShader(c, &vs, NULL, NULL);
     unsigned long long h = vs ? mp_vs_hash(vs) : 0;
     if (vs) ID3D11VertexShader_Release(vs);
-    if (h != 0x37ca95e9b122bd8dull && h != 0x416460f36ab45618ull) return;
+    int want = h == 0x37ca95e9b122bd8dull || h == 0x416460f36ab45618ull;
+    for (unsigned k = 0; k < g_vdump_ncounts && !want; k++) want = g_vdump_counts[k] == count;
+    if (!want) return;
     ID3D11Buffer *vb = NULL, *ib = NULL;
     UINT st = 0, of = 0, ibo = 0;
     DXGI_FORMAT ibf = DXGI_FORMAT_UNKNOWN;
@@ -1918,6 +1926,10 @@ static void panel_sharp(int choice) {
     g_log("settings panel: sharpness %s", SHARP_KEYS[g_sharp]);
     settings_save();
 }
+// Culling (partcull.c): Off / Light / Normal / Strong, applied and saved in heapfix.ini
+void culling_pick(int c);   // heapfix.c
+#define panel_cull culling_pick
+
 static void panel_fps(int corner) {
     g_fpsc = corner >= 0 && corner < 5 ? corner : 0;
     g_log("settings panel: frame-rate counter %s", FPSC_KEYS[g_fpsc]);
@@ -1960,7 +1972,8 @@ static void panel_vsync(int on) {
 
 // The F11 panel on the game's device with the current choices (motion: the row's state, -1 / -2 when it is not offered)
 static int panel_setup(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT w, UINT h, DXGI_FORMAT fmt, int motion) {
-    FgpApply ap = {panel_sr, panel_fg, panel_motion, panel_cap, panel_preset, panel_sharp, PANEL_VIEW, panel_vsync, panel_fps, PANEL_TECH};
+    FgpApply ap = {panel_sr, panel_fg, panel_motion, panel_cap, panel_preset, panel_sharp, PANEL_VIEW, panel_vsync, panel_fps, PANEL_TECH,
+                   panel_cull};
     if (!fgp_init(dev, ctx, w, h, fmt, g_sr, (int)g_fg, motion, ap)) return 0;
     fgp_set_preset(g_preset);
     fgp_set_sharp(g_sharp);

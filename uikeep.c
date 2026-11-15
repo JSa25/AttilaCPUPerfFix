@@ -103,33 +103,11 @@ static void uk_delete_body(void *mgr, const gname *name) {
 }
 
 #ifndef UIKEEP_TEST
-// FNV-1a of the code as on disk: these functions hold absolute addresses, which the loader moves with the DLL
-// (it is never at its preferred base 0x10000000 in game). The relocation table says where they are.
-static DWORD uk_fnv(const unsigned char *b, DWORD rva, DWORD n) {
-    unsigned char buf[0x200];
-    if (n + 8 > sizeof buf) return 0;
-    memcpy(buf, b + rva - 4, n + 8);  // 4 bytes either side: an address can straddle the start or end
-    DWORD delta = (DWORD)(UINT_PTR)b - 0x10000000u;
-    const IMAGE_NT_HEADERS32 *nt = (const IMAGE_NT_HEADERS32 *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);
-    const IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-    for (DWORD off = 0; delta && off + 8 <= dir->Size;) {
-        const IMAGE_BASE_RELOCATION *r = (const IMAGE_BASE_RELOCATION *)(b + dir->VirtualAddress + off);
-        if (r->SizeOfBlock < 8) break;
-        const WORD *e = (const WORD *)(r + 1);
-        for (DWORD i = 0; i < (r->SizeOfBlock - 8) / 2; i++) {
-            DWORD at = r->VirtualAddress + (e[i] & 0xFFF);
-            if (e[i] >> 12 == IMAGE_REL_BASED_HIGHLOW && at >= rva - 4 && at + 4 <= rva + n + 4)
-                *(DWORD *)(buf + at - (rva - 4)) -= delta;
-        }
-        off += r->SizeOfBlock;
-    }
-    return fnv1a(buf + 4, n);
-}
 
 int install_uikeep(HMODULE m, void (*log)(const char *fmt, ...)) {
     unsigned char *b = (unsigned char *)m, *site = b + game_rva(b, RVA_CALL);
-    DWORD hs = uk_fnv(b, game_rva(b, RVA_STEP), LEN_STEP), hd = uk_fnv(b, game_rva(b, RVA_DELETE), LEN_DELETE),
-          ha = uk_fnv(b, game_rva(b, RVA_ACQUIRE), LEN_ACQUIRE);
+    DWORD hs = fnv1a_unreloc(b, game_rva(b, RVA_STEP), LEN_STEP), hd = fnv1a_unreloc(b, game_rva(b, RVA_DELETE), LEN_DELETE),
+          ha = fnv1a_unreloc(b, game_rva(b, RVA_ACQUIRE), LEN_ACQUIRE);
     if ((hs != FNV_STEP && hs != FNV_STEP_GOG) || (hd != FNV_DELETE && hd != FNV_DELETE_GOG) || (ha != FNV_ACQUIRE && ha != FNV_ACQUIRE_GOG)) {
         log("menu textures (+0x%X) differ from this game version - not kept", RVA_STEP);
         return 0;
