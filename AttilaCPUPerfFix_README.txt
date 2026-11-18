@@ -197,6 +197,16 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 7.3:
+-Banner waving no longer touches other mods' models. Some mods' spears,
+ swords and shields were being treated as cloth and moved with it; only the
+ waved banner meshes are affected now.
+-Banners are lit the same on both sides. One side used to go dark or washed
+ out depending on where you stood.
+-Smoother cloth: the banner surface no longer shows the pattern of the
+ simulation behind it.
+-More banners wave, where a pack has the meshes for them.
+
 Version 7.2:
 -Waving banners: flags wave in battle where a pack with waved banner
  meshes is loaded. Nothing of it runs without such a pack, and flag_wave=0 in heapfix.ini turns

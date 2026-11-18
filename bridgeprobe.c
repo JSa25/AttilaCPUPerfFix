@@ -1373,15 +1373,33 @@ static void fs_frame(ID3D11DeviceContext *c) {
     g_fs_runs++;
     if (g_fs_runs % 1800 == 0 && g_log) {
         double ms = (double)g_fs_ticks / (double)fq.QuadPart * 1000.0 / 1800;
-        // FS_GATHER is 768 and cannot be raised without rebuilding match() (its single group is at the 32 KB
-        // groupshared limit), so the demand and the overflow are logged: what did not fit draws as a plain mesh,
-        // and because the list fills in draw order, which flags lose out moves with the camera.
-        unsigned peak = 0, lost = fs_dropped(&peak);
         g_log("flag sim: %d flag meshes known; per frame %.0f prop draws checked, %.1f flag draws, %.1f flag instances simulated; "
-              "our CPU time %.3f ms per frame (checks, copies, dispatch); %.2f new cloths and %.2f flags left out of the lookup per frame; "
-              "busiest frame wanted %u of the %d slots, %u instances dropped so far",
+              "our CPU time %.3f ms per frame (checks, copies, dispatch); %.2f new cloths and %.2f flags left out of the lookup per frame",
               fs_models(), (double)g_fs_draws / 1800, (double)g_fs_flagdraws / 1800, (double)g_fs_simmed / 1800, ms,
-              (double)(st[0] - st_logged[0]) / 1800, (double)(st[1] - st_logged[1]) / 1800, peak, FS_GATHER, lost);
+              (double)(st[0] - st_logged[0]) / 1800, (double)(st[1] - st_logged[1]) / 1800);
+        // The cloth budget, per pass and per frame. "flag instances simulated" above cannot answer this: fs_run returns
+        // min(total, FS_GATHER), so a saturated battle reads exactly FS_GATHER and says nothing about how far over the
+        // demand went. The main view fills the list first and the shadow pass takes the remainder, so only main-view
+        // frames over the budget cost a flag ON SCREEN its cloth; shadow frames cost only its shadow.
+        struct fs_demand dm;
+        fs_demand_stats(&dm);
+        if (dm.frames) {
+            char h0[FS_DM_BUCKETS * 12 + 1], h1[sizeof h0];
+            int n0 = 0, n1 = 0;
+            for (int i = 0; i < FS_DM_BUCKETS; i++) {
+                n0 += _snprintf(h0 + n0, sizeof h0 - n0, "%s%u", i ? "," : "", dm.hist[0][i]);
+                n1 += _snprintf(h1 + n1, sizeof h1 - n1, "%s%u", i ? "," : "", dm.hist[1][i]);
+            }
+            // the shadow pass's demand is still reported, but it takes no gather slots (flagsim.c fs_shadow_gather),
+            // so it costs nothing: it is here to show what the main view is being spared
+            g_log("flag budget (%u frames, %d slots a pass, buckets of %d from 0): main view asked peak %u, over budget in "
+                  "%u frames (%.2f%%), most it ever got %u; shadow asked peak %u (not gathered, costs no slots); "
+                  "%u instances dropped so far",
+                  dm.frames, FS_GATHER, FS_DM_STEP, dm.peak[0], dm.over[0], 100.0 * dm.over[0] / dm.frames,
+                  dm.peak_got_main, dm.peak[1], dm.dropped);
+            g_log("flag budget histogram, frames by instances asked for - main view: %s", h0);
+            g_log("flag budget histogram, frames by instances asked for - shadow:    %s", h1);
+        }
         st_logged[0] = st[0]; st_logged[1] = st[1];
         g_fs_draws = g_fs_flagdraws = g_fs_inst = g_fs_simmed = 0;
         g_fs_ticks = 0;

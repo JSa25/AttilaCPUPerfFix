@@ -18,7 +18,7 @@
 #define FS_N (FS_GX * FS_GY)
 #define FS_SLOTS 512
 #define FS_SLOT4 12
-#define FS_GATHER 768
+#define FS_GATHER 1024
 #define FS_NB 512
 #define FS_STR2(x) #x
 #define FS_STR(x) FS_STR2(x)
@@ -49,6 +49,8 @@ static const char flag_hlsl[] =
     // Catmull-Rom weights of the 4 points around t, and their slopes
     "float4 cr_w(float t) { float t2 = t * t, t3 = t2 * t; return 0.5 * float4(-t + 2.0 * t2 - t3, 2.0 - 5.0 * t2 + 3.0 * t3, t + 4.0 * t2 - 3.0 * t3, -t2 + t3); }\n"
     "float4 cr_d(float t) { float t2 = t * t; return 0.5 * float4(-1.0 + 4.0 * t - 3.0 * t2, -10.0 * t + 9.0 * t2, 1.0 + 8.0 * t - 9.0 * t2, -2.0 * t + 3.0 * t2); }\n"
+    "float4 bs_w(float t) { float t2 = t * t, t3 = t2 * t; return (1.0 / 6.0) * float4(1.0 - 3.0 * t + 3.0 * t2 - t3, 4.0 - 6.0 * t2 + 3.0 * t3, 1.0 + 3.0 * t + 3.0 * t2 - 3.0 * t3, t3); }\n"
+    "float4 bs_d(float t) { float t2 = t * t; return 0.5 * float4(-1.0 + 2.0 * t - t2, -4.0 * t + 3.0 * t2, 1.0 + 2.0 * t - 3.0 * t2, t2); }\n"
     "bool sim_place(VIn v, float x, float u, float far, float side, float ax, out float3 P, out float3 e, out float3 f, out float3 z, out float4 m0, out float4 m1, out float4 m2) {\n"
     "  P = 0.0; e = 0.0; f = 0.0; z = 0.0; m0 = v.r0; m1 = v.r1; m2 = v.r2;\n"
     // the flags simulated this frame, by 2 m cell of the ground (buckets after the header): the 2 x 2 cells around this
@@ -72,16 +74,19 @@ static const char flag_hlsl[] =
     "  }\n"
     "  if (best < 0) return false;\n"
     "  float4 s0 = fs_slot[best * FS_SLOT4], p4 = fs_slot[best * FS_SLOT4 + 4], p5 = fs_slot[best * FS_SLOT4 + 5];\n"
-    "  float fi = saturate((x - p4.x) / max(p4.y - p4.x, 1e-3)) * (FS_GX - 1), fj = saturate(u / far) * (FS_GY - 1);\n"
+    "  float fi = saturate((x - p4.x) / max(p4.y - p4.x, 1e-3)) * (FS_GX - 1);\n"
+    "  float du = abs(ax < 1.5 ? v.p.y - p5.x : v.p.z - p5.y);\n"
+    "  float fj = saturate(du / max(far, 1e-3)) * (FS_GY - 1);\n"
     "  int i0 = min((int)fi, FS_GX - 2), j0 = min((int)fj, FS_GY - 2);\n"
     "  float a = fi - i0, b = fj - j0;\n"
     // a smooth surface through the particles (Catmull-Rom, 4 x 4 around the cell; the edges repeat), and its slopes
-    "  float4 wa = cr_w(a), wb = cr_w(b), da = cr_d(a), db = cr_d(b);\n"
+    "  float4 wa = cr_w(a), wb = cr_w(b);\n"
+    "  float4 ba = bs_w(a), bb = bs_w(b), da = bs_d(a), db = bs_d(b);\n"
     "  float3 Ps = 0.0, Pa = 0.0, Pb = 0.0;\n"
     "  [unroll] for (int jj = 0; jj < 4; jj++) [unroll] for (int ii = 0; ii < 4; ii++) {\n"
     "    int gi = clamp(i0 - 1 + ii, 0, FS_GX - 1), gj = clamp(j0 - 1 + jj, 0, FS_GY - 1);\n"
     "    float3 q = fs_grid[best * FS_N + gj * FS_GX + gi].xyz;\n"
-    "    Ps += wa[ii] * wb[jj] * q; Pa += da[ii] * wb[jj] * q; Pb += wa[ii] * db[jj] * q;\n"
+    "    Ps += wa[ii] * wb[jj] * q; Pa += da[ii] * bb[jj] * q; Pb += ba[ii] * db[jj] * q;\n"
     "  }\n"
     "  e = normalize(Pa);\n"
     "  f = normalize(Pb);\n"
@@ -107,7 +112,11 @@ static const char flag_hlsl[] =
     "struct Wv { float3 p; float3 e; float3 f; float3 z; float side; float ax; float on; };\n"
     "Wv wave(VIn v) {\n"
     "  Wv r; r.p = v.p.xyz; r.e = float3(1.0, 0.0, 0.0); r.f = float3(0.0, 1.0, 0.0); r.z = float3(0.0, 0.0, 1.0); r.side = 1.0; r.ax = 1.0; r.on = 0.0;\n"
-    "  [branch] if (v.p.w != 1.0) {\n"
+    // our own cloth only. make_wave_pack guarantees |w| >= 2 (F is 2..31 plus a fraction under 1), and says so:
+    // "never 1.0: the game other models (w = 1.0) stay apart". Testing w != 1.0 instead caught every model whose w
+    // is anything else - w = 0 among them, which 1212 ships on its _w_mask banners and Dawnless Days evidently
+    // ships on spears, swords and shields: players saw those weapons flapping as cloth (report 2026-11-18).
+    "  [branch] if (abs(v.p.w) >= 2.0) {\n"
     // frac 0..0.5: cloth along y, k = 1 - 2 frac; 0.52..0.98: cloth along z (lance pennants), k = (0.98 - frac) / 0.46
     "    float aw = abs(v.p.w), F = floor(aw), fr = aw - F;\n"
     "    float ax = fr > 0.51 ? 2.0 : 1.0;\n"
@@ -158,6 +167,17 @@ static const char flag_hlsl[] =
     // a normal or tangent of the flat model (x along the pole, side * the out axis along the fibre, the thin axis across)
     // into the cloth's frame
     "float3 remap(float3 n, Wv r) { return n.x * r.e + (r.ax < 1.5 ? n.y : n.z) * r.side * r.f + (r.ax < 1.5 ? n.z : n.y) * r.z; }\n"
+    "float fs_flip(VIn v, Wv r, float3 nmodel, float3 nworld) {\n"
+    "  if (r.on == 0.0) return 1.0;\n"
+    // Both halves of the decision must be LOW FREQUENCY, or the shading snaps between neighbours and draws a
+    // line along every ripple crest (fscrest_test: 78 seams, neighbours as opposite as -0.9998).
+    // face: which sheet of the cloth this vertex is on - a property of the sheet, not of the curvature, so the
+    //       two faces end up sharing one normal.
+    // view: the whole flag instance taken into world, so it cannot differ between neighbouring vertices.
+    "  float face = (r.ax < 1.5 ? nmodel.z : nmodel.y) < 0.0 ? -1.0 : 1.0;\n"
+    "  float3 thin = r.ax < 1.5 ? float3(v.r0.z, v.r1.z, v.r2.z) : float3(v.r0.y, v.r1.y, v.r2.y);\n"
+    "  return face * (dot(thin, cam[12].xyz) > 0.0 ? -1.0 : 1.0);\n"
+    "}\n"
     "VOut main_vs(VIn v) {\n"
     "  VOut o;\n"
     "  Wv r = wave(v);\n"
@@ -168,9 +188,12 @@ static const char flag_hlsl[] =
     "  o.c1 = float4(c.x, c.y, c.w, v.i3.y);\n"
     "  o.t0 = w;\n"
     "  o.t1 = v.uv;\n"
-    "  float3 n = v.n0.xyz * 2.0 - 1.0;\n"
+    "  float3 nm0 = v.n0.xyz * 2.0 - 1.0;\n"
+    "  float3 n = nm0;\n"
     "  [branch] if (r.on != 0.0) n = remap(n, r);\n"
     "  n = float3(dot(n, v.r0.xyz), dot(n, v.r1.xyz), dot(n, v.r2.xyz));\n"
+    "  float sflip = fs_flip(v, r, nm0, n);\n"
+    "  n *= sflip;\n"
     "  o.t2 = float4(normalize(n), wind0.x);\n"
     "  n = v.n1.xyz * 2.0 - 1.0;\n"
     "  [branch] if (r.on != 0.0) n = remap(n, r);\n"
@@ -179,7 +202,7 @@ static const char flag_hlsl[] =
     "  n = v.n2.xyz * 2.0 - 1.0;\n"
     "  [branch] if (r.on != 0.0) n = remap(n, r);\n"
     "  n = float3(dot(n, v.r0.xyz), dot(n, v.r1.xyz), dot(n, v.r2.xyz));\n"
-    "  o.t4 = normalize(n);\n"
+    "  o.t4 = normalize(n) * sflip;\n"
     "  o.t5 = v.i3; o.t6 = v.i4; o.t7 = v.i5;\n"
     "  o.c2 = v.col; o.nrm = v.i6;\n"
     "  o.sel = t_sel.Load(int3(asint(v.iid) + asint(cfg[4].w), 0, 0)).x;\n"
@@ -222,7 +245,6 @@ static const char flag_cs_hlsl[] =
     // frame). The flags simulated this frame go into the lookup buckets after the header (by 2 m cell of the ground).
     "groupshared uint mclaim[FS_SLOTS];\n"
     "groupshared int mslot[FS_GATHER];\n"
-    "groupshared float3 mO[FS_GATHER];\n"
     // up to 12 flags a 2 m cell (4 left lancers' pennants out of the lookup in a tight formation: they flipped between
     // their cloth and the wave from frame to frame); counters for the log: new claims, flags left out of the lookup
     // bids doubles as each gathered flag's size and side|pass while the claims are sorted out (cleared after);
@@ -256,7 +278,7 @@ static const char flag_cs_hlsl[] =
     "    }\n"
     "  }\n"
     "  uint mpass = q1.z > 0.5 ? 1u : 0u;\n"
-    "  mslot[g] = -1; mO[g] = O;\n"
+    "  mslot[g] = -1;\n"
     "  if (g < FS_GATHER) { bids[2 * g] = asuint(q0.z); bids[2 * g + 1] = (asuint(q0.w) & ~1u) | mpass; }\n"   // size; side (its low mantissa bit) | pass
     "  GroupMemoryBarrierWithGroupSync();\n"
     // the claims: the main view's draw of a flag beats its shadow-pass draw (2026-11-12: the shadow pass can draw a moving
@@ -272,7 +294,9 @@ static const char flag_cs_hlsl[] =
     "  if (act && mslot[g] < 0) {\n"
     "    uint sz = bids[2 * g], sd = bids[2 * g + 1] & ~1u; bool share = false;\n"
     "    [loop] for (uint h = 0; h < ng && !share; h++) {\n"
-    "      if (h == g || abs(asfloat(bids[2 * h]) - asfloat(sz)) > 0.3 || (bids[2 * h + 1] & ~1u) != sd || length(mO[h] - O) > 0.35) continue;\n"
+    "      if (h == g || abs(asfloat(bids[2 * h]) - asfloat(sz)) > 0.3 || (bids[2 * h + 1] & ~1u) != sd) continue;\n"
+    "      float3 Oh = float3(asfloat(fs_gather.Load(h * 112 + 12)), asfloat(fs_gather.Load(h * 112 + 28)), asfloat(fs_gather.Load(h * 112 + 44)));\n"
+    "      if (length(Oh - O) > 0.35) continue;\n"
     "      if (mslot[h] >= 0) share = true;\n"
     "      else { uint ph = bids[2 * h + 1] & 1u; if (ph < mpass || (ph == mpass && h < g)) share = true; }\n"
     "    }\n"

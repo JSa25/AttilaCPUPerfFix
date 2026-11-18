@@ -66,8 +66,17 @@ static ID3D11UnorderedAccessView *fsg_slot_uav, *fsg_grid_uav;
 static ID3D11ComputeShader *fsg_match, *fsg_step;
 static float fsg_gp[FS_GATHER * 8 * 2];   // main-view draws from 0, shadow-pass draws from FS_GATHER (appended in fs_run)
 static unsigned fsg_ng, fsg_ns, fsg_frame = 100;
-static unsigned fsg_dropped, fsg_want, fsg_want_f;   // instances that did not fit in FS_GATHER, the busiest frame's demand
-unsigned fs_dropped(unsigned *peak_wanted) { if (peak_wanted) *peak_wanted = fsg_want; return fsg_dropped; }
+// How much cloth each pass asks for, frame by frame. The earlier counter added the two passes together, which cannot
+// answer the question that matters: the main view fills the list first and the shadow pass gets only the remainder
+// (fs_run), so a flag on screen loses its cloth only when the MAIN view's own demand passes FS_GATHER. A mean is no
+// use either - fs_run returns min(total, FS_GATHER), so once it saturates the average reads exactly FS_GATHER and
+// hides how far over the demand went. This keeps a distribution over frames per pass instead.
+static unsigned fsg_dropped;
+static struct fs_demand fsg_dm;
+static unsigned fsg_want_f[2];              // this frame's demand, [0] main view, [1] shadow
+static unsigned fsg_got_main;               // what the main view got this frame, before the shadow draws are appended
+void fs_demand_stats(struct fs_demand *out) { *out = fsg_dm; out->dropped = fsg_dropped; }
+static void fsd_bucket(unsigned *h, unsigned v) { unsigned b = v / FS_DM_STEP; h[b < FS_DM_BUCKETS ? b : FS_DM_BUCKETS - 1]++; }
 // tuning (flagvs.h tune0 / tune1): wind speed scale, air pressure, skin drag, still-air damping; turbulence, shear,
 // bending, gust size. Defaults = setting D, "deep rolling waves" (notes/banners.md, the user picked it), retuned
 // for the 24 x 36 grid to the same 1.5 flaps a second and 0.5 m tip swing
@@ -149,8 +158,17 @@ int fs_init(ID3D11Device *dev, char *err, int errlen) {
     return fsg_ready;
 }
 
+// The shadow pass costs the budget and buys almost nothing. It draws each flag once per cascade and the whole army,
+// not just what is on screen, so it is what fills FS_GATHER; but a shadow draw can never start a cloth (flagvs.h:
+// "need = mpass == 0"), never updates the slot's last-in-view, and the vertex shader finds a flag's cloth by its
+// ground cell, not by its place in the gather list. So a shadow draw of a flag the main view also drew still finds
+// the cloth with no entry of its own, and a flag only the shadow pass draws got no cloth before this either.
+// Set fs_shadow_gather back to 1 to get the old behaviour for an A/B.
+int fs_shadow_gather;
+
 void fs_gather(ID3D11DeviceContext *c, ID3D11Buffer *inst, UINT byte_off, UINT n, const float *prm) {
     if (!fsg_ready || !inst) return;
+    if (fs_pass && !fs_shadow_gather) { fsg_want_f[1] += n; return; }   // counted, so the log still shows what it would have asked for
     D3D11_BUFFER_DESC bd;
     ID3D11Buffer_GetDesc(inst, &bd);
     if (byte_off >= bd.ByteWidth) return;
@@ -160,7 +178,7 @@ void fs_gather(ID3D11DeviceContext *c, ID3D11Buffer *inst, UINT byte_off, UINT n
     // what does not fit gets no cloth and draws as the plain mesh. 768 is the ceiling of match()'s single thread
     // group (32 KB of groupshared, 1024 threads: nothing above 768/512 compiles, checked 2026-11-17), so the drop
     // is counted rather than hidden - which flags lose out follows draw order, so it moves with the camera.
-    fsg_want_f += n;
+    fsg_want_f[fs_pass ? 1 : 0] += n;
     if (n > FS_GATHER - *cnt) { fsg_dropped += n - (FS_GATHER - *cnt); n = FS_GATHER - *cnt; }
     if (n > (bd.ByteWidth - byte_off) / 112) n = (bd.ByteWidth - byte_off) / 112;
     if (!n) return;
@@ -229,6 +247,7 @@ static void fsr_frame(ID3D11DeviceContext *c, ID3D11Buffer *wind, ID3D11Buffer *
 
 unsigned fs_run(ID3D11DeviceContext *c, ID3D11Buffer *wind, ID3D11Buffer *cam, float dt, float t) {
     if (!fsg_ready) return 0;
+    fsg_got_main = fsg_ng;                                                      // before the shadow draws are appended
     unsigned add = fsg_ns < FS_GATHER - fsg_ng ? fsg_ns : FS_GATHER - fsg_ng;   // the shadow draws after the main view's
     if (add) {
         D3D11_BOX box = {0, 0, 0, add * 112, 1, 1};
@@ -237,8 +256,17 @@ unsigned fs_run(ID3D11DeviceContext *c, ID3D11Buffer *wind, ID3D11Buffer *cam, f
         fsg_ng += add;
     }
     fsg_ns = 0;
-    if (fsg_want_f > fsg_want) fsg_want = fsg_want_f;   // the busiest frame's demand, to size FS_GATHER against
-    fsg_want_f = 0;
+    // one row per frame, per pass: this is the whole measurement
+    fsg_dm.frames++;
+    fsd_bucket(fsg_dm.hist[0], fsg_want_f[0]);
+    fsd_bucket(fsg_dm.hist[1], fsg_want_f[1]);
+    if (fsg_want_f[0] > fsg_dm.peak[0]) fsg_dm.peak[0] = fsg_want_f[0];
+    if (fsg_want_f[1] > fsg_dm.peak[1]) fsg_dm.peak[1] = fsg_want_f[1];
+    if (fsg_want_f[0] > FS_GATHER) fsg_dm.over[0]++;          // a flag ON SCREEN lost its cloth in this frame
+    if (fsg_want_f[1] > FS_GATHER) fsg_dm.over[1]++;          // only shadows lost theirs
+    if (fsg_want_f[1] > FS_GATHER - fsg_got_main) fsg_dm.shadow_squeezed++;   // the main view left the shadow too little
+    if (fsg_got_main > fsg_dm.peak_got_main) fsg_dm.peak_got_main = fsg_got_main;
+    fsg_want_f[0] = fsg_want_f[1] = 0;
     unsigned ng = fsg_ng;
     if (dt < 1.0f / 240) dt = 1.0f / 240;
     if (dt > 1.0f / 30) dt = 1.0f / 30;

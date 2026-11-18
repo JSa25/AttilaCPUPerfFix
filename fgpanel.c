@@ -86,9 +86,9 @@ void fgp_set_cull_only(void) { p_cullonly = 1; p_page = 1; p_dirty = 1; }   // n
 #include "version.h"
 #define WN_POPUP 3   // lines of it in the pop-up
 static const wchar_t *const WHATS_NEW[] = {
-    L"Waving banners: flags wave in battle where a mod's pack has waved banner meshes.",
-    L"Mods without those meshes are untouched: nothing of the flag code runs until it finds one.",
-    L"Battles: one more of the render loops fetches what the game reads next before it stalls on it.",
+    L"Banner waving no longer touches other mods' models: some mods' spears and shields were moving as cloth.",
+    L"Banners are lit the same on both sides, and the cloth is smoother.",
+    L"More banners wave, where a pack has the meshes for them.",
 };
 #define WN_N (int)(sizeof WHATS_NEW / sizeof WHATS_NEW[0])
 // Pop-ups waiting (bits): 1 a note (fgp_set_note), 2 a newer version installed (fgp_set_update), 4 What's new after an update
