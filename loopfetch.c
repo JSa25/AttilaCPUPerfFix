@@ -1,8 +1,9 @@
 // Prefetch ahead in the battle render pass loops that walk an array of item pointers and stall on the first read
 // of a field of each item (AGENT_LOG 47-49). The array is known in advance, so while handling item i the stub asks
-// the CPU to start loading the field of item i+4 that the loop is about to read. It only prefetches through item
-// pointers, never loads: a loop can stop early, so a slot it never reaches may hold a stale pointer. The array itself
-// is only read inside the loop's range (i+4 < end). The loop's own instructions then run unchanged.
+// the CPU to start loading the fields of item i+4 (i+8 at the animation site) that the loop is about to read. It only
+// prefetches through item pointers, never loads: a loop can stop early, so a slot it never reaches may hold a stale
+// pointer. The array itself is only read inside the loop's range (i+4 < end). The loop's own instructions then run
+// unchanged.
 // Each site is a loop top that is the target of exactly one jb back-edge, with no jump into the patched bytes.
 #include <windows.h>
 #include <string.h>
@@ -56,9 +57,20 @@ static const struct site SITES[] = {
       0x0F, 0x18, 0x0A,            // prefetcht0 [edx]       the loop reads [item] first
       0x5A},                       // skip: pop edx
      19, 1, "render pass FUN_117b0400"},
+    // The loop reads and writes an item's +0x5c..+0x70 and +0xa4, never its first line: those two lines of item i+8.
+    // It was off while it fetched [item] and [item+60h] of i+4 (AGENT_LOG 48): [item] is a line the loop never reads
+    // and the line holding +0xa4 was never fetched at all.
     {0x182E0DA, 9, {0x8B, 0x40, 0x08, 0x8B, 0x0C, 0x88, 0x8B, 0x71, 0x60},
-     {0x52, 0x8B, 0x70, 0x08, 0x8D, 0x51, 0x04, 0x3B, 0x54, 0x24, 0x5C, 0x73, 0x0A, 0x8B, 0x14, 0x96, 0x0F, 0x18, 0x0A, 0x0F, 0x18, 0x4A, 0x60, 0x5A},
-     24, 0, "animation batching FUN_1182e080"},  // no gain once prefetch-only (AGENT_LOG 48)
+     {0x52,                        // push edx
+      0x8B, 0x70, 0x08,            // mov esi,[eax+8]        array (the original sets esi next)
+      0x8D, 0x51, 0x08,            // lea edx,[ecx+8]
+      0x3B, 0x54, 0x24, 0x5C,      // cmp edx,[esp+5Ch]      end (+4 for the push)
+      0x73, 0x0E,                  // jae skip
+      0x8B, 0x14, 0x96,            // mov edx,[esi+edx*4]    item i+8
+      0x0F, 0x18, 0x4A, 0x60,      // prefetcht0 [edx+60h]
+      0x0F, 0x18, 0x8A, 0xA4, 0x00, 0x00, 0x00,  // prefetcht0 [edx+0A4h]
+      0x5A},                       // skip: pop edx
+     28, 1, "animation batching FUN_1182e080"},
     {0x17B1560, 6, {0x8B, 0x40, 0x08, 0x8B, 0x7E, 0x70}, FETCH_EAX_LIST_EBP_I(0x3C), 23, 1, "render pass FUN_117b1520"},
     {0x17B0FC0, 6, {0x8B, 0x40, 0x08, 0x8B, 0x7E, 0x70}, FETCH_EAX_LIST_EBP_I(0x3C), 23, 1, "render pass FUN_117b0f80"},
     {0x17B0065, 6, {0x8B, 0x45, 0x0C, 0x8B, 0x40, 0x08},

@@ -197,6 +197,14 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 7.2:
+-Waving banners: flags wave in battle where a pack with waved banner
+ meshes is loaded. Nothing of it runs without such a pack, and flag_wave=0 in heapfix.ini turns
+ it off.
+-Animation batching: the loop now prefetches the two cache lines the game
+ reads from each item, instead of one it never touches. Seven of the battle
+ render loops are covered now instead of six.
+
 Version 7.1:
 -Unit detail cull: small parts of far-away soldiers (belts, quivers, bridles,
  crests) are not drawn. On by default, set to "light". Change it in the F8 panel, or with culling= in heapfix.ini (off, light,

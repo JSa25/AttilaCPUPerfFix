@@ -141,6 +141,7 @@ static int g_hud_this_frame, g_scene_last, g_frame_scaled;
 static float g_vp[16];
 
 static void (*g_log)(const char *fmt, ...);
+static int g_fw_on;   // flag wave (defined with it below)
 
 // Present statistics (reported every 30 s)
 static unsigned g_presents, g_present_other_thread, g_sync[5];
@@ -326,7 +327,7 @@ __attribute__((force_align_arg_pointer)) static void bp_enter(unsigned id, const
         return;
     }
     if (id == g_id_view) g_view_sp++;
-    if (id == g_id_stage && (g_capturing || g_motion)) mp_hook(g_capturing ? "stage entry" : NULL);
+    if (id == g_id_stage && (g_capturing || g_motion || g_fw_on)) mp_hook(g_capturing ? "stage entry" : NULL);   // the flag sim needs the draw hook too
     if (id == g_id_stage && g_live_state == 1) jit_install();
     unsigned vt = obj ? *(const unsigned *)obj - g_pt_base : 0;
     if (g_live_state == 1 && id == g_id_stage && (vt == g_vt_fx || vt == g_vt_fx_end)) {   // AMD FSR's reactive mask
@@ -1253,9 +1254,281 @@ static unsigned long long fnv64(const void *p, size_t n) {
     return h;
 }
 
+// ---- flag wave (notes/banners.md): the game's two rigid prop vertex shaders are created from our copies (flagvs.h:
+// identical for every model the game ships, flag cloth from the weight pack waves). flagtest.c (dlss/proof) checks them
+// against the game's. On unless flag_wave=0, and nothing of it runs until fs_scan finds a flag mesh (g_fw_armed).
+#include "flagvs.h"
+// the two shaders as bytecode, compiled by fwvs_gen.c at build time: compiling the HLSL here cost 264 ms of every
+// player's game start and needed d3dcompiler_47.dll, which a stripped Windows or Proton may not have.
+#if __has_include("flagvs_bc.h")
+#include "flagvs_bc.h"          // next to a copy of this file in build/ (reshade_test.c's broken copies)
+#else
+#include "build/flagvs_bc.h"
+#endif
+static int g_fw_on;
+static volatile LONG g_fw_swapped[2];
+// Wind for the shadow shader: the game binds its wind_VS block (cb2) only for the main view's prop shader. VSSetShader
+// hook: when the main view's shader is switched away from, its cb2 buffer is kept; when the shadow shader is set, that
+// buffer is lent to slot 2 and the game's own slot-2 buffer goes back before any other shader is set (or as soon as the
+// game sets slot 2 itself). The game draws the shadows first, so the shadows use the wind buffer's current contents.
+// Copies of each shader remembered. The game creates the prop shader many times over; at 4 (2026-11-12, Flag Wave)
+// most of 1212's main-view draws were not recognised, so they got no cloth and flickered.
+#define FW_NVS 64
+static ID3D11VertexShader *g_fw_vs[2][FW_NVS];   // our shader objects, by kind (main view, shadow)
+static ID3D11VertexShader *g_fw_own[2][FW_NVS];  // flagwave_ab.txt: the game's own shader for each of ours
+static int g_fw_ab;
+static int g_fw_cur = -1, g_fw_lent;
+static ID3D11Buffer *g_fw_wind, *g_fw_saved, *g_fw_stage;
+static ID3D11Buffer *g_fw_cam;        // the game's camera block (cb0): without it fs_run simulates every flag at full detail
+static unsigned g_fs_last_gather;     // the Present a flag was last gathered in: nothing on screen, nothing to simulate
+static unsigned g_fw_mains, g_fw_logged, g_fw_copied;
+static void(STDMETHODCALLTYPE *r_vsss)(ID3D11DeviceContext *, ID3D11VertexShader *, ID3D11ClassInstance *const *, UINT);
+static void(STDMETHODCALLTYPE *r_vscb)(ID3D11DeviceContext *, UINT, UINT, ID3D11Buffer *const *);
+static int fw_kind(ID3D11VertexShader *vs) {
+    for (int k = 0; k < 2; k++)
+        for (int i = 0; i < FW_NVS; i++)
+            if (vs && g_fw_vs[k][i] == vs) return k;
+    return -1;
+}
+static void fw_unlend(void) {
+    if (g_fw_saved) ID3D11Buffer_Release(g_fw_saved);
+    g_fw_saved = NULL;
+    g_fw_lent = 0;
+}
+// dev log: the game's wind values (first 3 times, every ~2000 switches away from the main view's prop shader)
+static void fw_log_wind(ID3D11DeviceContext *c) {
+    if (g_fw_logged >= 3 || !g_fw_wind || !g_log) return;
+    if (!g_fw_stage) {
+        D3D11_BUFFER_DESC bd;
+        ID3D11Buffer_GetDesc(g_fw_wind, &bd);
+        bd.Usage = D3D11_USAGE_STAGING; bd.BindFlags = 0; bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; bd.MiscFlags = 0; bd.StructureByteStride = 0;
+        ID3D11Device *d;
+        ID3D11DeviceContext_GetDevice(c, &d);
+        if (FAILED(ID3D11Device_CreateBuffer(d, &bd, NULL, &g_fw_stage))) g_fw_stage = NULL, g_fw_logged = 3;
+        ID3D11Device_Release(d);
+        if (!g_fw_stage) return;
+    }
+    if (!g_fw_copied) { ID3D11DeviceContext_CopyResource(c, (ID3D11Resource *)g_fw_stage, (ID3D11Resource *)g_fw_wind); g_fw_copied = 1; return; }
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ID3D11DeviceContext_Map(c, (ID3D11Resource *)g_fw_stage, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m))) return;
+    const float *f = m.pData;
+    g_log("flag wave: game wind_VS direction %.3f %.3f, gust start %.2f, vegetation multiplier %.3f, h strength %.3f, v strength %.3f",
+          f[0], f[1], f[2], f[3], f[4], f[5]);
+    ID3D11DeviceContext_Unmap(c, (ID3D11Resource *)g_fw_stage, 0);
+    g_fw_copied = 0;
+    g_fw_logged++;
+}
+// ---- the cloth simulation (flagsim.c, notes/banners.md): flag meshes are found by their marker vertex when the game
+// creates its vertex buffers (CreateBuffer hook); every draw with our prop shader set is checked against them and a
+// flag's instance records are gathered (a GPU copy); the first time one of our shaders is set in a new frame, the
+// previous frame's flags are simulated (compute), and while our shaders are set the results are lent to VS slots t14 /
+// t15 (the game's own views there go back before any other shader is set, as with the wind block).
+#include "flagsim.c"   // included, not linked: reshade_test.c builds this file as source too
+static int g_fs_ok, g_fs_lent;
+static unsigned g_fs_present;
+static LARGE_INTEGER g_fs_qpc0, g_fs_qpc_last;
+static ID3D11ShaderResourceView *g_fs_saved[2];
+static unsigned long long g_fs_ticks, g_fs_draws, g_fs_flagdraws, g_fs_inst, g_fs_runs, g_fs_simmed;
+static void(STDMETHODCALLTYPE *r_vssrv)(ID3D11DeviceContext *, UINT, UINT, ID3D11ShaderResourceView *const *);
+static HRESULT(STDMETHODCALLTYPE *r_cbuf)(ID3D11Device *, const D3D11_BUFFER_DESC *, const D3D11_SUBRESOURCE_DATA *, ID3D11Buffer **);
+static volatile LONG g_fs_found;
+// Set when the first marker vertex turns up. The game makes its prop shaders before any flag mesh is loaded (3 ms
+// earlier in the log), so they have to be replaced at creation; until this is set, w_vsss hands the game its own back
+// and does nothing else, so a player with no flag pack runs as if the flag code were not here.
+static volatile LONG g_fw_armed;
+static HRESULT STDMETHODCALLTYPE w_cbuf(ID3D11Device *d, const D3D11_BUFFER_DESC *bd, const D3D11_SUBRESOURCE_DATA *sd, ID3D11Buffer **out) {
+    HRESULT hr = r_cbuf(d, bd, sd, out);
+    if (SUCCEEDED(hr) && out && *out && bd && sd && sd->pSysMem && (bd->BindFlags & D3D11_BIND_VERTEX_BUFFER)) {
+        int f = fs_scan(*out, sd->pSysMem, bd->ByteWidth);
+        if (f) {
+            g_fw_armed = 1;
+            if (InterlockedExchangeAdd(&g_fs_found, f) == 0 && g_log) g_log("flag sim: first flag meshes found in a new vertex buffer (%d) - flag code armed", f);
+        }
+    }
+    return hr;
+}
+static void fs_unlend(void) {
+    for (int i = 0; i < 2; i++) if (g_fs_saved[i]) ID3D11ShaderResourceView_Release(g_fs_saved[i]), g_fs_saved[i] = NULL;
+    g_fs_lent = 0;
+}
+static void fs_frame(ID3D11DeviceContext *c) {
+    LARGE_INTEGER now, fq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&fq);
+    if (!g_fs_ok) {
+        ID3D11Device *d = NULL;
+        ID3D11DeviceContext_GetDevice(c, &d);
+        char err[600] = "";
+        g_fs_ok = d && fs_init(d, err, sizeof err) ? 1 : -1;
+        if (d) ID3D11Device_Release(d);
+        if (g_log) g_log("flag sim %s%s%s", g_fs_ok > 0 ? "set up" : "NOT set up: ", g_fs_ok > 0 ? "" : err, "");
+        g_fs_qpc0 = g_fs_qpc_last = now;
+    }
+    if (g_fs_ok < 0) return;
+    float dt = (float)(now.QuadPart - g_fs_qpc_last.QuadPart) / (float)fq.QuadPart, t = (float)(now.QuadPart - g_fs_qpc0.QuadPart) / (float)fq.QuadPart;
+    g_fs_qpc_last = now;
+    g_fs_simmed += fs_run(c, g_fw_wind, g_fw_cam, dt, t);
+    static unsigned st[2], st_logged[2];   // GPU running totals: new cloths started, flags left out of the shader's lookup
+    fs_stats(c, st);
+    g_fs_runs++;
+    if (g_fs_runs % 1800 == 0 && g_log) {
+        double ms = (double)g_fs_ticks / (double)fq.QuadPart * 1000.0 / 1800;
+        // FS_GATHER is 768 and cannot be raised without rebuilding match() (its single group is at the 32 KB
+        // groupshared limit), so the demand and the overflow are logged: what did not fit draws as a plain mesh,
+        // and because the list fills in draw order, which flags lose out moves with the camera.
+        unsigned peak = 0, lost = fs_dropped(&peak);
+        g_log("flag sim: %d flag meshes known; per frame %.0f prop draws checked, %.1f flag draws, %.1f flag instances simulated; "
+              "our CPU time %.3f ms per frame (checks, copies, dispatch); %.2f new cloths and %.2f flags left out of the lookup per frame; "
+              "busiest frame wanted %u of the %d slots, %u instances dropped so far",
+              fs_models(), (double)g_fs_draws / 1800, (double)g_fs_flagdraws / 1800, (double)g_fs_simmed / 1800, ms,
+              (double)(st[0] - st_logged[0]) / 1800, (double)(st[1] - st_logged[1]) / 1800, peak, FS_GATHER, lost);
+        st_logged[0] = st[0]; st_logged[1] = st[1];
+        g_fs_draws = g_fs_flagdraws = g_fs_inst = g_fs_simmed = 0;
+        g_fs_ticks = 0;
+    }
+}
+// a draw with one of our shaders set: a flag mesh's instances are gathered for the next frame's simulation
+static void fs_draw(ID3D11DeviceContext *c, UINT inst, INT bv, UINT sinst) {
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    ID3D11Buffer *vb[2] = {0};
+    UINT st[2] = {0}, of[2] = {0};
+    ID3D11DeviceContext_IAGetVertexBuffers(c, 0, 2, vb, st, of);
+    const float *prm = vb[0] ? fs_is_flag(vb[0], of[0] + (UINT)bv * st[0]) : NULL;
+    if (prm && vb[1] && st[1] == 112) {
+        // Which list the draw goes in. The shadow pass draws first and each flag once per cascade, so left at 0 its
+        // draws fill all FS_GATHER slots of the main view's list and the flags on screen get no cloth (flagsim.c).
+        fs_pass = g_fw_cur == 1;
+        fs_gather(c, vb[1], of[1] + sinst * 112, inst, prm);
+        g_fs_flagdraws++;
+        g_fs_inst += inst;
+        g_fs_last_gather = g_presents;
+    }
+    g_fs_draws++;
+    if (vb[0]) ID3D11Buffer_Release(vb[0]);
+    if (vb[1]) ID3D11Buffer_Release(vb[1]);
+    QueryPerformanceCounter(&b);
+    g_fs_ticks += (unsigned long long)(b.QuadPart - a.QuadPart);
+}
+// flagwave_ab.txt (FPS test): the flag wave on in even 10 s windows of UTC time, off in odd (the same windows as the other
+// fixes' A/B, so fps_log.csv's seconds can be split); off = the game's own prop shaders, no simulation, no gathering
+static int fw_ab_on(void) {
+    if (!g_fw_ab) return 1;
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    int on = !((((ULONGLONG)ft.dwHighDateTime << 32 | ft.dwLowDateTime) / 100000000ULL) & 1);
+    static int last = -1;
+    if (on != last && g_log) g_log("flag wave A/B: %s", on ? "ON" : "off");
+    last = on;
+    return on;
+}
+// Ctrl+Shift+F while the game's window is in front: the flag wave off / on, once per press. heapfix.ini's flag_wave
+// decides whether any of this is installed; this is the in-game switch, for looking at one scene both ways.
+static volatile LONG g_fw_off;
+static void fw_hotkey(void) {
+    if (!g_fw_on) return;
+    static int was;
+    int down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('F') & 0x8000);
+    if (down && !was) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+        if (pid == GetCurrentProcessId() && g_log) g_log("flag wave %s (Ctrl+Shift+F)", InterlockedXor(&g_fw_off, 1) ? "ON" : "OFF");
+    }
+    was = down;
+}
+static void STDMETHODCALLTYPE w_vsss(ID3D11DeviceContext *c, ID3D11VertexShader *vs, ID3D11ClassInstance *const *ci, UINT n) {
+    int k = fw_kind(vs);
+    // No flag mesh has been seen yet, or the A/B is in an off window: the game's own shader, as if the flag wave were
+    // not there. k = -1 then skips the wind block, the cloth frame, the lending and fs_draw, so nothing below runs.
+    if (k >= 0 && (!g_fw_armed || g_fw_off || (g_fw_ab && !fw_ab_on()))) {
+        for (int i = 0; i < FW_NVS; i++) if (g_fw_vs[k][i] == vs && g_fw_own[k][i]) { vs = g_fw_own[k][i]; break; }
+        k = -1;
+    }
+    if (g_fw_cur == 0 && k != 0) {   // leaving the main view's prop shader: its wind block is in slot 2
+        ID3D11Buffer *b = NULL;
+        ID3D11DeviceContext_VSGetConstantBuffers(c, 2, 1, &b);
+        if (b && b != g_fw_wind) { if (g_fw_wind) ID3D11Buffer_Release(g_fw_wind); g_fw_wind = b; if (g_fw_stage) ID3D11Buffer_Release(g_fw_stage), g_fw_stage = NULL, g_fw_copied = 0; }
+        else if (b) ID3D11Buffer_Release(b);
+        b = NULL;   // and its camera block (cb0): flags far from the camera simulate less often
+        ID3D11DeviceContext_VSGetConstantBuffers(c, 0, 1, &b);
+        if (b && b != g_fw_cam) { if (g_fw_cam) ID3D11Buffer_Release(g_fw_cam); g_fw_cam = b; }
+        else if (b) ID3D11Buffer_Release(b);
+        if (++g_fw_mains % 2000 == 1 || g_fw_copied) fw_log_wind(c);
+    }
+    if (g_fw_lent && k != 1) {
+        r_vscb(c, 2, 1, &g_fw_saved);
+        fw_unlend();
+    }
+    if (g_fs_lent && k < 0) {
+        r_vssrv(c, 14, 2, g_fs_saved);
+        fs_unlend();
+    }
+    // The first of our shaders this frame: simulate the last frame's flags. Once the cloth is set up, only while flags
+    // are actually being drawn - with none gathered for 12 Presents there is nothing on screen to simulate.
+    if (k >= 0 && g_presents != g_fs_present && (g_fs_ok == 0 || g_presents - g_fs_last_gather <= 12)) {
+        g_fs_present = g_presents;
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        if (g_fs_lent) { r_vssrv(c, 14, 2, g_fs_saved); fs_unlend(); }   // our views off the VS before they become UAVs
+        fs_frame(c);
+        QueryPerformanceCounter(&b);
+        g_fs_ticks += (unsigned long long)(b.QuadPart - a.QuadPart);
+    }
+    r_vsss(c, vs, ci, n);
+    if (k == 1 && g_fw_wind && !g_fw_lent) {
+        ID3D11DeviceContext_VSGetConstantBuffers(c, 2, 1, &g_fw_saved);
+        r_vscb(c, 2, 1, &g_fw_wind);
+        g_fw_lent = 1;
+    }
+    if (k >= 0 && g_fs_ok > 0 && !g_fs_lent) {
+        ID3D11ShaderResourceView *ours[2];
+        fs_vs_views(ours);
+        ID3D11DeviceContext_VSGetShaderResources(c, 14, 2, g_fs_saved);
+        r_vssrv(c, 14, 2, ours);
+        g_fs_lent = 1;
+    }
+    g_fw_cur = k;
+}
+static void STDMETHODCALLTYPE w_vscb(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11Buffer *const *b) {
+    if (g_fw_lent && start <= 2 && start + n > 2) fw_unlend();   // the game sets slot 2 itself: nothing to give back
+    r_vscb(c, start, n, b);
+}
+static void STDMETHODCALLTYPE w_vssrv(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11ShaderResourceView *const *v) {
+    if (g_fs_lent && start <= 15 && start + n > 14) fs_unlend();   // the game sets t14 / t15 itself
+    r_vssrv(c, start, n, v);
+}
 
 static HRESULT STDMETHODCALLTYPE w_cvs(ID3D11Device *d, const void *bc, SIZE_T len, ID3D11ClassLinkage *cl, ID3D11VertexShader **out) {
     unsigned long long h = fnv64(bc, len);
+    if (g_fw_on && (h == 0x55ca645c65c0fbe6ull || h == 0xeb3006be08a96700ull)) {
+        int k = h != 0x55ca645c65c0fbe6ull;
+        HRESULT hr = r_cvs(d, flag_vs_bc[k], flag_vs_bclen[k], cl, out);
+        if (SUCCEEDED(hr)) {
+            LONG nth = InterlockedIncrement(&g_fw_swapped[k]);
+            if (nth == 1 && g_log) g_log("flag wave: %s shader created from ours", k ? "shadow" : "main view");
+            if (out && *out) g_fw_vs[k][(nth - 1) % FW_NVS] = *out;
+            if (nth == FW_NVS + 1 && g_log) g_log("flag wave: %s shader made from ours %ld times - more than remembered", k ? "shadow" : "main view", nth);
+            if (g_fw_ab && out && *out) {   // A/B: the game's own shader too, drawn in the off windows
+                ID3D11VertexShader *own = NULL;
+                if (SUCCEEDED(r_cvs(d, bc, len, cl, &own))) g_fw_own[k][(nth - 1) % FW_NVS] = own;
+            }
+            if (!r_vsss) {
+                ID3D11DeviceContext *c = NULL;
+                ID3D11Device_GetImmediateContext(d, &c);
+                if (c) {
+                    void **vt = *(void ***)c;
+                    if (!g_ctx) { g_ctx = c; ID3D11DeviceContext_AddRef(c); }   // the draw hooks (mp_hook) need it without the frame bridge
+                    patch_slot(&vt[offsetof(ID3D11DeviceContextVtbl, VSSetConstantBuffers) / sizeof(void *)], (void *)w_vscb, (void **)&r_vscb);
+                    patch_slot(&vt[offsetof(ID3D11DeviceContextVtbl, VSSetShaderResources) / sizeof(void *)], (void *)w_vssrv, (void **)&r_vssrv);
+                    if (r_vscb && r_vssrv) patch_slot(&vt[offsetof(ID3D11DeviceContextVtbl, VSSetShader) / sizeof(void *)], (void *)w_vsss, (void **)&r_vsss);
+                    ID3D11DeviceContext_Release(c);
+                }
+            }
+        }
+        else { hr = r_cvs(d, bc, len, cl, out); if (g_log) g_log("flag wave: ours refused (0x%08lx) - the game's own", (unsigned long)hr); }   // the game's own
+        if (!g_mp_on) return hr;
+        if (FAILED(hr) || !out || !*out) return hr;
+    } else
     {
         HRESULT hr = r_cvs(d, bc, len, cl, out);
         if (!g_mp_on || FAILED(hr) || !out || !*out) return hr;
@@ -1343,15 +1616,16 @@ static int mp_layout(const void *il) {
 static void patch_slot(void **slot, void *to, void **old);
 static void mp_device(IUnknown *dev) {
     static int done;
-    if (!(g_mp_on || g_motion) || done || !dev) return;
+    if (!(g_mp_on || g_motion || g_fw_on) || done || !dev) return;
     static const GUID iid_dev = {0xdb6f6ddb, 0xac77, 0x4e88, {0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40}};   // ID3D11Device
     ID3D11Device *d = NULL;
     if (FAILED(IUnknown_QueryInterface(dev, &iid_dev, (void **)&d))) return;
     void **vt = *(void ***)d;
-    if (g_mp_on)
+    if (g_mp_on || g_fw_on)
         patch_slot(&vt[offsetof(ID3D11DeviceVtbl, CreateVertexShader) / sizeof(void *)], (void *)w_cvs, (void **)&r_cvs);
     patch_slot(&vt[offsetof(ID3D11DeviceVtbl, CreateInputLayout) / sizeof(void *)], (void *)w_cil, (void **)&r_cil);
     patch_slot(&vt[offsetof(ID3D11DeviceVtbl, CreatePixelShader) / sizeof(void *)], (void *)w_cps, (void **)&r_cps);
+    if (g_fw_on) patch_slot(&vt[offsetof(ID3D11DeviceVtbl, CreateBuffer) / sizeof(void *)], (void *)w_cbuf, (void **)&r_cbuf);   // flag sim: marker vertices
     ID3D11Device_Release(d);
     done = 1;
 }
@@ -1576,6 +1850,7 @@ static void STDMETHODCALLTYPE w_dii(ID3D11DeviceContext *c, UINT ic, UINT inst, 
     g_hk[HK_DRAW]++;
     mp_draw(c, "DrawIndexedInstanced", ic, inst, sinst);
     vdump_draw(c, ic, si, bv);
+    if (g_fw_on && g_fw_cur >= 0 && c == g_ctx) fs_draw(c, inst, bv, sinst);
     if (g_motion && c == g_ctx && GetCurrentThreadId() == g_pt_main) {
         unsigned vt = mp_stage_vt();
         if (vt == g_vt_main || (vt && (vt == g_vt_pre[0] || vt == g_vt_pre[1] || vt == g_vt_pre[2]))) fgm_draw(c, ic, inst, si, bv, sinst);
@@ -1683,7 +1958,7 @@ static HRESULT STDMETHODCALLTYPE w_map(ID3D11DeviceContext *c, ID3D11Resource *r
 // because something replaced them (campaign run 2026-10-28: draws were seen in the shadow stage only, then none). A slot
 // found replaced is logged with the module that owns the new pointer and hooked again on top of it.
 static void mp_hook(const char *where) {
-    if (!(g_mp_on || g_motion) || !g_ctx) return;
+    if (!(g_mp_on || g_motion || g_fw_on) || !g_ctx) return;
     void **vt = *(void ***)g_ctx;
     static const struct { size_t off; const char *name; } slots[5] = {
         {offsetof(ID3D11DeviceContextVtbl, DrawIndexedInstanced), "DrawIndexedInstanced"},
@@ -2533,6 +2808,24 @@ static int cam_hook(HMODULE m, void (*log)(const char *fmt, ...)) {
     return 1;
 }
 
+// flag_wave=0 under [fixes] in heapfix.ini, or flagwave_off.txt in the game folder: none of the flag hooks go in, so a
+// benchmark run carries none of this even with a flag pack loaded. heapfix.c's fix_off is static to that file, so the
+// same rule is spelled out again here.
+static int fw_switched_off(const wchar_t *dir, void (*log)(const char *fmt, ...)) {
+    wchar_t p[MAX_PATH], v[32];
+    _snwprintf(p, MAX_PATH, L"%ls\\flagwave_off.txt", dir);
+    int off = GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
+    if (!off) {
+        _snwprintf(p, MAX_PATH, L"%ls\\heapfix.ini", dir);
+        if (GetPrivateProfileStringW(L"fixes", L"flag_wave", L"", v, 32, p))
+            off = (v[0] >= L'0' && v[0] <= L'9') || v[0] == L'-'
+                      ? _wtoi(v) == 0
+                      : !_wcsicmp(v, L"off") || !_wcsicmp(v, L"false") || !_wcsicmp(v, L"no");
+    }
+    if (off) log("flag wave switched off (heapfix.ini flag_wave=0 or flagwave_off.txt) - not installed");
+    return off;
+}
+
 int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...)) {
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((unsigned char *)m + ((IMAGE_DOS_HEADER *)m)->e_lfanew);
     g_mod_size = nt->OptionalHeader.SizeOfImage;
@@ -2558,6 +2851,17 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
             g_mp_on = g_mp_il && g_mp_vsf;
             log("motion probe %s: vertex shaders to motion_vs.bin, draws logged in bridge captures", g_mp_on ? "on" : "NOT on");
         }
+    }
+    if (!fw_switched_off(dir, log)) {
+        // On for every player: the game's prop shaders are made from ours so that a waved flag mesh can move. Until
+        // fs_scan finds one, w_vsss hands the game its own shader back and nothing else of this runs (g_fw_armed).
+        wchar_t fp[MAX_PATH];
+        g_fw_on = 1;
+        log("flag wave ready: the game's prop shaders 55ca645c (main view) and eb3006be (shadows) are made from ours; "
+            "the cloth starts when a flag pack with waved meshes is loaded");
+        _snwprintf(fp, MAX_PATH, L"%ls\\flagwave_ab.txt", dir);
+        g_fw_ab = GetFileAttributesW(fp) != INVALID_FILE_ATTRIBUTES;
+        if (g_fw_ab) log("flag wave A/B: on in even 10 s windows of UTC time, off in odd (flagwave_ab.txt)");
     }
     g_log = log;
     wchar_t p[MAX_PATH];

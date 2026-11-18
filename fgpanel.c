@@ -86,11 +86,9 @@ void fgp_set_cull_only(void) { p_cullonly = 1; p_page = 1; p_dirty = 1; }   // n
 #include "version.h"
 #define WN_POPUP 3   // lines of it in the pop-up
 static const wchar_t *const WHATS_NEW[] = {
-    L"Culling (F8): small parts of far-away soldiers are not drawn in big battles. On at light - change it in the panel.",
-    L"Battles: the unit cards are drawn from a cache instead of every frame.",
-    L"F8 opens the panel without the upscaling add-on too (Culling and What's new).",
-    L"Huge battles: the game's sound memory running full no longer closes the game.",
-    L"A message when a newer version is installed: keep playing, restart the game to use it.",
+    L"Waving banners: flags wave in battle where a mod's pack has waved banner meshes.",
+    L"Mods without those meshes are untouched: nothing of the flag code runs until it finds one.",
+    L"Battles: one more of the render loops fetches what the game reads next before it stalls on it.",
 };
 #define WN_N (int)(sizeof WHATS_NEW / sizeof WHATS_NEW[0])
 // Pop-ups waiting (bits): 1 a note (fgp_set_note), 2 a newer version installed (fgp_set_update), 4 What's new after an update

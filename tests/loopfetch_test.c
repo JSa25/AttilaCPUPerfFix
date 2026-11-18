@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
 
     HMODULE m = LoadLibraryExA(argv[1], NULL, DONT_RESOLVE_DLL_REFERENCES);
     CHECK0(m);
-    CHECK0(install_loopfetch(m, say) == 6);
+    CHECK0(install_loopfetch(m, say) == 7);
     CHECK0(install_loopfetch(m, say) == 0);
     printf("all loop prefetch tests passed\n");
     return 0;

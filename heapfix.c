@@ -589,7 +589,7 @@ static void install_all(HMODULE m) {
     if (fix_off(L"render_loop_prefetch", L"loopfetch_off.txt", "render loop prefetch", "not installed")) st[S_PREFETCH] = FIX_SWITCHED_OFF;
     else {
         int n = install_loopfetch(m, wlog);
-        st[S_PREFETCH] = n >= 6 ? FIX_ON : n ? FIX_PARTLY : FIX_INACTIVE;
+        st[S_PREFETCH] = n >= 7 ? FIX_ON : n ? FIX_PARTLY : FIX_INACTIVE;
     }
     // Loading: packs through the file cache, buffered small reads of the save (fileio.c), then the missing-folder
     // cache for loose-file checks and opens (attrcache.c), whose open hook calls fileio's.
@@ -657,6 +657,14 @@ static void install_all(HMODULE m) {
         g_passtime_on = install_passtime(m, wlog) > 0;
         if (g_passtime_on) g_frame_check = frame_checks;
     } else {   // without the add-on: the F8 panel (Culling, What's new) and the pop-ups on the game's own frames (overlay.c)
+        // The flag wave hangs off the same lean bridge the add-on brings up (bridgeprobe.c needs its stage hook for the
+        // draw hooks), so that goes in for everyone unless flag_wave=0. None of the flag code runs until a waved flag
+        // mesh turns up in a vertex buffer, so a player without such a pack carries the hooks and does no work.
+        if (!fix_off(L"flag_wave", L"flagwave_off.txt", "flag wave", "not installed")) {
+            g_pt_force_bridge = 1;
+            g_passtime_on = install_passtime(m, wlog) > 0;
+            if (g_passtime_on) g_frame_check = frame_checks;
+        }
         int install_overlay(HMODULE m, void (*log)(const char *fmt, ...));
         install_overlay(m, wlog);
     }

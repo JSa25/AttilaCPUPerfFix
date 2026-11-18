@@ -12,6 +12,7 @@ void fs_tune(const float *eight);                                               
 void fs_vs_views(ID3D11ShaderResourceView **two);                                 // for VS slots t14, t15
 ID3D11Buffer *fs_debug_buffer(int which);                                         // 0 slots, 1 grid (tests)
 int fs_stats(ID3D11DeviceContext *c, unsigned out[2]);                            // running totals: new claims, flags left out of the lookup
+unsigned fs_dropped(unsigned *peak_wanted);                                       // instances FS_GATHER had no room for; the busiest frame's demand
 int fs_record_start(const wchar_t *path, int frames);                                 // flight recorder: the next frames to a file (flagreplay.c)
 int fs_recording(void);
 extern int fs_pass;                                                                // 0 main view, 1 shadow pass (set before fs_gather)

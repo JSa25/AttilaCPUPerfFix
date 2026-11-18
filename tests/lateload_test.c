@@ -316,7 +316,7 @@ int main(int argc, char **argv) {
     CHECK(has("battle draw-list sort replaced") && has("render-list sort (+0x4C/+0x48) replaced"));
     CHECK(has("batch fix installed") && has("campaign fix: 4 of 4") && has("x87 fix: 1277 of 1277"));
     CHECK(has("height cache installed") && has("memcpy fast path installed"));
-    CHECK((has("loop prefetch: 6 of 6") || has("loop prefetch: 7 of 7")) &&  // dev builds: + effects emitter site
+    CHECK((has("loop prefetch: 7 of 7") || has("loop prefetch: 8 of 8")) &&  // dev builds: + effects emitter site
           (has("frame hook ready") || has("FPS logger ready")));                // dev builds: FPS logger
     CHECK(!has("does not match") && !has("differs") && !has("skipped") && !has("not the game"));
 

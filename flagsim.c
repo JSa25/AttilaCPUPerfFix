@@ -66,6 +66,8 @@ static ID3D11UnorderedAccessView *fsg_slot_uav, *fsg_grid_uav;
 static ID3D11ComputeShader *fsg_match, *fsg_step;
 static float fsg_gp[FS_GATHER * 8 * 2];   // main-view draws from 0, shadow-pass draws from FS_GATHER (appended in fs_run)
 static unsigned fsg_ng, fsg_ns, fsg_frame = 100;
+static unsigned fsg_dropped, fsg_want, fsg_want_f;   // instances that did not fit in FS_GATHER, the busiest frame's demand
+unsigned fs_dropped(unsigned *peak_wanted) { if (peak_wanted) *peak_wanted = fsg_want; return fsg_dropped; }
 // tuning (flagvs.h tune0 / tune1): wind speed scale, air pressure, skin drag, still-air damping; turbulence, shear,
 // bending, gust size. Defaults = setting D, "deep rolling waves" (notes/banners.md, the user picked it), retuned
 // for the 24 x 36 grid to the same 1.5 flaps a second and 0.5 m tip swing
@@ -155,7 +157,11 @@ void fs_gather(ID3D11DeviceContext *c, ID3D11Buffer *inst, UINT byte_off, UINT n
     // the shadow pass draws first and each flag once per cascade: its draws wait in the second half and only fill what
     // the main view leaves (2026-11-12 recording: 768 shadow draws filled the list, the flags on screen got no cloth)
     unsigned *cnt = fs_pass ? &fsg_ns : &fsg_ng, base = fs_pass ? FS_GATHER : 0;
-    if (n > FS_GATHER - *cnt) n = FS_GATHER - *cnt;
+    // what does not fit gets no cloth and draws as the plain mesh. 768 is the ceiling of match()'s single thread
+    // group (32 KB of groupshared, 1024 threads: nothing above 768/512 compiles, checked 2026-11-17), so the drop
+    // is counted rather than hidden - which flags lose out follows draw order, so it moves with the camera.
+    fsg_want_f += n;
+    if (n > FS_GATHER - *cnt) { fsg_dropped += n - (FS_GATHER - *cnt); n = FS_GATHER - *cnt; }
     if (n > (bd.ByteWidth - byte_off) / 112) n = (bd.ByteWidth - byte_off) / 112;
     if (!n) return;
     D3D11_BOX box = {byte_off, 0, 0, byte_off + n * 112, 1, 1};   // the draw's records in one copy
@@ -231,6 +237,8 @@ unsigned fs_run(ID3D11DeviceContext *c, ID3D11Buffer *wind, ID3D11Buffer *cam, f
         fsg_ng += add;
     }
     fsg_ns = 0;
+    if (fsg_want_f > fsg_want) fsg_want = fsg_want_f;   // the busiest frame's demand, to size FS_GATHER against
+    fsg_want_f = 0;
     unsigned ng = fsg_ng;
     if (dt < 1.0f / 240) dt = 1.0f / 240;
     if (dt > 1.0f / 30) dt = 1.0f / 30;
