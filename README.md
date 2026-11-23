@@ -103,9 +103,10 @@ matches the header the plugin is built against.
 engine, which is not published, the same reason `shared/flagvs_bc.h` is committed on the 32-bit side.
 
 `tools/gen_sol_sites.py` reads a checkout of
-[Sol-Invictus2/64-bit-Attila](https://github.com/Sol-Invictus2/64-bit-Attila) and writes the loader's patch sites for
-the mock-loader test. **The build does not need it**, and its output is never committed here: that table is derived
-from Sol Invictus's code and is his to license, not ours.
+[Sol-Invictus2/64-bit-Attila](https://github.com/Sol-Invictus2/64-bit-Attila) (MIT) and writes the loader's patch
+sites for the mock-loader test. **The build does not need it.** Its output is not committed here for the same reason
+the other generated files are not: it is made from one version of the loader, so a committed copy would go stale
+without anyone noticing.
 
 ## Building
 
@@ -155,4 +156,6 @@ build.bat test "C:\...\steamapps\common\Total War Attila\empire.retail.dll"
 See [LICENSE](LICENSE). `32bit/dlmalloc/malloc-2.8.6.c` is dlmalloc by Doug Lea, released to the public domain
 ([CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)), unchanged. `32bit/reshade/*.hpp` are ReShade's add-on API
 headers by Patrick Mours (BSD-3-Clause OR MIT, as stated in each file), unchanged. mimalloc (MIT) is not in this
-repository; the 64-bit build downloads it. Nothing from Sol Invictus's 64-bit Attila is redistributed here.
+repository; the 64-bit build downloads it. Sol Invictus's
+[64-bit Attila](https://github.com/Sol-Invictus2/64-bit-Attila) is MIT; no file of his is included here, and anything
+of it that is used later will carry his copyright and permission notice as that licence asks.
