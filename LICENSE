@@ -17,7 +17,9 @@ You may NOT, without written permission from the author:
 This software is provided "as is", without warranty of any kind. The author is not liable for any
 damage or data loss arising from its use.
 
-Files from third parties keep their own licenses: dlmalloc/malloc-2.8.6.c is dlmalloc by Doug Lea,
-released to the public domain (CC0 1.0), and reshade/*.hpp are ReShade's add-on API headers, Copyright (C) 2021
+Files from third parties keep their own licenses: 32bit/dlmalloc/malloc-2.8.6.c is dlmalloc by Doug Lea,
+released to the public domain (CC0 1.0), and 32bit/reshade/*.hpp are ReShade's add-on API headers, Copyright (C) 2021
 Patrick Mours, BSD-3-Clause OR MIT as stated in each file; neither is covered by the terms above. Total War: ATTILA and its code belong to
-their owners; this repository contains none of the game's files.
+their owners; this repository contains none of the game's files. Sol Invictus's 64-bit Attila, which the 64bit/
+plugin is built to run in, is MIT (Copyright (c) 2026 Sol Invictus); no file of it is in this repository, and if
+one is added later it will keep that license and carry his copyright and permission notice.
