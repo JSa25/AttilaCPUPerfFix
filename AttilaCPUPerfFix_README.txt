@@ -200,6 +200,10 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 7.5:
+-64-bit: waving banners work when the Upscaling and Framegen add-on is
+ loaded. They stood still before.
+
 Version 7.4:
 -Now also works with 64-bit Attila by Sol Invictus.
 -64-bit: the same fixes, F8 panel, waving banners and main menu label as the
