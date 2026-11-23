@@ -1,0 +1,6 @@
+- New: 64-bit Attila support. The engine fix now also runs in Sol Invictus's 64-bit Attila (loader 1.3.13) as a plugin, perffix64.dll; starting normal Attila once copies it into attila64\plugins, no installer needed.
+- 64-bit: render-list sorts, draw batching, loop prefetch, x87 float conversion, unit detail culling, menu textures kept and the battle unit card cache, as in the 32-bit version.
+- 64-bit: campaign terrain height cache and faster AI pool lookups.
+- 64-bit: the game's memory runs on the mimalloc allocator.
+- 64-bit: waving banners with a banner pack that carries them (1212 performance pack 21.11.26c and newer).
+- 64-bit: the F8 panel (culling) and the main menu label.

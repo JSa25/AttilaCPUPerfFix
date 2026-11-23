@@ -1,0 +1,66 @@
+# Builds 64bit/perffix64_plugin.dll on GitHub's own machine: the same engine fix as a plugin for Sol Invictus's
+# 64-bit Attila. One release, one version number (shared/version.h); the 32-bit dinput8.dll is built by build.yml.
+#
+# Unlike the 32-bit DLL this one is not byte-reproducible - the linker writes a timestamp - so there is no SHA gate
+# here. What the run proves is that the published sources build the plugin from nothing but this repository: no
+# SDL2.dll, no checkout of the loader, no generated file carried along.
+name: Build (64-bit plugin)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write      # signed build provenance (attestation)
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  build64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the compiler (llvm-mingw 20261006) and mimalloc 3.5.3
+        shell: pwsh
+        run: |
+          # pinned versions and checksums, so the build always uses exactly these
+          $files = @(
+            @{ url = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip'
+               sha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'; out = 'llvm.zip' },
+            @{ url = 'https://github.com/microsoft/mimalloc/archive/refs/tags/v3.5.3.zip'
+               sha = '97e672db18c36093378e30cc234f4625ad37b95ca9a270336752d3f3011323e9'; out = 'mimalloc.zip' }
+          )
+          foreach ($f in $files) {
+            Invoke-WebRequest $f.url -OutFile $f.out
+            $got = (Get-FileHash $f.out -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $f.sha) { throw "$($f.out): checksum $got does not match $($f.sha)" }
+          }
+          Expand-Archive llvm.zip "$env:RUNNER_TEMP\llvm"
+          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\llvm\llvm-mingw-20261006-ucrt-x86_64\bin"
+          Expand-Archive mimalloc.zip "$env:RUNNER_TEMP\mi"
+          Move-Item "$env:RUNNER_TEMP\mi\mimalloc-3.5.3" mimalloc
+
+      - name: Build the plugin
+        shell: bash
+        run: MI="$PWD/mimalloc" bash 64bit/build.sh
+
+      - name: SHA-256
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash 64bit\out\perffix64_plugin.dll -Algorithm SHA256).Hash.ToLower()
+          "SHA-256 of perffix64_plugin.dll: $h"
+          "### perffix64_plugin.dll`nSHA-256: ``$h``" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perffix64
+          path: 64bit/out/perffix64_plugin.dll
+
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: 64bit/out/perffix64_plugin.dll

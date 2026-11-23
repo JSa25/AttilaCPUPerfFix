@@ -1,2 +1,9 @@
 build/
+out/
 *.log
+
+# written by 64bit/build.sh at every build, from the 32-bit sources: never commit them, or the next build
+# silently throws the committed copy away (edit the 32-bit file or the matching *_tail.inc instead)
+64bit/src/flagwave64.c
+64bit/src/scriptext64.c
+mimalloc/

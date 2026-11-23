@@ -1,6 +1,6 @@
-# Builds dinput8.dll from this repository on GitHub's own machine, so nobody has to trust a build
+# Builds 32bit/dinput8.dll from this repository on GitHub's own machine, so nobody has to trust a build
 # made on the author's PC. The build is reproducible: the SHA-256 printed in the run summary matches
-# the DLL on Nexus for the same version.
+# the DLL on Nexus for the same version. The 64-bit plugin of the same release is built by build64.yml.
 name: Build
 
 on:
@@ -40,29 +40,30 @@ jobs:
 
       - name: Build
         shell: cmd
+        working-directory: 32bit
         run: build.bat
 
       - name: SHA-256
         shell: pwsh
         run: |
-          $h = (Get-FileHash build\dinput8.dll -Algorithm SHA256).Hash.ToLower()
+          $h = (Get-FileHash 32bit\build\dinput8.dll -Algorithm SHA256).Hash.ToLower()
           "SHA-256 of dinput8.dll: $h"
           "### dinput8.dll`nSHA-256: ``$h``" | Out-File $env:GITHUB_STEP_SUMMARY -Append
 
       - uses: actions/upload-artifact@v4
         with:
           name: dinput8
-          path: build/dinput8.dll
+          path: 32bit/build/dinput8.dll
 
       - name: Attest build provenance
         if: github.event_name != 'pull_request'
         uses: actions/attest@v4
         with:
-          subject-path: build/dinput8.dll
+          subject-path: 32bit/build/dinput8.dll
 
       - name: Attach to the release
         if: github.event_name == 'release'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" build\dinput8.dll --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" 32bit\build\dinput8.dll --clobber

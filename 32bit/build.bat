@@ -12,10 +12,12 @@ rem rslink.cpp: the add-on's ReShade link (C++, ReShade's add-on API headers in 
 "%CXX%" -std=c++17 -O2 -Wall -Wextra -isystem reshade -fno-exceptions -fno-rtti -fno-threadsafe-statics -c -o build\rslink.o rslink.cpp || exit /b 1
 if "%WINDRES%"=="" set "WINDRES=i686-w64-mingw32-windres"
 rem dinput8.rc: the version resource (Properties > Details)
-"%WINDRES%" -O coff -o build\dinput8_res.o dinput8.rc || exit /b 1
+rem --include-dir ..\shared: dinput8.rc reads version.h, the one version number of the one release
+"%WINDRES%" --include-dir ..\shared -O coff -o build\dinput8_res.o dinput8.rc || exit /b 1
 rem --no-insert-timestamp keeps the build reproducible: the same compiler gives the same file
 rem not stripped, a fixed timestamp and this link name (it is in the export table): the 7.1 release file exactly (link name kept from 6.10.5)
-"%CC%" -O2 -Wall -Wextra -shared -static -Wl,-Xlink=-timestamp:1793660000 -o build\dinput8_6.10.5_B.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c uicache.c soundguard.c pools.c scriptext.c memwatch.c plugins.c partcull.c overlay.c menuver.c passtime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c build\rslink.o build\dinput8_res.o dinput8.def %LIBS% -lgdi32 || exit /b 1
+rem -I..\shared: version.h and the cloth banners (flagsim.c, fwpack.c, flagvs*.h, fw_kind.h), which the 64-bit plugin builds too
+"%CC%" -O2 -Wall -Wextra -shared -static -I..\shared -Wl,-Xlink=-timestamp:1793660000 -o build\dinput8_6.10.5_B.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c uicache.c soundguard.c pools.c scriptext.c memwatch.c plugins.c partcull.c overlay.c menuver.c passtime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c build\rslink.o build\dinput8_res.o dinput8.def %LIBS% -lgdi32 || exit /b 1
 copy /y build\dinput8_6.10.5_B.dll build\dinput8.dll >nul
 echo built build\dinput8.dll
 

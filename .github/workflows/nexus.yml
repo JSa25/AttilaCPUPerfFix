@@ -39,19 +39,21 @@ jobs:
 
       - name: Build
         shell: cmd
+        working-directory: 32bit
         run: build.bat
 
       - name: Check against the released DLL, read the version, zip
         id: pkg
         shell: pwsh
         run: |
-          $h = (Get-FileHash build\dinput8.dll -Algorithm SHA256).Hash.ToLower()
-          $want = (Get-Content dinput8.dll.sha256 -Raw).Trim().Split()[0].ToLower()
+          $h = (Get-FileHash 32bit\build\dinput8.dll -Algorithm SHA256).Hash.ToLower()
+          $want = (Get-Content 32bit\dinput8.dll.sha256 -Raw).Trim().Split()[0].ToLower()
           if ($h -ne $want) { throw "the build ($h) does not reproduce the released DLL ($want)" }
-          $ver = [regex]::Match((Get-Content version.h -Raw), 'MOD_VERSION_STR "([^"]+)"').Groups[1].Value
-          if (-not $ver) { throw "no version in version.h" }
+          # shared\version.h: one version number for the 32-bit DLL and the 64-bit plugin of the same release
+          $ver = [regex]::Match((Get-Content shared\version.h -Raw), 'MOD_VERSION_STR "([^"]+)"').Groups[1].Value
+          if (-not $ver) { throw "no version in shared\version.h" }
           New-Item -ItemType Directory pkg\AttilaCPUPerfFix | Out-Null
-          Copy-Item build\dinput8.dll, AttilaCPUPerfFix_README.txt pkg\AttilaCPUPerfFix\
+          Copy-Item 32bit\build\dinput8.dll, AttilaCPUPerfFix_README.txt pkg\AttilaCPUPerfFix\
           Compress-Archive pkg\AttilaCPUPerfFix AttilaCPUPerfFix.zip
           "version=$ver" >> $env:GITHUB_OUTPUT
           "sha=$h" >> $env:GITHUB_OUTPUT
