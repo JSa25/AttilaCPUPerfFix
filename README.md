@@ -103,7 +103,7 @@ matches the header the plugin is built against.
 engine, which is not published, the same reason `shared/flagvs_bc.h` is committed on the 32-bit side.
 
 `tools/gen_sol_sites.py` reads a checkout of
-[Sol-Invictus2/64-bit-Attila](https://github.com/Sol-Invictus2/64-bit-Attila) (MIT) and writes the loader's patch
+[Sol-Invictus2/64-bit-Attila](https://github.com/Sol-Invictus2/64-bit-Attila) and writes the loader's patch
 sites for the mock-loader test. **The build does not need it.** Its output is not committed here for the same reason
 the other generated files are not: it is made from one version of the loader, so a committed copy would go stale
 without anyone noticing.
