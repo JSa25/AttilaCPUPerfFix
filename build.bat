@@ -15,7 +15,7 @@ rem dinput8.rc: the version resource (Properties > Details)
 "%WINDRES%" -O coff -o build\dinput8_res.o dinput8.rc || exit /b 1
 rem --no-insert-timestamp keeps the build reproducible: the same compiler gives the same file
 rem not stripped, a fixed timestamp and this link name (it is in the export table): the 7.1 release file exactly (link name kept from 6.10.5)
-"%CC%" -O2 -Wall -Wextra -shared -static -Wl,-Xlink=-timestamp:1793660000 -o build\dinput8_6.10.5_B.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c uicache.c soundguard.c pools.c scriptext.c memwatch.c plugins.c partcull.c overlay.c passtime.c gputime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c build\rslink.o build\dinput8_res.o dinput8.def %LIBS% -lgdi32 || exit /b 1
+"%CC%" -O2 -Wall -Wextra -shared -static -Wl,-Xlink=-timestamp:1793660000 -o build\dinput8_6.10.5_B.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c uicache.c soundguard.c pools.c scriptext.c memwatch.c plugins.c partcull.c overlay.c menuver.c passtime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c build\rslink.o build\dinput8_res.o dinput8.def %LIBS% -lgdi32 || exit /b 1
 copy /y build\dinput8_6.10.5_B.dll build\dinput8.dll >nul
 echo built build\dinput8.dll
 

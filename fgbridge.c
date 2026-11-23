@@ -1,4 +1,4 @@
-// Frame bridge, game side (dev only; DLSS_PLAN plan B, AGENT_LOG 94/95): on the game's own D3D11 device, the frame's
+// Frame bridge, game side (in the release since 6.3; DLSS_PLAN plan B, AGENT_LOG 94/95): on the game's own D3D11 device, the frame's
 // HUD-less colour, depth (R32F), camera motion vectors (RG16F, pixels, previous minus current) and the final colour go
 // into textures shared by name with the 64-bit helper (helper64.exe bridge), which presents them through NVIDIA
 // Streamline with DLSS Frame Generation into the game's window. Protocol: dlss/proof/fgb_proto.h.
@@ -15,6 +15,7 @@
 #include <string.h>
 #include <math.h>
 #include "fgb_proto.h"
+#include "patch.h"
 
 static const GUID iid_dxgi_resource1 = {0x30961379, 0x4609, 0x4a41, {0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1}};
 static const GUID iid_device5 = {0x8ffde202, 0xa0e7, 0x45df, {0x9e, 0x01, 0xe8, 0x37, 0x80, 0x1b, 0x5e, 0xa0}};
@@ -632,9 +633,13 @@ void fgb_hud_post(ID3D11Resource *backbuffer) {
 }
 // the hole fill around the per-object pass (fill_src): begin keeps the camera-only vectors, end fills the holes. Also
 // called by bridgetest (boxmv) around its own object vectors.
-void fgb_fill_begin(void) { if (g_fill_cs) ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_mvcam, (ID3D11Resource *)g_mv); }
+// Only while AMD FSR upscales or generates frames: this DLL is always built with FSR in it since 6.10.0, so the fill ran
+// with NVIDIA DLSS as well - two full-size copies of the vectors and a compute pass a frame, for a picture that measured
+// no better with it (AGENT_LOG 162: DLSS 29.79 without the fill, 28.70 with; "FSR only until it is shown to help").
+static int fill_wanted(void) { return g_fill_cs && (fgb_sr_backend() == 2 || fgb_fg_backend() == 2); }
+void fgb_fill_begin(void) { if (fill_wanted()) ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_mvcam, (ID3D11Resource *)g_mv); }
 void fgb_fill_end(UINT rw, UINT rh) {
-    if (!g_fill_cs) return;
+    if (!fill_wanted()) return;
     ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_mvobj, (ID3D11Resource *)g_mv);
     struct { UINT w, h; float tol, unitk; } k = {rw, rh, 0.03f, g_react_uav && fgb_sr_backend() == 2 ? g_fill_unitk : 0};
     ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_fill_cb, 0, NULL, &k, 0, 0);
@@ -679,7 +684,10 @@ static int react_copy(ID3D11Texture2D **t, ID3D11ShaderResourceView **srv, ID3D1
         if (FAILED(ID3D11Device_CreateTexture2D(g_dev, &d, NULL, t))) { *t = NULL; return 0; }
         if (FAILED(ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)*t, NULL, srv))) { ID3D11Texture2D_Release(*t); *t = NULL; return 0; }
     }
-    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)*t, 0, 0, 0, 0, src, 0, NULL);
+    // the part the scene is drawn in (the render size below native: the shader reads no pixel past it)
+    UINT rw = g_sr ? g_rw : g_w, rh = g_sr ? g_rh : g_h;
+    D3D11_BOX box = {0, 0, 0, rw < d.Width ? rw : d.Width, rh < d.Height ? rh : d.Height, 1};
+    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)*t, 0, 0, 0, 0, src, 0, &box);
     return 1;
 }
 void fgb_react_begin(ID3D11Resource *hdr) {
@@ -1327,8 +1335,7 @@ void *fgb_unhooked(void *fn) {
     unsigned char *t = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!t) return NULL;
     memcpy(t, hot, 5);
-    t[5] = 0xE9;
-    *(int *)(t + 6) = (int)((const unsigned char *)fn + 5 - (t + 10));
+    patch_rel(t + 5, (const unsigned char *)fn + 5);
     DWORD old;
     VirtualProtect(t, 16, PAGE_EXECUTE_READ, &old);
     FlushInstructionCache(GetCurrentProcess(), t, 16);

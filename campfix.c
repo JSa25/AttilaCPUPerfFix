@@ -70,6 +70,13 @@ static unsigned short fpu_cw(void) {
     __asm__ volatile("fnstcw %0" : "=m"(cw));
     return cw;
 }
+static unsigned sse_csr(void) {
+    unsigned m;
+    __asm__ volatile("stmxcsr %0" : "=m"(m));
+    return m;
+}
+// x87fix.c's watcher found a game thread with another rounding mode or DAZ (weak: the tests build this file alone)
+extern volatile LONG g_x87_other_thread_bad __attribute__((weak));
 
 // The terrain height block is also run off the main thread (heightcache.c): it goes back while the other game threads
 // are suspended and none stands inside it (paused_write, gamerva.h), else next frame.
@@ -81,10 +88,14 @@ static void height_restore(void) { write_code(height_at(), SITES[2].orig, SITES[
 // so this is also the one safe place to switch the patches on and off for A/B runs (dev only: not paused).
 void campfix_frame(void) {
     struct site *h = &SITES[2];
-    if (h->installed && (fpu_cw() & 0xC00) != 0 && paused_write((HMODULE)g_campfix_base, height_busy, height_restore)) {
+    // The same three conditions x87fix.c has for its sites of this kind: this block is replaced before x87fix scans, so
+    // it is not in its list, and until 2026-11-21 only the main thread's rounding mode was looked at here - a worker
+    // with another mode, or DAZ, would have had x87fix put its sites back and left this one in.
+    int changed = (fpu_cw() & 0xC00) != 0 || (sse_csr() & 0x40) || (&g_x87_other_thread_bad && g_x87_other_thread_bad);
+    if (h->installed && changed && paused_write((HMODULE)g_campfix_base, height_busy, height_restore)) {
         h->installed = 0;
         g_height_disabled = 1;
-        g_campfix_log("campaign fix: the game changed the FPU rounding mode - terrain height patch removed");
+        g_campfix_log("campaign fix: the rounding mode is not the default any more (this thread's or a game thread's) - terrain height patch removed");
     }
     if (!g_campfix_ab) return;
     int want = (GetTickCount() / 10000) % 2 == 0;

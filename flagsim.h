@@ -2,9 +2,12 @@
 #pragma once
 #include <d3d11.h>
 int fs_scan(const void *buf, const void *data, UINT size);                      // marker vertices in a new vertex buffer's data
+void fs_forget(const void *buf);                                                  // a buffer was created at this address: what was known of it is gone
 int fs_models(void);                                                              // flag meshes known
 const float *fs_is_flag(const void *buf, UINT byte_off);                          // the model's 6 floats if a flag mesh starts there
+int fs_buf_has_flags(const void *buf);                                            // the buffer holds a flag mesh somewhere
 int fs_init(ID3D11Device *dev, char *err, int errlen);
+int fs_cs_from_bytecode(void);                                                    // 1: fs_init took the build's compute bytecode, 0: it compiled the HLSL
 void fs_gather(ID3D11DeviceContext *c, ID3D11Buffer *inst, UINT byte_off, UINT n, const float *prm);   // one flag draw's records
 unsigned fs_run(ID3D11DeviceContext *c, ID3D11Buffer *wind, ID3D11Buffer *cam, float dt, float t);   // simulate; cam: the game's camera block or NULL
 void fs_tune2(const float *four);                                                  // substeps, lift, gust size, eddy size

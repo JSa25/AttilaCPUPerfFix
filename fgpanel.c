@@ -1,4 +1,5 @@
-// F11 panel for the frame bridge (dev only; AGENT_LOG 101, look AGENT_LOG 104): DLSS Super Resolution mode, frame
+// The settings panel (F8 by default, F11 until 2026-11-02; called "the F11 panel" in older comments) for the frame bridge
+// and, without the add-on, for Culling (in the release; AGENT_LOG 101, look AGENT_LOG 104): DLSS Super Resolution mode, frame
 // generation (off / 2x / 3x / 4x), per-object motion vectors, and a readout of the game's and the shown frame rate.
 // Drawn on the CPU into a bitmap only when something on it changes (anti-aliased rounded shapes computed here, text by
 // GDI), uploaded to a texture, and blended over the back buffer at Present while the panel is open (one small quad; with
@@ -22,7 +23,7 @@ unsigned fgb_sr_backend(void), fgb_fg_backend(void);   // fgbridge.c: 0 none, 1 
 #define SR_AMD (fgb_sr_backend() == 2)   // AMD FSR upscaling / frame generation runs: AMD's names, no DLSS-only rows
 #define FG_AMD (fgb_fg_backend() == 2)
 
-typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*sharp)(int choice); void (*view)(int choice); void (*vsync)(int on); void (*fps)(int on); void (*tech)(int sr, int fg); void (*cull)(int choice); } FgpApply;
+#include "fgpanel.h"
 
 static ID3D11Device *p_dev;
 static ID3D11DeviceContext *p_ctx;
@@ -86,9 +87,11 @@ void fgp_set_cull_only(void) { p_cullonly = 1; p_page = 1; p_dirty = 1; }   // n
 #include "version.h"
 #define WN_POPUP 3   // lines of it in the pop-up
 static const wchar_t *const WHATS_NEW[] = {
-    L"Banner waving no longer touches other mods' models: some mods' spears and shields were moving as cloth.",
-    L"Banners are lit the same on both sides, and the cloth is smoother.",
-    L"More banners wave, where a pack has the meshes for them.",
+    L"Better performance in big battles.",
+    L"Waving banners need a banner pack made for this version.",
+    L"addon=off now fully turns off the upscaling add-on.",
+    L"Waving banners run lighter, and the F8 panel stays in place when you change resolution.",
+    L"Only one copy of the mod runs at a time.",
 };
 #define WN_N (int)(sizeof WHATS_NEW / sizeof WHATS_NEW[0])
 // Pop-ups waiting (bits): 1 a note (fgp_set_note), 2 a newer version installed (fgp_set_update), 4 What's new after an update
@@ -632,6 +635,53 @@ static void counter_redraw(void) {
     ID3D11DeviceContext_UpdateSubresource(p_ctx, (ID3D11Resource *)c_tex, 0, NULL, c_rgba, c_w * 4, 0);
 }
 
+// ---- the main menu label (top right, under the game's own version text): menuver.c says when the menus are up.
+// The game's own text box was too narrow and its font too soft at 4K (two in-game tries, 2026-11-22), so it is drawn here.
+// shortcut: a copy of the counter's text strip; fold the two into one helper if a third text strip is added.
+int (*g_fgp_menu_label)(void);   // menuver.c: 1 while the game's front end (its menus) is up
+static HDC l_dc;
+static HBITMAP l_bmp;
+static unsigned char *l_bits, *l_rgba;
+static ID3D11Texture2D *l_tex;
+static ID3D11ShaderResourceView *l_srv;
+static int l_w, l_h, l_bad;
+static void label_redraw(void) {
+    if (!l_dc) {
+        l_w = (int)(220 * p_u); l_h = (int)(40 * p_u);   // two lines: the version, the author
+        BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), l_w, -l_h, 1, 32, BI_RGB, 0, 0, 0, 0, 0}, {{0, 0, 0, 0}}};
+        l_dc = CreateCompatibleDC(NULL);
+        l_bmp = l_dc ? CreateDIBSection(l_dc, &bi, DIB_RGB_COLORS, (void **)&l_bits, NULL, 0) : NULL;
+        l_rgba = malloc((size_t)l_w * l_h * 4);
+        if (!l_bmp || !l_rgba) { l_bad = 1; return; }
+        SelectObject(l_dc, l_bmp);
+        SelectObject(l_dc, CreateFontW(-(int)(13 * p_u), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI"));
+        SetBkMode(l_dc, TRANSPARENT);
+        SetTextColor(l_dc, RGB(255, 255, 255));
+        RECT r = {0, 0, l_w - (int)(2 * p_u), l_h / 2}, r2 = {0, l_h / 2, l_w - (int)(2 * p_u), l_h};
+        DrawTextW(l_dc, L"Engine Fix " MOD_VERSION_STR, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(l_dc, L"by JGdaCaesar", -1, &r2, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        GdiFlush();
+        for (int i = 0; i < l_w * l_h; i++) {   // white text with a soft dark outline, premultiplied (as the counter)
+            int x = i % l_w, y = i / l_w;
+            float t = l_bits[i * 4 + 1] / 255.0f, ol = 0;
+            for (int dy = -2; dy <= 2; dy++)
+                for (int dx = -2; dx <= 2; dx++) {
+                    int xx = x + dx, yy = y + dy;
+                    if (xx >= 0 && yy >= 0 && xx < l_w && yy < l_h) { float v = l_bits[((size_t)yy * l_w + xx) * 4 + 1] / 255.0f; if (v > ol) ol = v; }
+                }
+            float a = t > ol * 0.8f ? t : ol * 0.8f;
+            l_rgba[i * 4] = l_rgba[i * 4 + 1] = l_rgba[i * 4 + 2] = (unsigned char)(t * 230 + 0.5f);   // a little under white, as the game's text
+            l_rgba[i * 4 + 3] = (unsigned char)(a * 255 + 0.5f);
+        }
+    }
+    if (!l_tex) {   // on the panel's device (made again after fgp_move_device)
+        D3D11_TEXTURE2D_DESC td = {(UINT)l_w, (UINT)l_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        D3D11_SUBRESOURCE_DATA sd = {l_rgba, (UINT)l_w * 4, 0};
+        if (FAILED(ID3D11Device_CreateTexture2D(p_dev, &td, &sd, &l_tex)) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(p_dev, (ID3D11Resource *)l_tex, NULL, &l_srv))) l_bad = 1;
+    }
+}
+
 // ---- the pop-up (top middle), one at a time, 20 s each, all of them gone once the panel opens:
 // a newer version installed (fgp_set_update), What's new after an update (fgp_show_whatsnew), a note (fgp_set_note: the
 // add-on did not start, DLSS turned off) ----
@@ -845,6 +895,7 @@ int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT b
     if (!p_dc) return 0;   // never set up
 #define DROP(x) if (x) { (x)->lpVtbl->Release(x); (x) = NULL; }
     DROP(p_rtv); DROP(p_srv); DROP(p_tex); DROP(p_vs); DROP(p_ps); DROP(p_blend); DROP(p_rs); DROP(p_dss);
+    DROP(l_srv); DROP(l_tex);   // the main menu label's (label_redraw makes them on the new device)
     DROP(c_srv); DROP(c_tex);   // the FPS counter's too: counter_redraw makes them on the new device (ultrareview 2026-11-02)
     DROP(t_srv); DROP(t_tex);   // and the pop-up's
 #undef DROP
@@ -883,6 +934,13 @@ static void fgp_defaults(void) {
 // each Present (main thread), before the frame is handed to the helper: input, then the panel over the back buffer
 void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
     if (!p_ok) return;
+    {   // The back buffer's size as it is now. It was only taken when the device changed, so after a resolution change
+        // on the same device the mouse was scaled by old / new and clicks landed beside the cursor (audit 2026-11-20);
+        // the FPS counter and the pop-up were placed for the old size too.
+        D3D11_TEXTURE2D_DESC bd;
+        ID3D11Texture2D_GetDesc((ID3D11Texture2D *)backbuffer, &bd);
+        if (bd.Width && bd.Height && (bd.Width != p_bw || bd.Height != p_bh)) { p_bw = bd.Width; p_bh = bd.Height; }
+    }
     static int hz_read;
     if (!hz_read) {   // the screen's refresh rate, for the recommendation
         hz_read = 1;
@@ -946,6 +1004,12 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
         if (p_cdirty || !c_tex) { counter_redraw(); p_cdirty = 0; }
         int left = p_fpson == 1 || p_fpson == 3, top = p_fpson <= 2, mg = (int)(12 * p_u);
         if (c_srv) blend_panel(backbuffer, c_srv, left ? mg : (int)p_bw - c_w - mg, top ? mg : (int)p_bh - c_h - mg, c_w, c_h);
+    }
+    if (g_fgp_menu_label && !l_bad && g_fgp_menu_label()) {   // under the game's version text, top right
+        if (!l_srv) label_redraw();
+        int ly = p_fpson == 2 && p_shown_fps > 0 ? (int)(46 * p_u) + c_h + (int)(2 * p_u) : (int)(46 * p_u);   // under a top-right FPS counter too
+        // 46: below both lines of the game's version text ("v1.6.0  Build" / the build number) at 4K, 2026-11-22 screenshot
+        if (l_srv) blend_panel(backbuffer, l_srv, (int)p_bw - l_w - (int)(10 * p_u), ly, l_w, l_h);
     }
     if (p_open) t_queue = 0;   // the panel says all of it
     if (!t_show && t_queue) {   // the next pop-up: a newer version first, then What's new, then a note

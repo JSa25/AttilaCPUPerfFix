@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gamerva.h"
+#include "patch.h"
 
 extern volatile LONG g_frame_no;   // fps.c
 
@@ -607,10 +608,7 @@ static void __cdecl uic_post(void) {
 // The two stubs, and the jump to the first over the function's first instruction (sub esp, 0xCC: 6 bytes).
 static int hook_at(unsigned char *f) {
     static const unsigned char head[6] = {0x81, 0xEC, 0xCC, 0x00, 0x00, 0x00};
-    DWORD old;
-    if (memcmp(f, head, sizeof head) || !(g_stubs = VirtualAlloc(NULL, 96, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)) ||
-        !VirtualProtect(f, 6, PAGE_EXECUTE_READWRITE, &old))
-        return 0;
+    if (memcmp(f, head, sizeof head) || !(g_stubs = VirtualAlloc(NULL, 96, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))) return 0;
     static const unsigned char entry[0x25] = {
         0x60,                                  // 00 pushad
         0x8D, 0x44, 0x24, 0x20,                // 01 lea eax, [esp+0x20]   (where the return address is)
@@ -635,24 +633,17 @@ static int hook_at(unsigned char *f) {
     memcpy(s + 0x28, after, sizeof after);
     *(int *)(s + 0x2A) = (int)((unsigned char *)(void *)uic_post - (s + 0x2E));
     *(void **)(s + 0x31) = &g_uic_ret;
-    f[0] = 0xE9; *(int *)(f + 1) = (int)(s - (f + 5)); f[5] = 0x90;
-    VirtualProtect(f, 6, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), f, 6);
-    return 1;
+    return patch_jump(f, 6, s);
 }
 
 // A stub at the start of the game's flush notes which batch it is for (ecx), touching nothing else.
 static int hook_flush(unsigned char *f) {
     static const unsigned char head[10] = {0x83, 0xEC, 0x0C, 0x56, 0x8B, 0xF1, 0x83, 0x7E, 0x20, 0x00};   // sub esp, 0xC; push esi; mov esi, ecx; cmp [esi+0x20], 0
-    DWORD old;
-    if (memcmp(f, head, sizeof head) || !VirtualProtect(f, 6, PAGE_EXECUTE_READWRITE, &old)) return 0;
+    if (memcmp(f, head, sizeof head)) return 0;
     unsigned char *s = g_stubs + 0x40;
     s[0] = 0x89; s[1] = 0x0D; *(void **)(s + 2) = &g_uic_batch;   // 40 mov [g_uic_batch], ecx
-    memcpy(s + 6, f, 6);                                          // 46 the three instructions the jump replaces
-    s[12] = 0xE9; *(int *)(s + 13) = (int)(f + 6 - (s + 17));     // 4C jmp f + 6
-    f[0] = 0xE9; *(int *)(f + 1) = (int)(s - (f + 5)); f[5] = 0x90;
-    VirtualProtect(f, 6, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), f, 6);
+    patch_tramp(s + 6, f, 6);                                     // 46 the three instructions the jump replaces; 4C jmp f + 6
+    if (!patch_jump(f, 6, s)) return 0;
     g_flush = (void(__fastcall *)(void *, void *))(void *)f;
     return 1;
 }

@@ -1,5 +1,7 @@
 // Frame hook on the game's per-frame function (FUN_100c1950, called once per main-loop iteration).
-// Release builds use it only to run the per-frame safety checks (campfix.c, x87fix.c).
+// Release builds use it for the frame count (g_frame_no: the UI cache, the freeze watchdog, crash records) and the
+// per-frame checks heapfix.c hangs on it (the rounding guards of campfix.c / x87fix.c, the script extender, the frame
+// bridge's frame counter); with fps_on.txt in the game folder at start they time frames too.
 // Dev builds also timestamp every call: while <game folder>\fps_on.txt exists, a background thread
 // writes one line per second to fps_log.csv, and a summary for the whole recording when it stops.
 #include <windows.h>
@@ -8,6 +10,7 @@
 #include <string.h>
 #include <psapi.h>
 #include "gamerva.h"
+#include "patch.h"
 
 #define RVA_FRAME 0x0C1950
 static const unsigned char FRAME_PROLOGUE[10] = {0x56, 0x8B, 0xF1, 0x80, 0xBE, 0xC8, 0x00, 0x00, 0x00, 0x00};
@@ -127,18 +130,8 @@ int install_fps(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...)
     }
     DWORD old;
     if (!VirtualProtect(g_tramp, sizeof g_tramp, PAGE_EXECUTE_READWRITE, &old)) return 0;
-    memcpy(g_tramp, site, sizeof FRAME_PROLOGUE);  // push esi; mov esi,ecx; cmp byte [esi+0C8h],0
-    g_tramp[10] = 0xE9;
-    DWORD rel = (DWORD)((site + 10) - (g_tramp + 15));
-    memcpy(g_tramp + 11, &rel, 4);
-    FlushInstructionCache(GetCurrentProcess(), g_tramp, sizeof g_tramp);
-    if (!VirtualProtect(site, 10, PAGE_EXECUTE_READWRITE, &old)) return 0;
-    site[0] = 0xE9;
-    rel = (DWORD)((unsigned char *)fps_stub - (site + 5));
-    memcpy(site + 1, &rel, 4);
-    memset(site + 5, 0x90, 5);  // never executed (the jmp leaves first); keeps the disassembly tidy
-    VirtualProtect(site, 10, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 10);
+    patch_tramp(g_tramp, site, sizeof FRAME_PROLOGUE);  // push esi; mov esi,ecx; cmp byte [esi+0C8h],0
+    if (!patch_jump(site, 10, fps_stub)) return 0;
     wcsncpy(g_dir, dir, MAX_PATH - 1);
     wchar_t flag[MAX_PATH];
     _snwprintf(flag, MAX_PATH, L"%ls\\fps_on.txt", g_dir);

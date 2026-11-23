@@ -1,6 +1,6 @@
-// Flag wave (dev, notes/banners.md "Our own system"): our copies of the game's two rigid prop vertex shaders, used in
-// their place by bridgeprobe.c when flagwave_on.txt is in the game folder.
-//   main:   vs_55ca645c65c0fbe6 (main view, stage +0x1CCE4E4)
+// Flag wave (in the release since 7.2; notes/banners.md "Our own system"): our copies of the game's two rigid prop vertex shaders, used in
+// their place by bridgeprobe.c when a loaded pack carries the flag switch file (fwpack.c).
+//   main:   vs_55ca645c65c0fbe6 (main view, stage +0x1CCE4E4) and its twin vs_0cae34c7869ca505 (stage +0x1CC0614)
 //   shadow: vs_eb3006be08a96700 (shadow maps, stage +0x1C9CF00)
 // Each repeats the game's code instruction for instruction (flagtest.c checks every output bit for bit against the
 // game's bytecode from the motion probe) with one change: a vertex whose POSITION.w is not 1.0 is cloth, placed by
@@ -11,15 +11,19 @@
 #pragma once
 
 // cloth simulation sizes (shared by the shaders and bridgeprobe.c): FS_GX particles along the pole x FS_GY away from it
-// per flag, FS_SLOTS flags (slot ids 16 bits in the buckets), FS_SLOT4 float4s of slot data, FS_GATHER flag instances gathered per
-// frame (one match thread each), FS_NB lookup buckets (2 m cells of the ground, hashed; 2 float4s each, up to 12 flags)
+// per flag, FS_SLOTS flags (slot ids 9 bits in the lookup), FS_SLOT4 float4s of slot data, FS_GATHER flag instances gathered per
+// frame (one match thread each), FS_NB lookup lists (1 m cells of the ground, hashed; 2 float4s each, up to 21 flags;
+// a multiple of FS_GATHER: each match thread clears its share)
 #define FS_GX 24
 #define FS_GY 36
 #define FS_N (FS_GX * FS_GY)
 #define FS_SLOTS 512
 #define FS_SLOT4 12
 #define FS_GATHER 1024
-#define FS_NB 512
+#define FS_NB 4096
+#if FS_SLOTS > 512 || FS_NB % FS_GATHER
+#error a lookup entry holds 9 bits of slot; the match threads clear FS_NB / FS_GATHER lists each
+#endif
 #define FS_STR2(x) #x
 #define FS_STR(x) FS_STR2(x)
 #define FS_DEFS "#define FS_GX " FS_STR(FS_GX) "\n#define FS_GY " FS_STR(FS_GY) "\n#define FS_N " FS_STR(FS_N) "\n#define FS_SLOTS " \
@@ -27,9 +31,13 @@
     "uint fs_bucket(int2 c) { return ((uint)(c.x * 73856093) ^ (uint)(c.y * 19349663)) & (FS_NB - 1); }\n"
 
 static const char flag_hlsl[] =
+    // The game has the main view's shader twice: 55ca645c, and 0cae34c7 with the config and wind blocks in each
+    // other's slots and not one instruction different otherwise (another render stage; the carroccio's banners hung
+    // still, Warman 2026-11-20). FW_TWIN compiles ours for that one.
+    "#ifdef FW_TWIN\n#define FW_CFG b2\n#define FW_WIND b1\n#else\n#define FW_CFG b1\n#define FW_WIND b2\n#endif\n"
     "cbuffer camera_VS_PS : register(b0) { float4 cam[27]; };\n"
-    "cbuffer rigid_config_PS : register(b1) { float4 cfg[5]; };\n"
-    "cbuffer wind_VS : register(b2) { float4 wind0; float4 wind1; };\n"
+    "cbuffer rigid_config_PS : register(FW_CFG) { float4 cfg[5]; };\n"
+    "cbuffer wind_VS : register(FW_WIND) { float4 wind0; float4 wind1; };\n"
     "Texture2D<uint4> t_sel : register(t0);\n"
     "struct VIn { float4 p : POSITION0; float4 uv : TEXCOORD0; float4 n0 : NORMAL0; float4 n1 : NORMAL1; float4 n2 : NORMAL2;\n"
     "  float4 col : COLOR0; float4 r0 : POSITION1; float4 r1 : POSITION2; float4 r2 : POSITION3; float4 i3 : POSITION4;\n"
@@ -53,30 +61,38 @@ static const char flag_hlsl[] =
     "float4 bs_d(float t) { float t2 = t * t; return 0.5 * float4(-1.0 + 2.0 * t - t2, -4.0 * t + 3.0 * t2, 1.0 + 2.0 * t - 3.0 * t2, t2); }\n"
     "bool sim_place(VIn v, float x, float u, float far, float side, float ax, out float3 P, out float3 e, out float3 f, out float3 z, out float4 m0, out float4 m1, out float4 m2) {\n"
     "  P = 0.0; e = 0.0; f = 0.0; z = 0.0; m0 = v.r0; m1 = v.r1; m2 = v.r2;\n"
-    // the flags simulated this frame, by 2 m cell of the ground (buckets after the header): the 2 x 2 cells around this
-    // instance hold every pole within 1 m of it
+    // the flags simulated this frame, by 1 m cell of the ground (lists after the header)
     "  float3 O = float3(v.r0.w, v.r1.w, v.r2.w);\n"
-    "  int2 c0 = (int2)floor(O.xz * 0.5 - 0.5);\n"
     "  int best = -1; float bd = 0.6;\n"   // its own cloth only (1 m let a flag without one borrow a neighbour's, 1 m off)
-    "  [unroll] for (int cy = 0; cy < 2; cy++) [unroll] for (int cx = 0; cx < 2; cx++) {\n"
-    "    uint bi = FS_SLOTS * FS_SLOT4 + 1 + 2 * fs_bucket(c0 + int2(cx, cy));\n"
-    "    float4 be = fs_slot[bi], be2 = fs_slot[bi + 1];\n"
-    "    uint n = min(asuint(be.x), 12u);\n"
-    "    [loop] for (uint q = 0; q < n; q++) {\n"
-    "      uint wd = asuint(q < 2 ? be.y : q < 4 ? be.z : q < 6 ? be.w : q < 8 ? be2.x : q < 10 ? be2.y : be2.z);\n"
-    "      uint s = (wd >> (16 * (q & 1))) & 0xFFFF;\n"
-    // against where that flag should be now (this frame is one after the last Present's)
-    "      float4 q0 = fs_slot[s * FS_SLOT4];\n"
+    // This runs for every vertex of every flag in every pass, so it reads as little as it can (on a weak GPU the
+    // search was 4 to 6 of the 10 ms a 96-pennant formation cost per pass): one list - this instance's own 1 m cell,
+    // where the match pass has listed every flag near enough to be taken (see fs_put) - its second half only when it
+    // holds more than nine flags, and per flag one value: slot + 11, where the match pass has already worked out
+    // where its speed puts it for this frame and put its size beside it. Its last pole only if that is another place.
+    "  uint bi = FS_SLOTS * FS_SLOT4 + 1 + 2 * fs_bucket((int2)floor(O.xz));\n"
+    "  uint4 be = asuint(fs_slot[bi]), be2 = 0;\n"
+    "  uint n = min(be.x, 21u);\n"
+    "  [branch] if (n > 9) be2 = asuint(fs_slot[bi + 1]);\n"
+    "  [loop] for (uint q = 0; q < n; q++) {\n"
+    "    uint w = q / 3;\n"
+    "    uint wd = w < 3 ? (w == 0 ? be.y : w == 1 ? be.z : be.w) : (w == 3 ? be2.x : w == 4 ? be2.y : w == 5 ? be2.z : be2.w);\n"
+    "    uint id = (wd >> (10 * (q % 3))) & 0x3FF, s = id & 0x1FF;\n"
+    "    float4 pr = fs_slot[s * FS_SLOT4 + 11];\n"   // xyz: where that flag should be now; w: its size
+    "    [branch] if (abs(pr.w - far) < 0.3) {\n"
     // the nearer of its last pole and where its speed puts it now (one bad speed reading must not lose it)
-    "      float d = min(length(O - q0.xyz), length(O - (q0.xyz + fs_slot[s * FS_SLOT4 + 6].xyz * (fs_slot[FS_SLOTS * FS_SLOT4].x + 1.0 - q0.w))));\n"
-    "      if (d < bd && abs(fs_slot[s * FS_SLOT4 + 4].z - far) < 0.3) { best = (int)s; bd = d; }\n"
+    "      float d = length(O - pr.xyz);\n"
+    "      [branch] if (id & 0x200) d = min(length(O - fs_slot[s * FS_SLOT4].xyz), d);\n"
+    "      if (d < bd) { best = (int)s; bd = d; }\n"
     "    }\n"
     "  }\n"
     "  if (best < 0) return false;\n"
     "  float4 s0 = fs_slot[best * FS_SLOT4], p4 = fs_slot[best * FS_SLOT4 + 4], p5 = fs_slot[best * FS_SLOT4 + 5];\n"
     "  float fi = saturate((x - p4.x) / max(p4.y - p4.x, 1e-3)) * (FS_GX - 1);\n"
     "  float du = abs(ax < 1.5 ? v.p.y - p5.x : v.p.z - p5.y);\n"
-    "  float fj = saturate(du / max(far, 1e-3)) * (FS_GY - 1);\n"
+    // against the cloth's own size (p4.z: the marker's, the size the grid was laid out with), not the vertex's size
+    // code: the code is a quarter-metre rounding, and where it came out short the outer edge of 148 flags bunched onto
+    // the last row. An older pack's marker holds the rounded size, so there this is what it always was.
+    "  float fj = saturate(du / max(p4.z, 1e-3)) * (FS_GY - 1);\n"
     "  int i0 = min((int)fi, FS_GX - 2), j0 = min((int)fj, FS_GY - 2);\n"
     "  float a = fi - i0, b = fj - j0;\n"
     // a smooth surface through the particles (Catmull-Rom, 4 x 4 around the cell; the edges repeat), and its slopes
@@ -220,6 +236,7 @@ static const char flag_hlsl[] =
 // previous frame's draws). Slot data (FS_SLOT4 float4s per flag): 0 pole origin xyz, frame last seen; 1-3 instance rows;
 // 4 xmin, xmax (the cloth along the pole), far (its size), side; 5 y, z of the pole in the model, init flag, frame claimed;
 // 8-10 the instance rows the cloth was last stepped with (the shader draws the cloth rigidly with its pole from them);
+// 11 where the pole should be at the next draw (xyz) and the cloth's size again (w): all the shader's search reads;
 // after the slots: the current frame. Grid: FS_SLOTS * FS_N positions, then as many previous positions.
 //   match: one thread; every gathered flag instance claims the nearest slot of the same model within 1.5 m (the same
 //          instance drawn again in another pass, within 2 cm, shares it), or the oldest slot (started from the model's
@@ -237,26 +254,54 @@ static const char flag_cs_hlsl[] =
     "cbuffer camera_VS_PS : register(b2) { float4 camb[27]; };\n"   // the game's camera block: camera_position in c0
     "ByteAddressBuffer fs_gather : register(t0);\n"
     "StructuredBuffer<float4> fs_gparam : register(t1);\n"
-    "RWStructuredBuffer<float4> slot : register(u0);\n"
+    // (the same float4 buffer; declared as bits here because the lookup after the slots is built with atomic operations)
+    "RWStructuredBuffer<uint4> slot : register(u0);\n"
+    "float4 SG(uint i) { return asfloat(slot[i]); }\n"
+    "void SP(uint i, float4 v) { slot[i] = asuint(v); }\n"
     "RWStructuredBuffer<float4> grid : register(u1);\n"
     // match, one thread per gathered flag instance (was one thread for all: 0.44 ms for 88): each finds the nearest slot of
     // its model within 1.5 m and claims it (the nearest claimer wins; the same flag drawn again in another pass, within
     // 2 cm of the winner, shares it); new flags get the oldest unclaimed slot, one at a time (rare after the first
-    // frame). The flags simulated this frame go into the lookup buckets after the header (by 2 m cell of the ground).
+    // frame). The flags simulated this frame go into the lookup lists after the header (fs_put).
     "groupshared uint mclaim[FS_SLOTS];\n"
     "groupshared int mslot[FS_GATHER];\n"
-    // up to 12 flags a 2 m cell (4 left lancers' pennants out of the lookup in a tight formation: they flipped between
-    // their cloth and the wave from frame to frame); counters for the log: new claims, flags left out of the lookup
-    // bids doubles as each gathered flag's size and side|pass while the claims are sorted out (cleared after);
-    // alist doubles as the list of free slots once the search is done
-    "groupshared uint bcnt[FS_NB], bids[FS_NB * 6], nfresh, nover, alist[FS_SLOTS], nact, nfree, nneed, fbits[FS_SLOTS / 32];\n"
+    // counters for the log: new claims, list entries that did not fit; bids: each gathered flag's size and side|pass
+    // while the claims are sorted out; alist doubles as the list of free slots once the search is done
+    "groupshared uint bids[FS_GATHER * 2], nfresh, nover, alist[FS_SLOTS], nact, nfree, nneed, fbits[FS_SLOTS / 32];\n"
+    // The lookup the vertex shader searches: the ground in 1 m cells, hashed into FS_NB lists of up to 21 flags. A
+    // flag is listed in every cell within 0.61 m of its last pole and of where its speed puts it next, so the shader
+    // (which takes a cloth within 0.6 m of either) reads one list: its own cell's. Until 2026-11-21 the cells were 2 m,
+    // a flag was listed once and the shader read four lists of up to 12; in a tight formation that was about 16 flags
+    // to weigh per vertex, now about 5 (flagperf on an integrated Radeon, 96 pennants 1 m apart: 12.4 -> 8.7 ms a
+    // pass, every output byte the same). A list too short showed in game as pennants flipping between their cloth
+    // and the wave from frame to frame (4 lancers in a tight formation, when a 2 m cell held 6).
+    // An entry: the slot (9 bits) and, in bit 9, whether the two places differ (if not, the shader skips a read).
+    "void fs_ins(int2 c, uint id) {\n"
+    "  uint e = FS_SLOTS * FS_SLOT4 + 1 + 2 * fs_bucket(c), pos;\n"
+    "  InterlockedAdd(slot[e].x, 1, pos);\n"
+    "  if (pos >= 21) { InterlockedAdd(nover, 1); return; }\n"
+    "  uint w = pos / 3 + 1, bits = id << (10 * (pos % 3));\n"   // word 0 of the list's eight is the count
+    "  if (w == 1) InterlockedOr(slot[e].y, bits); else if (w == 2) InterlockedOr(slot[e].z, bits); else if (w == 3) InterlockedOr(slot[e].w, bits);\n"
+    "  else if (w == 4) InterlockedOr(slot[e + 1].x, bits); else if (w == 5) InterlockedOr(slot[e + 1].y, bits);\n"
+    "  else if (w == 6) InterlockedOr(slot[e + 1].z, bits); else InterlockedOr(slot[e + 1].w, bits);\n"
+    "}\n"
+    "void fs_put(uint s, float3 a, float3 b) {\n"   // a: its last pole; b: where it should be at the next draw
+    "  bool mv = any(a != b);\n"
+    "  uint id = s | (mv ? 0x200u : 0u);\n"
+    "  int2 a0 = (int2)floor(a.xz - 0.61), a1 = (int2)floor(a.xz + 0.61), b0 = (int2)floor(b.xz - 0.61), b1 = (int2)floor(b.xz + 0.61);\n"
+    "  [unroll] for (int y = 0; y < 3; y++) [unroll] for (int x = 0; x < 3; x++) {\n"   // 1.22 m across: 2 or 3 cells each way
+    "    int2 c = a0 + int2(x, y), d = b0 + int2(x, y);\n"
+    "    if (all(c <= a1)) fs_ins(c, id);\n"
+    "    if (mv && all(d <= b1) && (any(d < a0) || any(d > a1))) fs_ins(d, id);\n"   // not twice in one cell
+    "  }\n"
+    "}\n"
     "[numthreads(FS_GATHER, 1, 1)] void match(uint g : SV_GroupIndex) {\n"
     "  float frame = sim0.w; uint ng = min((uint)sim0.x, (uint)FS_GATHER);\n"
     "  if (g < FS_SLOTS) mclaim[g] = 0xFFFFFFFFu;\n"
     "  if (g == 0) { nfresh = 0; nover = 0; nact = 0; nfree = 0; nneed = 0; }\n"
     "  GroupMemoryBarrierWithGroupSync();\n"
     // the slots in use (seen in the last 30 frames), listed once: each flag then checks those, not all FS_SLOTS
-    "  if (g < FS_SLOTS) { float sw = slot[g * FS_SLOT4].w; if (sw > 0.0 && sw >= frame - 30.0) { uint ia; InterlockedAdd(nact, 1, ia); alist[ia] = g; } }\n"
+    "  if (g < FS_SLOTS) { float sw = SG(g * FS_SLOT4).w; if (sw > 0.0 && sw >= frame - 30.0) { uint ia; InterlockedAdd(nact, 1, ia); alist[ia] = g; } }\n"
     "  GroupMemoryBarrierWithGroupSync();\n"
     "  bool act = g < ng;\n"
     "  float4 r0 = 0.0, r1 = 0.0, r2 = 0.0, q0 = 0.0, q1 = 0.0; float3 O = 0.0; int best = -1; float bd = 1.5;\n"
@@ -266,14 +311,14 @@ static const char flag_cs_hlsl[] =
     "    uint na = nact;\n"
     "    [loop] for (uint ka = 0; ka < na; ka++) {\n"
     "      int s = (int)alist[ka];\n"
-    "      float4 s0 = slot[s * FS_SLOT4], s4 = slot[s * FS_SLOT4 + 4];\n"
+    "      float4 s0 = SG(s * FS_SLOT4), s4 = SG(s * FS_SLOT4 + 4);\n"
     // the same flag in every LOD and pass (the shadow pass often draws another LOD than the main view; 2026-11-12: one
     // banner got two cloths and jumped between them): by size (a quarter-metre step either way) and side, not the
     // exact x range each LOD mesh measured
     "      if (s0.w < frame - 30.0 || abs(s4.z - q0.z) > 0.3 || s4.w != q0.w) continue;\n"
     // where the flag should be now (its last pole moved on at its speed): a galloping rider is 13 cm on, and a passing
     // neighbour's last pole could be nearer than its own (2026-11-12, flagglitch: cloths swapped and restarted)
-    "      float d = min(length(O - s0.xyz), length(O - (s0.xyz + slot[s * FS_SLOT4 + 6].xyz * (frame - s0.w))));\n"
+    "      float d = min(length(O - s0.xyz), length(O - (s0.xyz + SG(s * FS_SLOT4 + 6).xyz * (frame - s0.w))));\n"
     "      if (d < bd) { bd = d; best = s; }\n"
     "    }\n"
     "  }\n"
@@ -307,7 +352,7 @@ static const char flag_cs_hlsl[] =
     // the free slots: not in view (no main-view draw) for over 10 frames, and not claimed by a main-view draw this frame
     // (a shadow draw keeping it may lose it). In slot order, in parallel: a bit per free slot, each one's rank = the free
     // slots below it (the old one-thread claim loop over every slot per new flag took 2.5 ms for 100 new flags)
-    "  bool isfree = g < FS_SLOTS && (mclaim[g] == 0xFFFFFFFFu || ((mclaim[g] >> 31) != 0 && mclaim[g] != 0xFFFFFFFEu)) && slot[g * FS_SLOT4 + 7].x < frame - 10.5;\n"
+    "  bool isfree = g < FS_SLOTS && (mclaim[g] == 0xFFFFFFFFu || ((mclaim[g] >> 31) != 0 && mclaim[g] != 0xFFFFFFFEu)) && SG(g * FS_SLOT4 + 7).x < frame - 10.5;\n"
     "  if (g < FS_SLOTS / 32) fbits[g] = 0;\n"
     "  GroupMemoryBarrierWithGroupSync();\n"
     "  if (isfree) InterlockedOr(fbits[g >> 5], 1u << (g & 31));\n"
@@ -316,54 +361,56 @@ static const char flag_cs_hlsl[] =
     "  if (g == 0) { uint nf = 0; for (uint wq = 0; wq < FS_SLOTS / 32; wq++) nf += countbits(fbits[wq]); nfree = nf; }\n"
     "  GroupMemoryBarrierWithGroupSync();\n"
     "  if (need) { uint ni; InterlockedAdd(nneed, 1, ni); if (ni < nfree) { mclaim[alist[ni]] = 0xFFFFFFFEu; mslot[g] = (int)(alist[ni] | 0x1000); } else mslot[g] = -2; }\n"   // all in use: the wave
-    "  if (g < FS_NB) { bcnt[g] = 0; [unroll] for (int w6 = 0; w6 < 6; w6++) bids[6 * g + w6] = 0; }\n"
-    "  GroupMemoryBarrierWithGroupSync();\n"
+    "  [unroll] for (uint w6 = 0; w6 < 2 * FS_NB / FS_GATHER; w6++) slot[FS_SLOTS * FS_SLOT4 + 1 + g * (2 * FS_NB / FS_GATHER) + w6] = 0;\n"   // last frame's lookup
+    "  AllMemoryBarrierWithGroupSync();\n"   // (the buffer too: the lists are filled below)
     // a shadow draw whose cloth just went to a flag in view: the wave in the shadow, this frame
     "  if (act && mslot[g] >= 0 && (mslot[g] & 0x1000) == 0 && mclaim[mslot[g]] == 0xFFFFFFFEu) mslot[g] = -2;   // (claim keys never reach that value)\n"
     "  GroupMemoryBarrierWithGroupSync();\n"
     "  int ms = act ? mslot[g] : -2;\n"
     "  if (ms >= 0) {\n"
     "    uint s = (uint)ms & 0xFFF;\n"
-    "    float init = (ms & 0x1000) ? 1.0 : slot[s * FS_SLOT4 + 5].z;\n"
-    "    float4 so = slot[s * FS_SLOT4];\n"
+    "    float init = (ms & 0x1000) ? 1.0 : SG(s * FS_SLOT4 + 5).z;\n"
+    "    float4 so = SG(s * FS_SLOT4);\n"
     "    float3 vel = (ms & 0x1000) ? 0.0 : (O - so.xyz) / max(frame - so.w, 1.0);\n"
-    "    slot[s * FS_SLOT4 + 6] = float4(length(vel) < 0.5 ? vel : 0.0, 0.0);\n"   // its speed per frame (none over 30 m/s: a jump, not a ride)
-    "    slot[s * FS_SLOT4] = float4(O, frame);\n"
+    "    float3 velc = length(vel) < 0.5 ? vel : 0.0;\n"   // its speed per frame (none over 30 m/s: a jump, not a ride)
+    "    SP(s * FS_SLOT4 + 6, float4(velc, 0.0));\n"
+    "    SP(s * FS_SLOT4, float4(O, frame));\n"
+    // For the vertex shader's search: where the flag should be when it is drawn, and its size. The same sum the
+    // shader used to make for every vertex - last pole + speed x (frame + 1 - frame last seen), here with "last
+    // seen" = this frame - made once per flag instead. A new cloth takes the gathered size, an old one keeps its own.
+    "    float3 nxt = O + velc * (frame + 1.0 - frame);\n"
+    "    SP(s * FS_SLOT4 + 11, float4(nxt, (ms & 0x1000) ? q0.z : SG(s * FS_SLOT4 + 4).z));\n"
     // the cloth is simulated on the pole's height smoothed over ~0.2 s: a cantering horse moves the lance up and down 2-8 cm
     // a frame, and the cloth swung 2.5x that instead of streaming back (2026-11-13 recording, ridetest). Our shader draws
     // it back through these rows onto the real pole, so it still rides the lance's bounce as one piece.
-    "    float4 o7 = slot[s * FS_SLOT4 + 7];\n"
+    "    float4 o7 = SG(s * FS_SLOT4 + 7);\n"
     "    float ys = (ms & 0x1000) || abs(O.y - o7.y) > 1.0 ? O.y : lerp(o7.y, O.y, 1.0 - exp(-sim0.y * max(frame - so.w, 1.0) / 0.2));\n"
-    "    slot[s * FS_SLOT4 + 1] = r0; slot[s * FS_SLOT4 + 2] = float4(r1.xyz, ys); slot[s * FS_SLOT4 + 3] = r2;\n"
+    "    SP(s * FS_SLOT4 + 1, r0); SP(s * FS_SLOT4 + 2, float4(r1.xyz, ys)); SP(s * FS_SLOT4 + 3, r2);\n"
     // the cloth's shape numbers stay those it started with (another LOD's x range must not shift it from frame to frame)
     "    bool fresh = (ms & 0x1000) != 0;\n"
-    "    if (fresh) slot[s * FS_SLOT4 + 4] = q0;\n"
-    "    slot[s * FS_SLOT4 + 5] = float4(fresh ? q1.xy : slot[s * FS_SLOT4 + 5].xy, init, frame);\n"
-    "    slot[s * FS_SLOT4 + 7] = float4(mpass == 0 ? frame : o7.x, ys, 0.0, 0.0);\n"   // last in view; the smoothed height
-    "    uint b = fs_bucket((int2)floor(O.xz * 0.5)), pos;\n"
-    "    InterlockedAdd(bcnt[b], 1, pos);\n"
-    "    if (pos < 12) InterlockedOr(bids[6 * b + pos / 2], s << (16 * (pos & 1))); else InterlockedAdd(nover, 1);\n"
+    "    if (fresh) SP(s * FS_SLOT4 + 4, q0);\n"
+    "    SP(s * FS_SLOT4 + 5, float4(fresh ? q1.xy : SG(s * FS_SLOT4 + 5).xy, init, frame));\n"
+    "    SP(s * FS_SLOT4 + 7, float4(mpass == 0 ? frame : o7.x, ys, 0.0, 0.0));\n"   // last in view; the smoothed height
+    "    fs_put(s, O, nxt);\n"
     "    if (fresh) InterlockedAdd(nfresh, 1);\n"
     "  }\n"
     // a flag not gathered this frame but seen in the last 10 (a draw missed, a pass skipped): still in the lookup, at its
     // last pole, so the shader keeps it on its cloth instead of falling back to the wave
     "  if (g < FS_SLOTS && mclaim[g] == 0xFFFFFFFFu) {\n"
-    "    float4 s0 = slot[g * FS_SLOT4];\n"
+    "    float4 s0 = SG(g * FS_SLOT4);\n"
     "    if (s0.w > 0.0 && s0.w >= frame - 10.0) {\n"
-    "      uint b = fs_bucket((int2)floor(s0.xz * 0.5)), pos;\n"
-    "      InterlockedAdd(bcnt[b], 1, pos);\n"
-    "      if (pos < 12) InterlockedOr(bids[6 * b + pos / 2], g << (16 * (pos & 1))); else InterlockedAdd(nover, 1);\n"
+    "      float3 nxt = s0.xyz + SG(g * FS_SLOT4 + 6).xyz * (frame + 1.0 - s0.w);\n"
+    "      SP(g * FS_SLOT4 + 11, float4(nxt, SG(g * FS_SLOT4 + 4).z));\n"
+    "      fs_put(g, s0.xyz, nxt);\n"
     "    }\n"
     "  }\n"
     "  GroupMemoryBarrierWithGroupSync();\n"
-    "  if (g < FS_NB) {\n"
-    "    slot[FS_SLOTS * FS_SLOT4 + 1 + 2 * g] = float4(asfloat(bcnt[g]), asfloat(bids[6 * g]), asfloat(bids[6 * g + 1]), asfloat(bids[6 * g + 2]));\n"
-    "    slot[FS_SLOTS * FS_SLOT4 + 2 + 2 * g] = float4(asfloat(bids[6 * g + 3]), asfloat(bids[6 * g + 4]), asfloat(bids[6 * g + 5]), 0.0);\n"
-    "  }\n"
     // header: the frame, then running totals of new claims and flags left out of the lookup (the plugin logs them)
-    "  if (g == 0) { float4 hd = slot[FS_SLOTS * FS_SLOT4]; slot[FS_SLOTS * FS_SLOT4] = float4(frame, asfloat(asuint(hd.y) + nfresh), asfloat(asuint(hd.z) + nover), 0.0); }\n"
+    "  if (g == 0) { float4 hd = SG(FS_SLOTS * FS_SLOT4); SP(FS_SLOTS * FS_SLOT4, float4(frame, asfloat(asuint(hd.y) + nfresh), asfloat(asuint(hd.z) + nover), 0.0)); }\n"
     "}\n"
-    "groupshared float3 gp[FS_N];\n"
+    // two copies, written in turn: a thread still reading the last one never meets the next write, so one sync per
+    // write is enough (was two with one copy; same sums, 43 syncs a flag instead of 85)
+    "groupshared float3 gp[2 * FS_N];\n"
     "groupshared float4 gs0, gs5;\n"   // the slot's first row via groupshared: what decides the group's flow must be uniform
     // value noise in 3D (hash of the lattice, smooth interpolation), -1..1
     "float fs_hash(float3 p) { p = frac(p * 0.3183099 + 0.1); p *= 17.0; return frac(p.x * p.y * p.z * (p.x + p.y + p.z)); }\n"
@@ -394,12 +441,12 @@ static const char flag_cs_hlsl[] =
     //    jumped them, for 0.06 ms saved), with 16 substeps within 100 m, 10 to 250 m, 6 beyond.
     "[numthreads(FS_N, 1, 1)] void step(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {\n"
     "  uint s = gid.x; float frame = sim0.w;\n"
-    "  if (tid == 0) { gs0 = slot[s * FS_SLOT4]; gs5 = slot[s * FS_SLOT4 + 5]; }\n"
+    "  if (tid == 0) { gs0 = SG(s * FS_SLOT4); gs5 = SG(s * FS_SLOT4 + 5); }\n"
     "  GroupMemoryBarrierWithGroupSync();\n"
     "  float4 s0 = gs0;\n"
     "  if (s0.w <= 0.0 || s0.w < frame - 10.0) return;\n"   // the whole group: not seen in the last 10 frames
-    "  float4 r0 = slot[s * FS_SLOT4 + 1], r1 = slot[s * FS_SLOT4 + 2], r2 = slot[s * FS_SLOT4 + 3];\n"
-    "  float4 p4 = slot[s * FS_SLOT4 + 4], p5 = slot[s * FS_SLOT4 + 5];\n"
+    "  float4 r0 = SG(s * FS_SLOT4 + 1), r1 = SG(s * FS_SLOT4 + 2), r2 = SG(s * FS_SLOT4 + 3);\n"
+    "  float4 p4 = SG(s * FS_SLOT4 + 4), p5 = SG(s * FS_SLOT4 + 5);\n"
     "  int i = (int)(tid % FS_GX), j = (int)(tid / FS_GX);\n"
     "  float dx = (p4.y - p4.x) / (FS_GX - 1), dy = p4.z / (FS_GY - 1);\n"
     // the model's own shape: along the pole (x), out along y (side +-1) or z (side +-2: lance pennants)
@@ -419,6 +466,7 @@ static const char flag_cs_hlsl[] =
     "  float3 wdir = wl > 1e-4 ? float3(wind0.x, 0.0, wind0.y) / wl : 0.0;\n"
     "  float3 wside = float3(-wdir.z, 0.0, wdir.x);\n"
     "  float str = saturate(wind1.x) * saturate(wl * 4.0);\n"
+    "  uint gb = 0;\n"
     "  [loop] for (int sub = 0; sub < SUB; sub++) {\n"
     "    float tt = t + h * sub;\n"
     // gusts change the wind's speed, 60-140 %, over several seconds and quicker, different for every flag
@@ -427,10 +475,10 @@ static const char flag_cs_hlsl[] =
     // turbulence: small sideways and up-down swirls travelling with the wind (they start the flutter)
     "    float sw = tt * (2.0 + U * 0.6) - (j * dy) * 2.5 + ph;\n"
     "    float3 wv = wdir * U + (wside * sin(sw + i * 0.4) + float3(0.0, 0.6, 0.0) * sin(sw * 1.3 + 1.1)) * U * tune1.x;\n"
-    "    gp[tid] = pos;\n"
+    "    gb = FS_N - gb; gp[gb + tid] = pos;\n"
     "    GroupMemoryBarrierWithGroupSync();\n"
     "    int il = i > 0 ? tid - 1 : tid, ir = i < FS_GX - 1 ? tid + 1 : tid, jd = j > 0 ? tid - FS_GX : tid, ju = j < FS_GY - 1 ? tid + FS_GX : tid;\n"
-    "    float3 n = cross(gp[ir] - gp[il], gp[ju] - gp[jd]);\n"
+    "    float3 n = cross(gp[gb + ir] - gp[gb + il], gp[gb + ju] - gp[gb + jd]);\n"
     "    float nl = length(n); n = nl > 1e-6 ? n / nl : float3(0.0, 1.0, 0.0);\n"
     "    float3 vr = wv - (pos - prev) / h;\n"
     "    float vm = length(vr);\n"
@@ -438,9 +486,8 @@ static const char flag_cs_hlsl[] =
     "    float3 np = pos + (pos - prev) * 0.998 + acc * h * h;\n"
     "    prev = j == 0 ? rest : pos;\n"
     "    pos = j == 0 ? rest : np;\n"
-    "    GroupMemoryBarrierWithGroupSync();\n"
     "    [loop] for (int it = 0; it < 6; it++) {\n"
-    "      gp[tid] = pos;\n"
+    "      gb = FS_N - gb; gp[gb + tid] = pos;\n"
     "      GroupMemoryBarrierWithGroupSync();\n"
     "      float3 c = 0.0; float cnt = 0.0;\n"
     "      [unroll] for (int k = 0; k < 12; k++) {\n"
@@ -451,19 +498,18 @@ static const char flag_cs_hlsl[] =
     "        float wgt = k < 4 ? 1.0 : k < 8 ? tune1.y : tune1.z;\n"   // stretch links firm, shear soft, bending very soft
     "        int ni = i + o.x, nj = j + o.y;\n"
     "        if (ni < 0 || ni >= FS_GX || nj < 0 || nj >= FS_GY) continue;\n"
-    "        float3 dd = gp[nj * FS_GX + ni] - pos; float len = length(dd);\n"
+    "        float3 dd = gp[gb + nj * FS_GX + ni] - pos; float len = length(dd);\n"
     "        if (len < 1e-6) continue;\n"
     // cloth resists stretching, hardly squashing (so it can crumple and hang); a pinned neighbour does not move: the whole
     // correction here
     "        c += dd * ((len - rl) / len) * (len < rl ? 0.05 : 1.0) * (nj == 0 ? 1.0 : 0.5) * wgt; cnt += wgt;\n"
     "      }\n"
     "      if (j > 0 && cnt > 0.0) pos += c / cnt;\n"
-    "      GroupMemoryBarrierWithGroupSync();\n"
     "    }\n"
     // (a follow-the-leader no-stretch pass was tried: it kept a calm flag swinging round the pole, with or without
     // Mueller's damping; without it the links hold full-wind stretch to about 2 %)
     "  }\n"
     "  grid[gi] = float4(pos, 0.0); grid[gv] = float4(prev, 0.0);\n"
-    "  if (tid == 0 && p5.z != 0.0) slot[s * FS_SLOT4 + 5].z = 0.0;\n"
-    "  if (tid == 0) { slot[s * FS_SLOT4 + 8] = r0; slot[s * FS_SLOT4 + 9] = r1; slot[s * FS_SLOT4 + 10] = r2; }\n"
+    "  if (tid == 0 && p5.z != 0.0) slot[s * FS_SLOT4 + 5].z = 0;\n"
+    "  if (tid == 0) { SP(s * FS_SLOT4 + 8, r0); SP(s * FS_SLOT4 + 9, r1); SP(s * FS_SLOT4 + 10, r2); }\n"
     "}\n";

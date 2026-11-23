@@ -53,7 +53,7 @@ with its 64-bit helper, is in the game folder. The helper's source is in its own
 | `flagsim.c`, `flagsim.h`, `flagvs.h` | The cloth banners: the GPU cloth simulation, included as source by `bridgeprobe.c` rather than linked, so it also builds standalone |
 | `fgprobe.h` | Upscaling add-on: the bridge cost probe (`fgbridge.c`), driven by the sweep's `probe=` key |
 | `fgb_motion_api.h` | Upscaling add-on: `fgb_motion_vectors`, exported for other mods - this frame's motion vectors on the game's D3D11 device (the struct and what the values mean) |
-| `passtime.c`, `gputime.c` | Upscaling add-on: the hook on the render stage driver the bridge runs on, and the hook on the game's `GetProcAddress` import (D3D11 device and DXGI factory) |
+| `passtime.c` | Upscaling add-on: the hook on the render stage driver the bridge runs on |
 | `rslink.cpp`, `reshade/` | Upscaling add-on (6.9): with ReShade in the game folder, registers as a ReShade add-on and runs ReShade's effects at the point where the interface starts (after DLSS), with the scene depth and the camera's near / far for ReShade's depth; the glue in `bridgeprobe.c` presents from under ReShade's swapchain wrapper. C++ without the C++ runtime; `reshade/` holds ReShade 6.8.0's add-on API headers, unchanged |
 
 Every patch first compares the game's bytes at its address with what it expects, and skips itself

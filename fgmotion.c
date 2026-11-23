@@ -1,4 +1,4 @@
-// Per-object motion vectors for the frame bridge (dev only; DLSS_PLAN "Per-object motion vectors", AGENT_LOG 97-99).
+// Per-object motion vectors for the frame bridge (in the release since 6.3; DLSS_PLAN "Per-object motion vectors", AGENT_LOG 97-99).
 // Attila's animated models (units, horses, campaign armies / agents) are drawn instanced by three main-view vertex shaders
 // that skin from an animation texture and a 120-byte instance record per model (world matrix rows at 0-47, bone base at
 // 48). The motion pass draws those models again, after the camera-motion pass and before the HUD-less copy, with our
@@ -279,6 +279,17 @@ static float (*m_prev_cpu)[16];   // M_MAX_INST previous records (64 bytes)
 #define M_WORKERS 3
 #define M_CHUNK 256
 static volatile LONG m_queued, m_done, m_claim;   // instances handed over / finished / claimed
+// m_claim holds the instances claimed in its low M_CLAIM_BITS bits and the queue's generation above them. release_draws
+// starts the queue again at 0 in the middle of a frame; a worker that had read the claim just before and lost the CPU
+// until after that used to find it "unchanged" (0 again), claim a chunk of a queue that no longer existed and add it to
+// m_done - and the main thread then waited for m_done == m_queued for ever (audit 2026-11-20). With the generation in
+// the word, a claim read before a restart can never be swapped in after it.
+#define M_CLAIM_BITS 17
+#define M_CLAIM_MASK ((1 << M_CLAIM_BITS) - 1)
+_Static_assert(M_MAX_INST <= M_CLAIM_MASK, "the claim's count needs to hold M_MAX_INST");
+#ifndef FGM_TEST_STALL   // fgmotion_par_test parks a thread here, between the read and the swap
+#define FGM_TEST_STALL()
+#endif
 static LONG m_ent_base;   // this frame's entries before the current queue (the pass empties the queue mid-frame)
 static HANDLE m_wakes[M_WORKERS], m_threads[M_WORKERS];
 static volatile LONG m_sleeping[M_WORKERS];
@@ -296,6 +307,7 @@ static ID3D11Resource *m_anim_bad[M_TEX];          // one that does not fit (kep
 static ID3D11Texture2D *m_prev_anim;               // their previous-frame copies (array slices)
 static ID3D11ShaderResourceView *m_prev_anim_srv;
 static int m_prev_ok[M_TEX];
+static LONG m_anim_used[M_TEX];                    // the frame a draw last read each index (frame end: copied only while in use)
 static unsigned m_frames, m_draws_total, m_inst_total, m_skipped, m_skipped_full;
 static double m_pass_ms;
 static unsigned long long m_draw_ticks;
@@ -341,10 +353,11 @@ static void lookup_range(LONG f, LONG from, LONG to) {
 // claims and does one chunk of what is queued; 0 when nothing is left to claim
 static int lookup_chunk(void) {
     for (;;) {
-        LONG start = m_claim, q = m_queued;
+        LONG c = m_claim, q = m_queued, start = c & M_CLAIM_MASK;   // the claim first: a queue restarted in between fails the swap
         if (start >= q) return 0;
         LONG end = q - start > M_CHUNK ? start + M_CHUNK : q;
-        if (InterlockedCompareExchange(&m_claim, end, start) != start) continue;
+        FGM_TEST_STALL();
+        if (InterlockedCompareExchange(&m_claim, (c & ~M_CLAIM_MASK) | end, c) != c) continue;
         lookup_range(*(volatile LONG *)&m_frame, start, end);   // the frame advances only while all are idle
         InterlockedExchangeAdd(&m_done, end - start);
         return 1;
@@ -356,7 +369,7 @@ static DWORD WINAPI worker(void *arg) {
     for (;;) {
         while (lookup_chunk()) {}
         InterlockedExchange(&m_sleeping[k], 1);
-        if (m_claim < m_queued) { InterlockedExchange(&m_sleeping[k], 0); continue; }   // queued meanwhile: no lost wake
+        if ((m_claim & M_CLAIM_MASK) < m_queued) { InterlockedExchange(&m_sleeping[k], 0); continue; }   // queued meanwhile: no lost wake
         WaitForSingleObject(m_wakes[k], INFINITE);
         InterlockedExchange(&m_sleeping[k], 0);
     }
@@ -477,6 +490,7 @@ void fgm_draw(ID3D11DeviceContext *c, UINT idx, UINT inst, UINT start_idx, INT b
     }
     if (ok && (tex < 0 || tex >= M_TEX)) m_skip_tex++;
     if (ok && tex > m_tex_max) m_tex_max = tex;
+    if (ok && tex >= 0 && tex < M_TEX) m_anim_used[tex] = m_frame;
     if (!ok || tex < 0 || tex >= M_TEX) {
         m_skipped++;
         if (vb[0]) ID3D11Buffer_Release(vb[0]);
@@ -569,7 +583,11 @@ static void release_draws(void) {
     }
     m_ndraws = 0;
     m_ent_base += m_queued;   // all done (waited above): later draws this frame add after them, as the single worker did
-    m_queued = m_done = m_claim = 0;
+    // The queue starts again. In this order: with m_queued at 0 nobody can claim; then the claim's count back to 0 under
+    // a new generation, so a claim someone read before this point no longer matches (see M_CLAIM_BITS).
+    m_queued = 0;
+    m_done = 0;
+    m_claim = (LONG)(((ULONG)m_claim & ~(ULONG)M_CLAIM_MASK) + (1u << M_CLAIM_BITS));
 }
 // frame end: this frame's entries become the previous frame's for the next one's lookups
 static void close_entries(void) {
@@ -782,6 +800,15 @@ void fgm_frame_end(void) {
     if (m_grid_frame != m_frame) m_nent[m_frame & 1] = 0;   // no models this frame: the next one starts without history
     for (int t = 0; t < M_TEX && m_enabled; t++)
         if (m_anim_res[t]) {
+            // A texture no draw has read for 120 frames is let go: its index was only ever replaced, never dropped, so
+            // a battle's textures (6.3 MB each) were copied every frame on the campaign map and in the menus too, and
+            // stayed referenced for the session. A draw that reads it again finds it as new, without history.
+            if (m_frame - m_anim_used[t] > 120) {
+                ID3D11Resource_Release(m_anim_res[t]);
+                m_anim_res[t] = NULL;
+                m_prev_ok[t] = 0;
+                continue;
+            }
             ID3D11DeviceContext_CopySubresourceRegion(m_ctx, (ID3D11Resource *)m_prev_anim, (UINT)t, 0, 0, 0, m_anim_res[t], 0, NULL);
             m_prev_ok[t] = 1;
         }
@@ -910,4 +937,14 @@ void fgm_release(void) {
     m_depth = NULL;
     if (m_prev_anim_srv) { ID3D11ShaderResourceView_Release(m_prev_anim_srv); m_prev_anim_srv = NULL; }
     if (m_prev_anim) { ID3D11Texture2D_Release(m_prev_anim); m_prev_anim = NULL; }
+    // The pass's own context state still binds what the pass last drew with (the vectors' view, the game's depth, the
+    // animation copies and the game's last buffers), so the releases above gave nothing back while it lived. It is not
+    // the current state here: fgm_pass swaps the game's back in before it returns.
+    if (m_state) { ID3DDeviceContextState_Release(m_state); m_state = NULL; }
+    if (m_ctx1) { ID3D11DeviceContext1_Release(m_ctx1); m_ctx1 = NULL; }
+    for (int t = 0; t < M_TEX; t++) {   // and the game's own animation textures, held since a draw first read them
+        if (m_anim_res[t]) { ID3D11Resource_Release(m_anim_res[t]); m_anim_res[t] = NULL; }
+        if (m_anim_bad[t]) { ID3D11Resource_Release(m_anim_bad[t]); m_anim_bad[t] = NULL; }
+        m_prev_ok[t] = 0;
+    }
 }

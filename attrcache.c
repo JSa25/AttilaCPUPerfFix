@@ -314,7 +314,7 @@ int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...)) 
     void *old = iat_hook(m, "CreateFileW", (void *)ac_CreateFileW);
     if (old) r_open = (ac_open_fn)old;
     else log("attribute cache: CreateFileW import not found - only file checks are cached");
-    HANDLE t = CreateThread(NULL, 64 * 1024, stats_thread, NULL, 0, NULL);
+    HANDLE t = CreateThread(NULL, 256 << 10, stats_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (t) CloseHandle(t);
     log("attribute cache installed: missing loose-file folders are remembered (cleared when a watched folder changes)%s",
         verify ? " - VERIFY mode, every answer is checked against Windows" : "");

@@ -14,9 +14,23 @@
 #include <windows.h>
 #include <string.h>
 #include "gamerva.h"
+#include "patch.h"
 
 #define RVA_HEIGHTQ 0x18F9150
 static const unsigned char HEIGHTQ_PROLOGUE[6] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8};  // push ebp; mov ebp,esp; and esp,-8
+// Is this the terrain height query? Its first 40 bytes without the two address fields in them (the same in the Steam
+// and GOG builds): ... sub esp,44h; push ebx / esi / edi; mov edi,ecx; mov ecx,<a global>; call <its test>; test al,al;
+// jne +2A4h; mov ecx,[edi+794h]; test ecx,ecx. The prologue alone (6 bytes any function of this shape starts with) was
+// all that stood between the hook, which reads this+794h, and another function at this address in a game build that is
+// not in the table (gamerva.h: those get the Steam address).
+static const unsigned char HEIGHTQ_HEAD[15] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x44, 0x53, 0x56, 0x57, 0x8B, 0xF9, 0xB9};
+static const unsigned char HEIGHTQ_BODY[16] = {0x84, 0xC0, 0x0F, 0x85, 0xA4, 0x02, 0x00, 0x00, 0x8B, 0x8F, 0x94, 0x07, 0x00, 0x00, 0x85, 0xC9};
+static int heightq_real(const unsigned char *f) {
+    return !memcmp(f, HEIGHTQ_HEAD, sizeof HEIGHTQ_HEAD) && f[19] == 0xE8 && !memcmp(f + 24, HEIGHTQ_BODY, sizeof HEIGHTQ_BODY);
+}
+#ifndef HEIGHTQ_CHECK   // heightcache_test.c hooks a stand-in that has the prologue only
+#define HEIGHTQ_CHECK(f) heightq_real(f)
+#endif
 
 volatile LONG g_hq[4];
 static int g_hq_mode;  // 1 verify, 2 cache
@@ -103,24 +117,14 @@ __attribute__((naked)) static void heightq_stub(void) {
 // mode 1 verify, 2 cache. Must run on the game's main thread. Returns 1 if installed.
 int install_heightcache(HMODULE m, int mode, void (*log)(const char *fmt, ...)) {
     unsigned char *site = (unsigned char *)m + game_rva(m, RVA_HEIGHTQ);
-    if (memcmp(site, HEIGHTQ_PROLOGUE, 6) != 0) { log("height cache: code differs from this game version - not installed"); return 0; }
+    if (!HEIGHTQ_CHECK(site)) { log("height cache: code differs from this game version - not installed"); return 0; }
     g_hq_mode = mode;
     g_hq_main = GetCurrentThreadId();
     g_hq_base = (unsigned char *)m;
     DWORD old;
     if (!VirtualProtect(g_hq_tramp, sizeof g_hq_tramp, PAGE_EXECUTE_READWRITE, &old)) return 0;
-    memcpy(g_hq_tramp, site, 6);
-    g_hq_tramp[6] = 0xE9;
-    DWORD rel = (DWORD)((site + 6) - (g_hq_tramp + 11));
-    memcpy(g_hq_tramp + 7, &rel, 4);
-    FlushInstructionCache(GetCurrentProcess(), g_hq_tramp, sizeof g_hq_tramp);
-    if (!VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old)) return 0;
-    site[0] = 0xE9;
-    rel = (DWORD)((unsigned char *)heightq_stub - (site + 5));
-    memcpy(site + 1, &rel, 4);
-    site[5] = 0x90;
-    VirtualProtect(site, 6, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 6);
+    patch_tramp(g_hq_tramp, site, 6);
+    if (!patch_jump(site, 6, heightq_stub)) return 0;
     log("height cache installed (%s)", mode == 2 ? "cache" : "verify only");
     return 1;
 }

@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
+// the stand-in below has the game routine's prologue and then jumps to memmove: the install takes it by that. The real
+// check (memfast_real) is run on the game's own code when its DLL is given as the argument.
+#define MEMFAST_CHECK(f) (memcmp(f, MEMFAST_PROLOGUE, 6) == 0)
 #include "../memfast.c"
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
@@ -31,9 +35,19 @@ __asm__(
     "popl %ebp\n\tpopl %edi\n\tpopl %esi\n\tpopl %ebx\n\t"
     "ret\n");
 
-int main(void) {
+int main(int argc, char **argv) {
     unsigned char *img = VirtualAlloc(NULL, 0x1B00000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     CHECK(img);
+    if (argc > 1) {   // the game's DLL (either build): the install's real check knows the routine, and only it
+        unsigned char *g = (unsigned char *)LoadLibraryExA(argv[1], NULL, DONT_RESOLVE_DLL_REFERENCES);
+        CHECK(g);
+        unsigned rva = game_rva(g, RVA_MEMCPY_FN);
+        CHECK(rva && memfast_real(g + rva));
+        CHECK(!memfast_real(g + rva + 1) && !memfast_real(g + game_rva(g, 0x18F9150)));   // not one byte on, not the height query
+        unsigned char standin[41] = {0x57, 0x56, 0x8B, 0x74, 0x24, 0x10, 0x5E, 0x5F};
+        CHECK(!memfast_real(standin));                                                    // not a function that only starts alike
+        printf("the game's memcpy at +0x%X is recognised by its first 41 bytes\n", rva);
+    }
     // stand-in: push edi; push esi; mov esi,[esp+10h]; pop esi; pop edi; jmp [g_memmove]
     unsigned char *f = img + RVA_MEMCPY_FN;
     unsigned char code[] = {0x57, 0x56, 0x8B, 0x74, 0x24, 0x10, 0x5E, 0x5F, 0xFF, 0x25, 0, 0, 0, 0};

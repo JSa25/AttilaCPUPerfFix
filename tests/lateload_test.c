@@ -319,6 +319,18 @@ int main(int argc, char **argv) {
     CHECK((has("loop prefetch: 7 of 7") || has("loop prefetch: 8 of 8")) &&  // dev builds: + effects emitter site
           (has("frame hook ready") || has("FPS logger ready")));                // dev builds: FPS logger
     CHECK(!has("does not match") && !has("differs") && !has("skipped") && !has("not the game"));
+    // The newer fixes say "not installed" / "NOT installed" when their code is not found, which the line above does not
+    // catch: a wrong byte in one of their patterns shipped the fix switched off under a green build (audit 2026-11-20).
+    CHECK(has("unit detail cull on") && has("battle UI cache installed") && has("sound crash guard: a sound without a buffer"));
+    CHECK(has("main menu: \"Engine Fix ") && !has("main menu label: the game's code differs"));   // menuver.c
+    {   // "flag wave not installed" (no flag pack is loaded here) is the one "not installed" that is a normal answer
+        int all = 0, flag = 0;
+        for (const char *q = g_log; (q = strstr(q, "not installed")) != NULL; q++) all++;
+        for (const char *q = g_log; (q = strstr(q, "flag wave not installed")) != NULL; q++) flag++;
+        CHECK(all == flag && !has("NOT installed"));
+    }
+    // no flag pack and no add-on: none of the frame bridge's hooks either (stage driver, Present, GetProcAddress)
+    if (has("flag wave not installed")) CHECK(!has("pass time:") && !has("bridge probe installed"));
 
     // the three heap jumps must point into this DLL; dlmalloc's trim stays the game's own, relocated address intact
     unsigned char *b = (unsigned char *)game;

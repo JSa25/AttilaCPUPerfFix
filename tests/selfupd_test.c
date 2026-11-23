@@ -145,6 +145,28 @@ int main(void) {
     CHECK(!strcmp(READ(mine), "my settings"));      // settings.txt is not in the package: kept
 #undef READ
 
+    // The 64-bit plugin: only where <game>\attila64\plugins exists, only to a higher marker, never a half download.
+    wchar_t plg[MAX_PATH], pdll[MAX_PATH], wp64[MAX_PATH], a64[MAX_PATH];
+    swprintf(a64, MAX_PATH, L"%ls\\attila64", g_dir);
+    swprintf(plg, MAX_PATH, L"%ls\\plugins", a64);
+    swprintf(pdll, MAX_PATH, L"%ls\\perffix64.dll", plg);
+    swprintf(wp64, MAX_PATH, L"%ls\\ws_perffix64.dll", g_dir);
+    DeleteFileW(pdll); RemoveDirectoryW(plg); RemoveDirectoryW(a64);
+    make(wp64, 740, NULL);
+    CHECK(plugin64_update_from(plg, wp64, say) == 0 && !exists(plg));    // no 64-bit Attila: nothing created
+    CreateDirectoryW(a64, NULL); CreateDirectoryW(plg, NULL);
+    CHECK(plugin64_update_from(plg, wp64, say) == 1 && file_version(pdll) == 740);   // missing: put in
+    CHECK(plugin64_update_from(plg, wp64, say) == 0);                   // same version: left
+    make(pdll, 750, NULL);
+    CHECK(plugin64_update_from(plg, wp64, say) == 0 && file_version(pdll) == 750);   // newer installed: no downgrade
+    make(pdll, 730, NULL);
+    make_(wp64, 741, NULL, 1);
+    CHECK(plugin64_update_from(plg, wp64, say) == 0 && file_version(pdll) == 730 && strstr(g_last, "not complete yet"));   // half download
+    make(wp64, 741, NULL);
+    CHECK(plugin64_update_from(plg, wp64, say) == 1 && file_version(pdll) == 741);   // older one replaced
+    make(wp64, 0, "no marker");
+    CHECK(plugin64_update_from(plg, wp64, say) == 0 && file_version(pdll) == 741);   // not a plugin file: ignored
+
     // update_off.txt next to the module (this test's folder stands in for the game folder): nothing else is looked at
     wchar_t off[MAX_PATH];
     GetModuleFileNameW(NULL, off, MAX_PATH);

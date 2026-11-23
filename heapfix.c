@@ -14,6 +14,7 @@
 #include <string.h>
 #include "version.h"
 #include "logtrim.h"
+#include "patch.h"
 
 #define DL_MAX_REQUEST 0xFFFFFFC0u   // dlmalloc fails requests this big; keep that behaviour
 #define PREFERRED_BASE 0x10000000u
@@ -220,13 +221,9 @@ static int install_into(HMODULE m) {
     for (size_t i = 0; i < NPATCH; i++) {  // original first instructions, then a jump to the rest
         if (!g_patches[i].to) continue;
         unsigned char *t = tramp + 32 * i, *site = base + g_patches[i].rva;
-        memcpy(t, site, g_patches[i].copy);
-        t[g_patches[i].copy] = 0xE9;
-        DWORD rel = (DWORD)((site + g_patches[i].copy) - (t + g_patches[i].copy + 5));
-        memcpy(t + g_patches[i].copy + 1, &rel, 4);
+        patch_tramp(t, site, g_patches[i].copy);
         *g_patches[i].orig = t;
     }
-    FlushInstructionCache(GetCurrentProcess(), tramp, 4096);
     if (!pools_init()) {
         wlog("the small-block pools could not be set up - nothing patched");
         return 0;
@@ -234,18 +231,12 @@ static int install_into(HMODULE m) {
     for (size_t i = 0; i < NPATCH; i++) {
         if (!g_patches[i].to) continue;
         unsigned char *site = base + g_patches[i].rva;
-        DWORD old;
-        if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        if (!patch_jump(site, 5, g_patches[i].to)) {
             // Only reachable for the first patch in practice; a partial install would mix heaps.
             wlog("VirtualProtect failed at %s (%lu)%s", g_patches[i].name, GetLastError(),
                  i ? " - GAME STATE UNSAFE, remove dinput8.dll" : " - nothing patched");
             return 0;
         }
-        site[0] = 0xE9;
-        DWORD rel = (DWORD)((unsigned char *)g_patches[i].to - (site + 5));
-        memcpy(site + 1, &rel, 4);
-        VirtualProtect(site, 5, old, &old);
-        FlushInstructionCache(GetCurrentProcess(), site, 5);
     }
     wlog("empire.retail.dll at %p: game heap replaced by 8 dlmalloc pools with the game's own settings (blocks <= 16 KB, "
          "nothing reserved up front, grown in 64 KB pieces like the game's heap); larger blocks stay on the game's heap", base);
@@ -305,6 +296,7 @@ HRESULT WINAPI stub_DllUnregisterServer(void) {
 #ifndef HEAPFIX_TEST
 int install_pool(HMODULE m, void (*log)(const char *fmt, ...));  // pool.c
 int install_sortfix(HMODULE m, void (*log)(const char *fmt, ...));  // sortfix.c
+int install_parsort(HMODULE m, int ab, void (*log)(const char *fmt, ...));  // sortfix.c: the soldiers' lists on several threads
 int install_fps(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...));  // fps.c
 int install_batchfix(HMODULE m, void (*log)(const char *fmt, ...));  // batchfix.c
 int install_campfix(HMODULE m, int ab, void (*log)(const char *fmt, ...));  // campfix.c
@@ -338,6 +330,8 @@ extern void (*g_gt_frame)(void);                                                
 extern int g_pt_force_bridge;                                                              // passtime.c
 volatile LONG g_geo_frame;
 static int g_passtime_on;
+// CAPTURE (build/capture/dinput8.dll, PERF_DEEP_DIVE 7): the release DLL plus the sampler and the load probes, all
+// started by their switch files; no other dev code (no vfxload, no A/B switches, no tests that change results)
 
 static int g_campfix_on, g_x87fix_on, g_scriptext_on;
 
@@ -390,6 +384,7 @@ static const char INI_DEFAULTS[] =
     "memory_allocator=1\r\n"
     "small_object_pools=1\r\n"
     "render_list_sorts=1\r\n"
+    "parallel_sort=1\r\n"
     "battle_draw_batching=1\r\n"
     "campaign_rounding=1\r\n"
     "x87_rounding=1\r\n"
@@ -433,29 +428,9 @@ static void ini_create(void) {
     WriteFile(f, INI_DEFAULTS, sizeof INI_DEFAULTS - 1, &w, NULL);
     CloseHandle(f);
 }
-// numbers, or on / true / yes = 1 and off / false / no = 0 (GetPrivateProfileIntW read "on" as 0 = the fix off;
-// ultrareview 2026-11-02); anything else keeps the default
-static int ini_int(const wchar_t *section, const wchar_t *key, int def) {
-    wchar_t v[32];
-    if (!g_ini[0] || !GetPrivateProfileStringW(section, key, L"", v, 32, g_ini)) return def;
-    if ((v[0] >= L'0' && v[0] <= L'9') || v[0] == L'-') return _wtoi(v);
-    static const wchar_t *const yes[3] = {L"on", L"true", L"yes"}, *const no[3] = {L"off", L"false", L"no"};
-    for (int i = 0; i < 3; i++) {
-        if (!_wcsicmp(v, yes[i])) return 1;
-        if (!_wcsicmp(v, no[i])) return 0;
-    }
-    return def;
-}
-// 1 when a fix is switched off: <key>=0 in [fixes] of heapfix.ini, or the older <name>_off.txt in the game folder.
-static int fix_off(const wchar_t *key, const wchar_t *old_file, const char *name, const char *then) {
-    wchar_t p[MAX_PATH];
-    wcscpy(p, g_log_path);
-    wchar_t *sl = wcsrchr(p, L'\\');
-    int file = sl && wcslen(old_file) + (sl + 1 - p) < MAX_PATH && (wcscpy(sl + 1, old_file), GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES);
-    if (ini_int(L"fixes", key, 1) && !file) return 0;
-    wlog("%s switched off (heapfix.ini or %ls) - %s", name, old_file, then);
-    return 1;
-}
+#include "fixoff.h"   // ini_int and fix_off: heapfix.ini's reader, and a fix's switch (its tests build the same file)
+// The flag wave's switch, for bridgeprobe.c too (with the add-on, and in dev builds, it is asked there): one rule, here.
+int flag_wave_off(void) { return fix_off(L"flag_wave", L"flagwave_off.txt", "flag wave", "not installed"); }
 
 static HINSTANCE g_self;
 
@@ -561,6 +536,12 @@ static void install_all(HMODULE m) {
     int sorts = 0, camp = 0, x87 = 0;
     if (fix_off(L"render_list_sorts", L"sortfix_off.txt", "render-list sorts", "not replaced")) st[S_SORTS] = FIX_SWITCHED_OFF;
     else sorts = install_sortfix(m, wlog);
+    // Battles: the job the main thread waits for each frame sorts the soldiers' draw lists on several threads
+    // (sortfix.c, AGENT_LOG 238). Part of the sorts: no status line of its own.
+    if (sorts && !fix_off(L"parallel_sort", L"parsort_off.txt", "soldier draw lists on several threads", "they are sorted on one thread, as before")) {
+        if (sl) wcscpy(sl + 1, L"parsort_ab.txt");   // the FPS test: 10 s windows on / off, the job's time to the log
+        install_parsort(m, sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES, wlog);
+    }
     st[S_BATCH] = fix_off(L"battle_draw_batching", L"batchfix_off.txt", "batch fix", "not installed") ? FIX_SWITCHED_OFF : install_batchfix(m, wlog) > 0;
     // the frame hook before the rounding fixes: its per-frame checks put the game's own code back when the rounding mode
     // changes, so without it they stay out (ultrareview 2026-11-02: a failed hook was ignored)
@@ -610,6 +591,9 @@ static void install_all(HMODULE m) {
     g_uikeep_keep = keep < 1 ? 1 : keep > 1024 ? 1024 : (unsigned)keep;
     st[S_MENUS] = fix_off(L"menu_textures", L"uikeep_off.txt", "menu textures fix", "freed when closed, as the game does") ? FIX_SWITCHED_OFF
                                                                                                                      : install_uikeep(m, wlog) > 0;
+    // Main menu: this mod's version under the game's version number (menuver.c)
+    int install_menuver(HMODULE m, void (*log)(const char *fmt, ...));
+    install_menuver(m, wlog);
     // Battles: a soldier's small parts are not drawn once they would be a few pixels tall (partcull.c).
     // Light by default (16 px bodies, 9 px heads): +12.3 fps on its own and +20.0 with the UI cache in a 1212
     // battle, with no pop-in at twice that threshold (notes/bench_cache_cull_2x2.md, notes/part_cull_design.md).
@@ -643,11 +627,9 @@ static void install_all(HMODULE m) {
     if (sl) wcscpy(sl + 1, L"FrameBridge\\helper64.exe");
     int addon = sl && GetFileAttributesW(off) != INVALID_FILE_ATTRIBUTES;
     if (addon) {   // addon=off in its settings.txt: the add-on does nothing at all (no hooks), as if it were not installed
-        char text[4096] = {0};   // settings.txt is past 1 KB since dlss_preset / sharpness: addon=off sat beyond 1024 bytes
-        wcscpy(sl + 1, L"FrameBridge\\settings.txt");
-        FILE *sf = _wfopen(off, L"r");
-        if (sf) { fread(text, 1, sizeof text - 1, sf); fclose(sf); }
-        if (strstr(text, "\naddon=off") || !strncmp(text, "addon=off", 9)) {
+        int addon_switched_off(const wchar_t *fbdir);   // bridgeprobe.c (it asks the same when a flag pack brings it up)
+        wcscpy(sl + 1, L"FrameBridge");
+        if (addon_switched_off(off)) {
             wlog("DLSS add-on found but switched off (addon=off in FrameBridge\\settings.txt) - the game runs with the performance fix only");
             addon = 0;
         }
@@ -658,9 +640,18 @@ static void install_all(HMODULE m) {
         if (g_passtime_on) g_frame_check = frame_checks;
     } else {   // without the add-on: the F8 panel (Culling, What's new) and the pop-ups on the game's own frames (overlay.c)
         // The flag wave hangs off the same lean bridge the add-on brings up (bridgeprobe.c needs its stage hook for the
-        // draw hooks), so that goes in for everyone unless flag_wave=0. None of the flag code runs until a waved flag
-        // mesh turns up in a vertex buffer, so a player without such a pack carries the hooks and does no work.
-        if (!fix_off(L"flag_wave", L"flagwave_off.txt", "flag wave", "not installed")) {
+        // draw hooks). It goes in only for a player whose loaded packs carry the flag switch with a 1 in it
+        // (fwpack.c): no flag pack, no bridge, no hook of it anywhere.
+        int fw_pack_switch(const wchar_t *dir, char *who, int wn);
+        wchar_t gdir[MAX_PATH] = L"";   // the game folder: off up to sl, the backslash every file name here is put after
+        if (sl) wcsncpy(gdir, off, (size_t)(sl - off));
+        int fwsw = 0;
+        if (sl && !flag_wave_off()) {   // it logs its own case
+            fwsw = fw_pack_switch(gdir, NULL, 0);
+            if (fwsw <= 0) wlog(fwsw < 0 ? "flag wave not installed: no loaded pack carries the flag switch file (a flag pack does)"
+                                          : "flag wave not installed: a loaded pack's flag switch file says 0");
+        }
+        if (fwsw > 0) {
             g_pt_force_bridge = 1;
             g_passtime_on = install_passtime(m, wlog) > 0;
             if (g_passtime_on) g_frame_check = frame_checks;
@@ -712,6 +703,23 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
         pool_lookup_thread_exit();
     }
     if (reason == DLL_PROCESS_ATTACH) {
+        // One engine fix per game: a second copy in the same process (another dinput8.dll, one in plugins\, one bundled
+        // under another name) would patch the game's code twice. The first copy holds Local\AttilaEngineFix_<pid> for
+        // the process's life (other mods may open it to see that the fix runs); a later copy finds it and stays out.
+        // Copies older than 7.4 do not take it, so only they can still double up.
+        wchar_t mx[64];
+        _snwprintf(mx, 64, L"Local\\AttilaEngineFix_%lu", GetCurrentProcessId());
+        HANDLE mh = CreateMutexW(NULL, FALSE, mx);
+        if (mh && GetLastError() == ERROR_ALREADY_EXISTS) {
+            CloseHandle(mh);
+            DisableThreadLibraryCalls(h);   // its pools never start: no thread notifications for them
+            wchar_t me[MAX_PATH] = L"";
+            GetModuleFileNameW(h, me, MAX_PATH);
+            set_log_path(h);
+            wlog("Attila Engine Performance Fix " MOD_VERSION_STR ": another copy is already running in this game (%ls) - this one "
+                 "(%ls) stays out; only one engine fix should be installed", mx, me);
+            return TRUE;   // the dinput8 exports still forward to Windows' own DLL
+        }
         set_log_path(h);  // thread notifications stay on: the pools take a thread's cached blocks back when it ends
         if (g_log_path[0]) log_header();
         g_self = h;

@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
+// the stand-in below has the game function's prologue and then calls the reference: the install takes it by that. The
+// real check (heightq_real) is run on the game's own code when its DLL is given as the argument.
+#define HEIGHTQ_CHECK(f) (memcmp(f, HEIGHTQ_PROLOGUE, 6) == 0)
 #include "../heightcache.c"
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
@@ -30,9 +34,19 @@ static DWORD WINAPI other(LPVOID p) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     unsigned char *img = VirtualAlloc(NULL, 0x2B00000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     CHECK(img);
+    if (argc > 1) {   // the game's DLL (either build): the install's real check knows the function, and only it
+        unsigned char *g = (unsigned char *)LoadLibraryExA(argv[1], NULL, DONT_RESOLVE_DLL_REFERENCES);
+        CHECK(g);
+        unsigned rva = game_rva(g, RVA_HEIGHTQ);
+        CHECK(rva && heightq_real(g + rva));
+        CHECK(!heightq_real(g + rva + 1) && !heightq_real(g + game_rva(g, 0x1A27CA0)));   // not one byte on, not memcpy
+        unsigned char standin[40] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0xFF, 0x75, 0x0C};
+        CHECK(!heightq_real(standin));                                                   // not a function that only starts alike
+        printf("the game's height query at +0x%X is recognised by its first 40 bytes\n", rva);
+    }
     // fake game: DAT_12a21d18 -> object with vtable slot +0x2C4 = game_switch
     static void *vtable[0x300 / 4], *game[4];
     vtable[0x2C4 / 4] = (void *)game_switch;

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <math.h>
+volatile long g_x87_other_thread_bad;   // x87fix.c's, which is not part of this test
 #include "../campfix.c"
 
 volatile LONG g_campfix_state = -1;
@@ -134,6 +135,14 @@ int main(int argc, char **argv) {
     WaitForSingleObject(parked, INFINITE);
     campfix_frame();   // the next frame, the block empty
     __asm__ volatile("fldcw %0" ::"m"(cw));
+    CHECK(!SITES[2].installed && memcmp(img + 0x189B363, HEIGHT_ORIG, 36) == 0);
+    // in again (the other three are in already and are skipped), then x87fix's watcher reports a game thread with
+    // another rounding mode: the height block goes back for that too, with this thread's own mode still the default
+    CHECK(install_campfix((HMODULE)img, 0, say) == 1 && SITES[2].installed);
+    campfix_frame();
+    CHECK(SITES[2].installed && (fpu_cw() & 0xC00) == 0);
+    g_x87_other_thread_bad = 1;
+    campfix_frame();
     CHECK(!SITES[2].installed && memcmp(img + 0x189B363, HEIGHT_ORIG, 36) == 0);
     printf("all campfix tests passed\n");
     return 0;

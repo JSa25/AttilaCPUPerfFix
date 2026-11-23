@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <string.h>
 #include "gamerva.h"
+#include "patch.h"
 
 struct site {
     unsigned cmp_rva;    // cmp dword [esi+14h],0 ; jnz +0Dh
@@ -76,8 +77,7 @@ static void build_stubs(unsigned char *code, unsigned char *c, unsigned char *r,
 
 // the site must be writable already (install_batchfix unlocks all eight first)
 static void jump_to(unsigned char *at, int len, unsigned char *target) {
-    at[0] = 0xE9;
-    put_rel(at + 1, target);
+    patch_rel(at, target);
     memset(at + 5, 0x90, len - 5);
     FlushInstructionCache(GetCurrentProcess(), at, len);
 }

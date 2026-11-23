@@ -323,8 +323,14 @@ static LONG record(EXCEPTION_POINTERS *e, int last_chance) {
         NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
         DWORD *sp = (DWORD *)(UINT_PTR)c->Esp, *top = (DWORD *)tib->StackBase;
         MEMORY_BASIC_INFORMATION sm;   // ESP outside the TIB's stack (game workers on their own stacks): the committed region's end
-        if ((sp >= top || sp < (DWORD *)tib->StackLimit) && VirtualQuery(sp, &sm, sizeof sm) && sm.State == MEM_COMMIT)
-            top = (DWORD *)((BYTE *)sm.BaseAddress + sm.RegionSize);
+        if (sp >= top || sp < (DWORD *)tib->StackLimit) {
+            // readable memory at ESP, or no scan: with ESP wild (not committed, or a guard page) the scan itself faulted
+            // inside this handler, the record was lost and so was every later one (audit 2026-11-20)
+            if (VirtualQuery(sp, &sm, sizeof sm) && sm.State == MEM_COMMIT && !(sm.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                top = (DWORD *)((BYTE *)sm.BaseAddress + sm.RegionSize);
+            else
+                top = sp;
+        }
         int found = 0;
         DWORD last = 0;
         p = put(p, end, "  stack:");
@@ -709,7 +715,7 @@ static void sampler_start(HMODULE empire, const wchar_t *dir, void (*log)(const 
         }
     g_sm_empire = (DWORD)(UINT_PTR)empire;
     g_sm_log = log;
-    HANDLE h = CreateThread(NULL, 0, sampler_thread, NULL, 0, NULL);
+    HANDLE h = CreateThread(NULL, 256 << 10, sampler_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (h) CloseHandle(h);
 }
 
@@ -750,6 +756,49 @@ static void log_specs(void (*log)(const char *fmt, ...), const MEMORYSTATUSEX *m
     log("memory: RAM %llu of %llu MB free, commit (RAM + page file) %llu of %llu MB free%s", ms->ullAvailPhys >> 20, ms->ullTotalPhys >> 20,
         ms->ullAvailPageFile >> 20, ms->ullTotalPageFile >> 20,
         !battery ? "" : ps.ACLineStatus == 0 ? "; laptop ON BATTERY (slower)" : "; laptop plugged in");
+}
+
+// The launcher's mod list as plain bytes, in load order (mod "x.pack"; and add_working_directory "..."; lines): the file
+// the launcher names on the command line (attila.exe used_mods.txt; - in the game folder, ASCII or UTF-16), else
+// user.script.txt. Returns its length, 0 when there is none; text is always terminated. The flag wave's pack switch
+// (fwpack.c) reads the same list, so the two agree on which packs are loaded.
+int diag_mods_text(const wchar_t *dir, char *text, int cap) {
+    const wchar_t *cl = GetCommandLineW(), *arg = NULL;
+    for (const wchar_t *q = cl; (q = wcsstr(q, L".txt;")) != NULL; q++) arg = q;
+    FILE *f = NULL;
+    if (arg) {
+        const wchar_t *b = arg;
+        if (arg[5] == L'"') { while (b > cl && b[-1] != L'"') b--; }   // a quoted path: spaces in it (round 2)
+        else while (b > cl && b[-1] != L' ' && b[-1] != L'"') b--;
+        wchar_t mp[MAX_PATH];
+        int an = (int)(arg + 4 - b);
+        int abs = an > 2 && b[1] == L':';   // a full path, else relative to the game folder
+        int ok = an > 0 && an < 200;
+        if (ok && abs) ok = swprintf(mp, MAX_PATH, L"%.*ls", an, b) > 0;
+        else if (ok) ok = swprintf(mp, MAX_PATH, L"%ls\\%.*ls", dir, an, b) > 0;
+        if (ok) f = _wfopen(mp, L"rb");
+    }
+    if (!f) {
+        wchar_t pp[MAX_PATH];
+        DWORD n = GetEnvironmentVariableW(L"APPDATA", pp, MAX_PATH);
+        if (n && n < MAX_PATH - 64) {
+            wcscat(pp, L"\\The Creative Assembly\\Attila\\scripts\\user.script.txt");
+            f = _wfopen(pp, L"rb");
+        }
+    }
+    size_t len = f ? fread(text, 1, cap - 2, f) : 0;
+    if (f) fclose(f);
+    text[len] = text[len + 1] = 0;
+    if (len >= 2 && (BYTE)text[0] == 0xFF && (BYTE)text[1] == 0xFE) {   // UTF-16: to the same bytes as ASCII
+        char *narrow = malloc(cap);
+        int w = narrow ? WideCharToMultiByte(CP_UTF8, 0, (const wchar_t *)(text + 2), (int)(len - 2) / 2, narrow, cap - 1, NULL, NULL) : 0;
+        if (w < 0) w = 0;
+        if (narrow) memcpy(text, narrow, w);
+        free(narrow);
+        text[w] = 0;
+        len = (size_t)w;
+    }
+    return (int)len;
 }
 
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...)) {
@@ -821,36 +870,8 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
             log("preferences: number_of_threads %s, gfx_video_memory %s, %sx%s, fullscreen %s", th, vm, xr, yr, fs);
         else
             log("preferences: preferences.script.txt not found or empty");
-        // the mods the launcher turned on, in load order: mod "x.pack"; lines in the file the launcher names on the
-        // command line (attila.exe used_mods.txt; - in the game folder, ASCII or UTF-16), else user.script.txt
-        const wchar_t *cl = GetCommandLineW(), *arg = NULL;
-        for (const wchar_t *q = cl; (q = wcsstr(q, L".txt;")) != NULL; q++) arg = q;
-        f = NULL;
-        if (arg) {
-            const wchar_t *b = arg;
-            if (arg[5] == L'"') { while (b > cl && b[-1] != L'"') b--; }   // a quoted path: spaces in it (round 2)
-            else while (b > cl && b[-1] != L' ' && b[-1] != L'"') b--;
-            wchar_t mp[MAX_PATH];
-            int an = (int)(arg + 4 - b);
-            int abs = an > 2 && b[1] == L':';   // a full path, else relative to the game folder
-            int ok = an > 0 && an < 200;
-            if (ok && abs) ok = swprintf(mp, MAX_PATH, L"%.*ls", an, b) > 0;
-            else if (ok) ok = swprintf(mp, MAX_PATH, L"%ls\\%.*ls", dir, an, b) > 0;
-            if (ok) f = _wfopen(mp, L"rb");
-        }
-        if (!f) {
-            wcscpy(pp + n, L"\\The Creative Assembly\\Attila\\scripts\\user.script.txt");
-            f = _wfopen(pp, L"rb");
-        }
-        len = f ? fread(text, 1, sizeof text - 2, f) : 0;
-        if (f) fclose(f);
-        text[len] = text[len + 1] = 0;
-        if (len >= 2 && (BYTE)text[0] == 0xFF && (BYTE)text[1] == 0xFE) {   // UTF-16: to the same bytes as ASCII
-            static char narrow[32768];
-            int w = WideCharToMultiByte(CP_UTF8, 0, (const wchar_t *)(text + 2), (int)(len - 2) / 2, narrow, sizeof narrow - 1, NULL, NULL);
-            memcpy(text, narrow, w > 0 ? w : 0);
-            text[w > 0 ? w : 0] = 0;
-        }
+        // the mods the launcher turned on, in load order
+        diag_mods_text(dir, text, sizeof text);
         static char mods[2048];
         int ml = 0, nm = 0;
         for (const char *q = text; (q = strstr(q, "mod \"")) != NULL; q++) {

@@ -9,9 +9,20 @@
 #include <windows.h>
 #include <string.h>
 #include "gamerva.h"
+#include "patch.h"
 
 #define RVA_MEMCPY_FN 0x1A27CA0
 static const unsigned char MEMFAST_PROLOGUE[6] = {0x57, 0x56, 0x8B, 0x74, 0x24, 0x10};  // push edi; push esi; mov esi,[esp+10h]
+// Is this the game's memcpy? Its first 41 bytes (no address in them; the same in the Steam and GOG builds): the loads of
+// the three arguments, the overlap test and the "under 32 bytes" branch. The 6-byte prologue alone was the whole check
+// before a jump that sends every call of this address to a copy routine (see heightcache.c).
+static const unsigned char MEMFAST_HEAD[41] = {0x57, 0x56, 0x8B, 0x74, 0x24, 0x10, 0x8B, 0x4C, 0x24, 0x14, 0x8B, 0x7C, 0x24, 0x0C,
+                                               0x8B, 0xC1, 0x8B, 0xD1, 0x03, 0xC6, 0x3B, 0xFE, 0x76, 0x08, 0x3B, 0xF8,
+                                               0x0F, 0x82, 0x94, 0x02, 0x00, 0x00, 0x83, 0xF9, 0x20, 0x0F, 0x82, 0xD2, 0x04, 0x00, 0x00};
+static int memfast_real(const unsigned char *f) { return !memcmp(f, MEMFAST_HEAD, sizeof MEMFAST_HEAD); }
+#ifndef MEMFAST_CHECK   // memfast_test.c hooks a stand-in that has the prologue only
+#define MEMFAST_CHECK(f) memfast_real(f)
+#endif
 static unsigned char g_memfast_tramp[16];
 void *g_memfast_tramp_ptr = g_memfast_tramp;
 
@@ -86,21 +97,11 @@ __attribute__((naked)) void memfast_stub(void) {
 // Returns 1 if installed.
 int install_memfast(HMODULE m, void (*log)(const char *fmt, ...)) {
     unsigned char *site = (unsigned char *)m + game_rva(m, RVA_MEMCPY_FN);
-    if (memcmp(site, MEMFAST_PROLOGUE, 6) != 0) { log("memcpy fast path: code differs from this game version - not installed"); return 0; }
+    if (!MEMFAST_CHECK(site)) { log("memcpy fast path: code differs from this game version - not installed"); return 0; }
     DWORD old;
     if (!VirtualProtect(g_memfast_tramp, sizeof g_memfast_tramp, PAGE_EXECUTE_READWRITE, &old)) return 0;
-    memcpy(g_memfast_tramp, site, 6);
-    g_memfast_tramp[6] = 0xE9;
-    DWORD rel = (DWORD)((site + 6) - (g_memfast_tramp + 11));
-    memcpy(g_memfast_tramp + 7, &rel, 4);
-    FlushInstructionCache(GetCurrentProcess(), g_memfast_tramp, sizeof g_memfast_tramp);
-    if (!VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old)) return 0;
-    site[0] = 0xE9;
-    rel = (DWORD)((unsigned char *)memfast_stub - (site + 5));
-    memcpy(site + 1, &rel, 4);
-    site[5] = 0x90;
-    VirtualProtect(site, 6, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 6);
+    patch_tramp(g_memfast_tramp, site, 6);
+    if (!patch_jump(site, 6, memfast_stub)) return 0;
     log("memcpy fast path installed (copies of 64 bytes or less)");
     return 1;
 }

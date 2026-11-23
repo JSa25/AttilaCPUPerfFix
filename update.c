@@ -169,6 +169,30 @@ int addon_update_from(const wchar_t *game_fb, const wchar_t *ws_fb, void (*log)(
     return failed ? 0 : copied + 1;
 }
 
+// The 64-bit plugin (64-bit Attila by Sol Invictus loads <game>\attila64\plugins\*.dll): the same Workshop item carries
+// perffix64.dll beside dinput8.dll. Where that plugins folder exists, the plugin is put there when it is missing or its
+// marker is lower; after that it updates itself (x64Review/perffix64/src/update64.c). Never downgrades, never creates
+// the folder, takes no file Steam has not finished. plugins = <game>\attila64\plugins, ws = the Workshop perffix64.dll.
+// Returns 1 if the plugins folder now holds the newer version.
+int plugin64_update_from(const wchar_t *plugins, const wchar_t *ws, void (*log)(const char *fmt, ...)) {
+    wchar_t dst[MAX_PATH], tmp[MAX_PATH];
+    if (GetFileAttributesW(plugins) == INVALID_FILE_ATTRIBUTES) return 0;   // no 64-bit Attila here
+    if (swprintf(dst, MAX_PATH, L"%ls\\perffix64.dll", plugins) < 0 || swprintf(tmp, MAX_PATH, L"%ls.new", dst) < 0) return 0;
+    int theirs = file_version(ws), mine = file_version(dst);
+    if (!theirs || theirs <= mine) return 0;
+    if (!pe_complete(ws)) {
+        log("update: the Workshop has the 64-bit plugin %d, but its file is not complete yet (Steam still downloading?) - next start", theirs);
+        return 0;
+    }
+    if (!CopyFileW(ws, tmp, FALSE) || file_version(tmp) != theirs || !pe_complete(tmp) || !MoveFileExW(tmp, dst, MOVEFILE_REPLACE_EXISTING)) {
+        log("update: putting the 64-bit plugin %d into attila64\\plugins failed (error %lu)", theirs, GetLastError());
+        DeleteFileW(tmp);
+        return 0;
+    }
+    log("update: 64-bit plugin %d put into attila64\\plugins from the Steam Workshop (was %d)", theirs, mine);
+    return 1;
+}
+
 // The game folder is steamapps\common\<game>; the Workshop copy lives in the same library's steamapps\workshop.
 void update_check(HMODULE self, void (*log)(const char *fmt, ...)) {
     wchar_t me[MAX_PATH], ws[MAX_PATH];
@@ -195,6 +219,14 @@ void update_check(HMODULE self, void (*log)(const char *fmt, ...)) {
     wchar_t game_fb[MAX_PATH], ws_fb[MAX_PATH];
     swprintf(ws_fb, MAX_PATH, L"%ls\\workshop\\content\\325610\\" ADDON_ITEM L"\\FrameBridge", ws);
     wcscat(ws, L"\\workshop\\content\\325610\\" WORKSHOP_ITEM L"\\dinput8.dll");
+    {   // the 64-bit plugin first: it does not depend on this DLL's own update below
+        wchar_t plugins[MAX_PATH], ws64[MAX_PATH];
+        wcscpy(plugins, me);
+        wcscpy(wcsrchr(plugins, L'\\') + 1, L"attila64\\plugins");
+        wcscpy(ws64, ws);
+        wcscpy(wcsrchr(ws64, L'\\') + 1, L"perffix64.dll");
+        plugin64_update_from(plugins, ws64, log);
+    }
     // Our version is read from our own file, the same way as the Workshop copy's, so the comparison can never
     // disagree with the marker and re-install the same file on every start.
     int mine = file_version(me);

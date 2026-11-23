@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <string.h>
 #include "gamerva.h"
+#include "patch.h"
 
 volatile unsigned char g_loopfetch_on = 1;  // dev A/B flips it; the original instructions run either way
 
@@ -95,19 +96,8 @@ static unsigned build(unsigned char *s, const struct site *t, unsigned char *sit
     s[n++] = 0x74; s[n++] = t->fetch_len;
     memcpy(s + n, t->fetch, t->fetch_len); n += t->fetch_len;
     memcpy(s + n, t->orig, t->len); n += t->len;
-    s[n++] = 0xE9; put32(s + n, (DWORD)((site + t->len) - (s + n + 4))); n += 4;
+    patch_rel(s + n, site + t->len); n += 5;
     return n;
-}
-
-static int patch(unsigned char *site, unsigned len, unsigned char *to) {
-    DWORD old;
-    if (!VirtualProtect(site, len, PAGE_EXECUTE_READWRITE, &old)) return 0;
-    site[0] = 0xE9;
-    put32(site + 1, (DWORD)(to - (site + 5)));
-    for (unsigned i = 5; i < len; i++) site[i] = 0x90;
-    VirtualProtect(site, len, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, len);
-    return 1;
 }
 
 int install_loopfetch(HMODULE m, void (*log)(const char *fmt, ...)) {
@@ -125,7 +115,7 @@ int install_loopfetch(HMODULE m, void (*log)(const char *fmt, ...)) {
         }
         build(s, t, site);
         FlushInstructionCache(GetCurrentProcess(), s, 128);
-        n += patch(site, t->len, s);
+        n += patch_jump(site, t->len, s);
     }
     log("loop prefetch: %d of %d render loops prefetch ahead", n, want);
     return n;

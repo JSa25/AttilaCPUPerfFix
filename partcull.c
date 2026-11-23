@@ -20,6 +20,7 @@
 #include <wchar.h>
 #include <math.h>
 #include "gamerva.h"
+#include "patch.h"
 
 #define PC_LOD 0x17F6437       // after the detail-level pick: mov ebx,eax ; mov [esp+2Ch],ebx
 #define PC_P1 0x17F657A        // part loop: mov ebx,[eax+ecx*4] ; mov ecx,[esp+44h]
@@ -195,17 +196,6 @@ __attribute__((naked)) static void pcull_stub_p2(void) {
         "1: popfl\n popal\n jmp *_pcull_skip_p2\n");
 }
 
-static void pcull_jmp(unsigned char *at, int len, void *to) {
-    DWORD old;
-    if (!VirtualProtect(at, len, PAGE_EXECUTE_READWRITE, &old)) return;
-    at[0] = 0xE9;
-    DWORD rel = (DWORD)((unsigned char *)to - (at + 5));
-    memcpy(at + 1, &rel, 4);
-    memset(at + 5, 0x90, len - 5);
-    VirtualProtect(at, len, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), at, len);
-}
-
 // 1 installed, 0 not (another game build, or already installed)
 int install_partcull(HMODULE m, void (*log)(const char *fmt, ...)) {
     static int done;
@@ -234,9 +224,9 @@ int install_partcull(HMODULE m, void (*log)(const char *fmt, ...)) {
     pcull_ret_p2 = p2 + 7;
     pcull_skip_p1 = b + r_n1;
     pcull_skip_p2 = b + r_n2;
-    pcull_jmp(l, 6, (void *)pcull_stub_lod);
-    pcull_jmp(p1, 7, (void *)pcull_stub_p1);
-    pcull_jmp(p2, 7, (void *)pcull_stub_p2);
+    patch_jump(l, 6, (void *)pcull_stub_lod);
+    patch_jump(p1, 7, (void *)pcull_stub_p1);
+    patch_jump(p2, 7, (void *)pcull_stub_p2);
     done = 1;
     {   // the probe's switch, beside the game's own exe
         if (GetModuleFileNameW(NULL, pcull_probe_path, MAX_PATH)) {

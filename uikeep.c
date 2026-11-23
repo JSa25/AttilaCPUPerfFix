@@ -46,7 +46,9 @@ static unsigned g_head, g_count;
 static volatile LONG g_kept, g_again, g_freed, g_gone;  // volatile: only read by the dev log
 
 // Deletes the kept picture of that name if nothing took it again and the game still has it (the queue step's own
-// test: count 0 or less, not pinned). Called inside the queue step, under the game's lock.
+// test: count 0 or less, not pinned). Called inside the queue step. Not under a lock, as this said until 2026-11-21: the
+// call the step starts with (FUN_116d7ac0) sets the floating-point mode and counts, it locks nothing. The ring here is
+// as safe as the game's own queue list, which the step walks without a lock too.
 static void free_kept(void *mgr, DWORD len, char *text) {
     gname n = {len, len, text};
     char *tex = g_tex_find(mgr, &n);

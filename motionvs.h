@@ -1,4 +1,4 @@
-// Motion pass shaders (dev; DLSS_PLAN "Per-object motion vectors", AGENT_LOG 97-99). The vertex shader repeats the
+// Motion pass shaders (in the release since 6.3; DLSS_PLAN "Per-object motion vectors", AGENT_LOG 97-99). The vertex shader repeats the
 // skinning of Attila's main-view model shaders (vs_a51431ebf7d15a22 = 2 bones; vs_520dbe181fbd767a and
 // vs_3d52a1037cfa96ab = 4 bones, from their disassembly) once with this frame's bones and instance record and once with
 // the previous frame's, and outputs both clip positions; the pixel shader writes the pixel motion (previous minus

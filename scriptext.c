@@ -326,6 +326,19 @@ static int find_lua(unsigned char *b, DWORD va) {
 }
 
 // dir: the game folder. Returns 1 when on (lua_ext\ exists and the game's Lua is where expected).
+// lua_ext.log is appended, not emptied: the extender starts more than once per game run (8 starts during one campaign,
+// 2026-11-20 00:55-00:56) and each "w" open wiped what a test had just logged. Started afresh past 8 MB.
+static FILE *open_log(const wchar_t *path) {
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    int big = GetFileAttributesExW(path, GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > (8u << 20));
+    FILE *f = _wfopen(path, big ? L"w" : L"a");
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    if (f) fprintf(f, "---- %04u-%02u-%02u %02u:%02u:%02u process %lu ----\n", st.wYear, st.wMonth, st.wDay, st.wHour,
+                   st.wMinute, st.wSecond, GetCurrentProcessId());
+    return f;
+}
+
 int install_scriptext(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...)) {
     swprintf(g_dir, MAX_PATH, L"%ls\\lua_ext", dir);
     DWORD a = GetFileAttributesW(g_dir);
@@ -341,7 +354,7 @@ int install_scriptext(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt
     InitializeCriticalSection(&g_qlock);
     wchar_t lp[MAX_PATH];
     swprintf(lp, MAX_PATH, L"%ls\\lua_ext.log", g_dir);
-    g_log = _wfopen(lp, L"w");
+    g_log = open_log(lp);
     log("script extender on: lua_ext\\*.lua run in each script environment, Ctrl+` opens the Lua console (lua_ext\\lua_ext.log)");
     return 1;
 }

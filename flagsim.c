@@ -1,4 +1,4 @@
-// Flag cloth simulation, the D3D11 side (dev, notes/banners.md "a real cloth simulation"); used by bridgeprobe.c's flag
+// Flag cloth simulation, the D3D11 side (in the release since 7.2; notes/banners.md "a real cloth simulation"); used by bridgeprobe.c's flag
 // wave and by dlss/proof/flagtest.c. The weight pack puts one marker vertex (never drawn: no index points at it) at the
 // start of every flag mesh: "FwSimV01" then six floats (the cloth's x range along the pole, its size, side, the pole's
 // y / z in the model). fs_scan finds them in the vertex data the game creates its buffers with; fs_is_flag tells a draw
@@ -15,13 +15,50 @@
 #include <string.h>
 #include "flagvs.h"
 #include "flagsim.h"
+// the compute shaders as bytecode (fwvs_gen.c writes them at build time); bridgeprobe.c has included it already, a
+// test that builds this file on its own finds it in build/. Without it fs_init compiles the HLSL, as it always did.
+#ifndef FLAG_CS_BC
+#if __has_include("flagvs_bc.h")
+#include "flagvs_bc.h"
+#elif __has_include("build/flagvs_bc.h")
+#include "build/flagvs_bc.h"
+#endif
+#endif
 
 #define FS_MODELS 8192
+// Both tables are keyed on a buffer's address, and the game frees its buffers: when a battle ends the address goes to the
+// next buffer made (measured: 76 of 200 new buffers got a freed flag buffer's address), whose meshes would then be taken
+// for flags. So every buffer the game creates is first forgotten (fs_forget): a new object at an address proves the old
+// one is gone. A forgotten slot holds FS_GONE: a lookup passes over it, an insert may take it.
+#define FS_GONE ((const void *)(UINT_PTR)1)
 static struct { const void *buf; UINT off; float prm[6]; } fsg_models[FS_MODELS];   // open hash on (buf, off)
 static LONG fsg_nmodels;
 static SRWLOCK fsg_lock = SRWLOCK_INIT;   // buffers are created on loading threads
 
+// the vertex buffers that hold at least one flag mesh: what fs_forget asks (one probe for a buffer that is not one)
+#define FS_BUFS 2048
+static const void *volatile fsg_bufs[FS_BUFS];
+int fs_buf_has_flags(const void *buf) {
+    unsigned h = (unsigned)(((UINT_PTR)buf >> 4) * 2654435761u) & (FS_BUFS - 1);
+    for (unsigned k = 0; k < FS_BUFS && fsg_bufs[h]; k++, h = (h + 1) & (FS_BUFS - 1))
+        if (fsg_bufs[h] == buf) return 1;
+    return 0;
+}
+
 static unsigned fs_hash(const void *buf, UINT off) { return (unsigned)(((UINT_PTR)buf >> 4) * 2654435761u ^ off * 40503u) & (FS_MODELS - 1); }
+
+// A buffer was created at this address: whatever was known about the address belonged to a buffer that no longer exists.
+// Called for every buffer the game creates, so the common case (never a flag buffer) is one lock-free probe.
+void fs_forget(const void *buf) {
+    if (!buf || !fs_buf_has_flags(buf)) return;
+    AcquireSRWLockExclusive(&fsg_lock);
+    for (unsigned h = 0; h < FS_MODELS; h++)
+        if (fsg_models[h].buf == buf) { fsg_models[h].buf = FS_GONE; fsg_nmodels--; }
+    unsigned b = (unsigned)(((UINT_PTR)buf >> 4) * 2654435761u) & (FS_BUFS - 1);
+    for (unsigned k = 0; k < FS_BUFS && fsg_bufs[b]; k++, b = (b + 1) & (FS_BUFS - 1))
+        if (fsg_bufs[b] == buf) { fsg_bufs[b] = FS_GONE; break; }
+    ReleaseSRWLockExclusive(&fsg_lock);
+}
 
 int fs_scan(const void *buf, const void *data, UINT size) {
     const unsigned char *d = data;
@@ -33,15 +70,29 @@ int fs_scan(const void *buf, const void *data, UINT size) {
         o = (UINT)(p - d);
         if (memcmp(p, "FwSimV01", 8)) continue;
         AcquireSRWLockExclusive(&fsg_lock);
-        unsigned h = fs_hash(buf, o);
-        for (unsigned k = 0; k < FS_MODELS; k++, h = (h + 1) & (FS_MODELS - 1))
-            if (!fsg_models[h].buf || (fsg_models[h].buf == buf && fsg_models[h].off == o)) {
-                if (!fsg_models[h].buf) fsg_nmodels++;
-                fsg_models[h].buf = buf; fsg_models[h].off = o;
-                memcpy(fsg_models[h].prm, p + 8, 24);
-                found++;
-                break;
+        // its own slot if it has one, else the first forgotten slot on the way, else the empty one that ends the search
+        unsigned h = fs_hash(buf, o), at = FS_MODELS;
+        for (unsigned k = 0; k < FS_MODELS; k++, h = (h + 1) & (FS_MODELS - 1)) {
+            if (fsg_models[h].buf == buf && fsg_models[h].off == o) { at = h; break; }
+            if (fsg_models[h].buf == FS_GONE && at == FS_MODELS) at = h;
+            if (!fsg_models[h].buf) { if (at == FS_MODELS) at = h; break; }
+        }
+        if (at < FS_MODELS) {   // (a full table: this mesh draws as the plain model)
+            if (fsg_models[at].buf != buf) fsg_nmodels++;
+            fsg_models[at].buf = buf; fsg_models[at].off = o;
+            memcpy(fsg_models[at].prm, p + 8, 24);
+            found++;
+        }
+        if (found == 1) {   // under the same lock: the buffer itself, once
+            unsigned b = (unsigned)(((UINT_PTR)buf >> 4) * 2654435761u) & (FS_BUFS - 1), bat = FS_BUFS;
+            for (unsigned k = 0; k < FS_BUFS; k++, b = (b + 1) & (FS_BUFS - 1)) {
+                if (fsg_bufs[b] == buf) { bat = b; break; }
+                if (fsg_bufs[b] == FS_GONE && bat == FS_BUFS) bat = b;
+                if (!fsg_bufs[b]) { if (bat == FS_BUFS) bat = b; break; }
             }
+            // a full table: the meshes are still known; only fs_forget cannot find this buffer again
+            if (bat < FS_BUFS) fsg_bufs[bat] = buf;
+        }
         ReleaseSRWLockExclusive(&fsg_lock);
     }
     return found;
@@ -123,23 +174,47 @@ int fs_pass;   // the pass the next fs_gather calls come from: 0 the main view, 
 const void *fs_cs_defines;     // tests: D3D_SHADER_MACRO list for the compute shaders (FS_NO_GUST ...; NULL in the DLL)
 ID3D11Query *fs_bench_ts[3];   // tests: timestamps before the match pass, between, after the step pass (NULL in the DLL)
 #define FS_REL(p) do { if (p) { IUnknown_Release((IUnknown *)(p)); (p) = NULL; } } while (0)
+static int fsg_from_bc;
+int fs_cs_from_bytecode(void) { return fsg_from_bc; }   // 1: the last fs_init took the build's bytecode, 0: it compiled
 int fs_init(ID3D11Device *dev, char *err, int errlen) {
     if (fsg_ready && dev == fsg_dev) return 1;
     // a new device (a settings change, another GPU in the tests): everything of the old one goes
     FS_REL(fsg_gather_srv); FS_REL(fsg_gparam_srv); FS_REL(fsg_slot_srv); FS_REL(fsg_grid_srv); FS_REL(fsg_slot_uav); FS_REL(fsg_grid_uav);
     FS_REL(fsg_gather); FS_REL(fsg_gparam); FS_REL(fsg_slot); FS_REL(fsg_grid); FS_REL(fsg_cb); FS_REL(fsg_match); FS_REL(fsg_step); FS_REL(fsg_stat); FS_REL(fsg_gsh); fsg_stat_wait = 0;
     fsg_ready = 0; fsg_ng = 0; fsg_ns = 0; fsg_frame = 100; fsg_dev = dev;
-    pD3DCompile comp = (pD3DCompile)(void *)GetProcAddress(LoadLibraryExA("d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32), "D3DCompile");
+    // The two compute shaders: the bytes fwvs_gen.c made at build time (flagvs_bc.h), when they were made from this very
+    // source text and no test asked for a variant. Compiling them here took 0.7 + 0.8 s on the game's render thread at
+    // the first flag draw of every game start (measured 2026-11-20) and needed d3dcompiler_47.dll.
     ID3DBlob *b[2] = {0}, *e = NULL;
-    static const char *const entry[2] = {"match", "step"};
-    for (int k = 0; k < 2; k++)
-        if (!comp || FAILED(comp(flag_cs_hlsl, sizeof flag_cs_hlsl - 1, "flagcs", (const D3D_SHADER_MACRO *)fs_cs_defines, NULL, entry[k], "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b[k], &e))) {
-            if (err) _snprintf(err, errlen, "%s: %s", entry[k], e ? (const char *)ID3D10Blob_GetBufferPointer(e) : "no d3dcompiler_47");
-            return 0;
+    const void *bc[2] = {0};
+    SIZE_T bn[2] = {0};
+    fsg_from_bc = 0;
+#ifdef FLAG_CS_BC
+    unsigned fnv = 0x811C9DC5u;
+    for (size_t i = 0; i < sizeof flag_cs_hlsl - 1; i++) fnv = (fnv ^ (unsigned char)flag_cs_hlsl[i]) * 0x01000193u;
+    if (!fs_cs_defines && fnv == flag_cs_src_fnv) {
+        bc[0] = flag_cs_match; bn[0] = sizeof flag_cs_match;
+        bc[1] = flag_cs_step; bn[1] = sizeof flag_cs_step;
+        fsg_from_bc = 1;
+    }
+#endif
+    if (!fsg_from_bc) {
+        pD3DCompile comp = (pD3DCompile)(void *)GetProcAddress(LoadLibraryExA("d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32), "D3DCompile");
+        static const char *const entry[2] = {"match", "step"};
+        for (int k = 0; k < 2; k++) {
+            if (!comp || FAILED(comp(flag_cs_hlsl, sizeof flag_cs_hlsl - 1, "flagcs", (const D3D_SHADER_MACRO *)fs_cs_defines, NULL, entry[k], "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b[k], &e))) {
+                if (err) _snprintf(err, errlen, "%s: %s", entry[k], e ? (const char *)ID3D10Blob_GetBufferPointer(e) : "no d3dcompiler_47");
+                if (e) ID3D10Blob_Release(e);
+                if (b[0]) ID3D10Blob_Release(b[0]);
+                return 0;
+            }
+            bc[k] = ID3D10Blob_GetBufferPointer(b[k]); bn[k] = ID3D10Blob_GetBufferSize(b[k]);
         }
-    ID3D11Device_CreateComputeShader(dev, ID3D10Blob_GetBufferPointer(b[0]), ID3D10Blob_GetBufferSize(b[0]), NULL, &fsg_match);
-    ID3D11Device_CreateComputeShader(dev, ID3D10Blob_GetBufferPointer(b[1]), ID3D10Blob_GetBufferSize(b[1]), NULL, &fsg_step);
-    ID3D10Blob_Release(b[0]); ID3D10Blob_Release(b[1]);
+    }
+    ID3D11Device_CreateComputeShader(dev, bc[0], bn[0], NULL, &fsg_match);
+    ID3D11Device_CreateComputeShader(dev, bc[1], bn[1], NULL, &fsg_step);
+    if (b[0]) ID3D10Blob_Release(b[0]);
+    if (b[1]) ID3D10Blob_Release(b[1]);
     const UINT nslot = FS_SLOTS * FS_SLOT4 + 1 + 2 * FS_NB, ngrid = FS_SLOTS * FS_N * 2;   // slots, header, the lookup buckets
     fsg_gather = fs_mkbuf(dev, FS_GATHER * 112, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0);
     fsg_gsh = fs_mkbuf(dev, FS_GATHER * 112, 0, 0, 0);   // the shadow pass's draws until fs_run
@@ -175,9 +250,10 @@ void fs_gather(ID3D11DeviceContext *c, ID3D11Buffer *inst, UINT byte_off, UINT n
     // the shadow pass draws first and each flag once per cascade: its draws wait in the second half and only fill what
     // the main view leaves (2026-11-12 recording: 768 shadow draws filled the list, the flags on screen got no cloth)
     unsigned *cnt = fs_pass ? &fsg_ns : &fsg_ng, base = fs_pass ? FS_GATHER : 0;
-    // what does not fit gets no cloth and draws as the plain mesh. 768 is the ceiling of match()'s single thread
-    // group (32 KB of groupshared, 1024 threads: nothing above 768/512 compiles, checked 2026-11-17), so the drop
-    // is counted rather than hidden - which flags lose out follows draw order, so it moves with the camera.
+    // what does not fit gets no cloth and draws as the plain mesh. FS_GATHER (flagvs.h: 1024 since 2026-11-17, 768
+    // before) is the ceiling: match() gives every gathered flag one thread of its single thread group, and a group
+    // has at most 1024. So the drop is counted rather than hidden - which flags lose out follows draw order, so it
+    // moves with the camera.
     fsg_want_f[fs_pass ? 1 : 0] += n;
     if (n > FS_GATHER - *cnt) { fsg_dropped += n - (FS_GATHER - *cnt); n = FS_GATHER - *cnt; }
     if (n > (bd.ByteWidth - byte_off) / 112) n = (bd.ByteWidth - byte_off) / 112;

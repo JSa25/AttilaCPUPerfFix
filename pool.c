@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <string.h>
 #include "gamerva.h"
+#include "patch.h"
 
 struct node { char *base; struct node *next; };
 struct cls { void *freelist; struct node *chunks; unsigned count; };
@@ -82,16 +83,6 @@ static const struct { DWORD rva, len, fnv; } POOL_FUNCS[] = {
     {0x7B6D00, 309, 0xCD52FD71u}, {0x7B6940, 309, 0xAEA56E55u},
 };
 
-static int write_jmp(unsigned char *site, void *to) {
-    DWORD old;
-    if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old)) return 0;
-    site[0] = 0xE9;
-    DWORD rel = (DWORD)((unsigned char *)to - (site + 5));
-    memcpy(site + 1, &rel, 4);
-    VirtualProtect(site, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 5);
-    return 1;
-}
 
 // Returns 1 if both pool entry points were redirected, 0 if nothing was changed.
 int install_pool(HMODULE m, void (*log)(const char *fmt, ...)) {
@@ -101,13 +92,13 @@ int install_pool(HMODULE m, void (*log)(const char *fmt, ...)) {
             log("pool function +0x%X does not match this game version - pool lookup not patched", POOL_FUNCS[i].rva);
             return 0;
         }
-    if (!write_jmp(base + 0x7B6F60, (void *)pool_free_a)) {
+    if (!patch_jump(base + 0x7B6F60, 5, (void *)pool_free_a)) {
         log("pool lookup: VirtualProtect failed (%lu) - not patched", GetLastError());
         return 0;
     }
     // Either entry works alone (the replacement and the original give the same answers), so a
     // failure here leaves a consistent, partly patched game.
-    if (!write_jmp(base + 0x7B7070, (void *)pool_free_b)) {
+    if (!patch_jump(base + 0x7B7070, 5, (void *)pool_free_b)) {
         log("pool lookup: only the small-size pools were patched (%lu)", GetLastError());
         return 1;
     }

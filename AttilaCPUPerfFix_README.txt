@@ -109,6 +109,10 @@ Install
 
 Uninstall: delete dinput8.dll (and heapfix.log).
 
+64-bit Attila (by Sol Invictus): copy perffix64.dll into attila64\plugins in
+the game folder. It needs DirectX 11; with OpenGL it stays off and says so.
+Uninstall: delete attila64\plugins\perffix64.dll.
+
 
 It doesn't show up in the launcher's mod list
 ---------------------------------------------
@@ -179,7 +183,6 @@ Compatibility and notes
 - NOT compatible with "Attila 32bit Engine Improver" or any other dinput8.dll
   mod. Only one dinput8.dll can be loaded.
 - Works with UI mods and normal pack mods.
-- Players report it works on Linux with Proton.
 - If you use "Attila 4K UI Scale": on its version 2.0 or newer, keep the
   "Vanilla" preset in its F10 menu (the default). On older versions, use its
   "Basic" file, not "All features on". Its heavier settings turn on bigger
@@ -197,6 +200,14 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 7.4:
+-Now also works with 64-bit Attila by Sol Invictus.
+-64-bit: the same fixes, F8 panel, waving banners and main menu label as the
+ normal game.
+-64-bit: needs DirectX 11; if 64-bit Attila starts with OpenGL, the engine
+ fix stays off and says so.
+-Better performance in big battles.
+
 Version 7.3:
 -Banner waving no longer touches other mods' models. Some mods' spears,
  swords and shields were being treated as cloth and moved with it; only the

@@ -12,6 +12,7 @@
 #include <emmintrin.h>
 #include <string.h>
 #include "gamerva.h"
+#include "patch.h"
 
 #define RVA_COMPRESS 0x18E8390u
 #define LEN_COMPRESS 0x342u   // through the ret 8
@@ -136,16 +137,10 @@ int install_texfix(HMODULE m, int verify, void (*log)(const char *fmt, ...)) {
     }
     void *to = (void *)tf_compress;
     (void)verify;
-    DWORD old;
-    if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old)) {
+    if (!patch_jump(site, 5, to)) {
         log("texture compression: VirtualProtect failed (%lu) - not replaced", GetLastError());
         return 0;
     }
-    site[0] = 0xE9;
-    DWORD rel = (DWORD)((unsigned char *)to - (site + 5));
-    memcpy(site + 1, &rel, 4);
-    VirtualProtect(site, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 5);
     log("texture compression replaced (SSE2 DXT1 blocks, same output)%s", verify ? " - VERIFY mode, every call checked against the game's" : "");
     return 1;
 }

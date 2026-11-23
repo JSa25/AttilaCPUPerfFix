@@ -128,7 +128,7 @@ static int x87_scan(const unsigned char *text, unsigned size, unsigned rva0) {
 }
 
 // Set by the watcher thread when some game thread runs with non-default rounding control or DAZ.
-static volatile LONG g_x87_other_thread_bad;
+volatile LONG g_x87_other_thread_bad;   // campfix.c reads it for its terrain-height block, the one site of this kind that is not in the list here
 
 // Puts the original bytes of the down/up/frndint sites back while every other game thread is suspended, so none runs
 // half-rewritten code (paused_write, gamerva.h). 0 (nothing written) if a suspended thread stood inside a site: tried
@@ -232,7 +232,7 @@ int install_x87fix(HMODULE m, void (*log)(const char *fmt, ...)) {
     }
     FlushInstructionCache(GetCurrentProcess(), NULL, 0);
     if (n > fast) {
-        HANDLE w = CreateThread(NULL, 0, x87_watch, NULL, 0, NULL);
+        HANDLE w = CreateThread(NULL, 256 << 10, x87_watch, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         if (w) CloseHandle(w);
     }
     log("x87 fix: %d of %d rounding-mode blocks replaced (%d truncating via fisttp, %d via SSE4.1 roundss)%s", n, found,

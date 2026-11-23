@@ -108,7 +108,7 @@ int install_memwatch(HMODULE m, void (*trim)(void), void (*log)(const char *fmt,
     int n = 0;
     if ((was = iat_swap(m, "MapViewOfFile", (void *)h_MapViewOfFile))) o_MapViewOfFile = was, n++;
     if ((was = iat_swap(m, "VirtualAlloc", (void *)h_VirtualAlloc))) o_VirtualAlloc = was, n++;
-    HANDLE t = CreateThread(NULL, 0, low_water, NULL, 0, NULL);
+    HANDLE t = CreateThread(NULL, 256 << 10, low_water, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (t) CloseHandle(t);
     size_t fr, big;
     address_space(&fr, &big);
