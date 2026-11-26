@@ -17,7 +17,7 @@ rem --include-dir ..\shared: dinput8.rc reads version.h, the one version number 
 rem --no-insert-timestamp keeps the build reproducible: the same compiler gives the same file
 rem not stripped, a fixed timestamp and this link name (it is in the export table): the 7.1 release file exactly (link name kept from 6.10.5)
 rem -I..\shared: version.h and the cloth banners (flagsim.c, fwpack.c, flagvs*.h, fw_kind.h), which the 64-bit plugin builds too
-"%CC%" -O2 -Wall -Wextra -shared -static -I..\shared -Wl,-Xlink=-timestamp:1793660000 -o build\dinput8_6.10.5_B.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c uicache.c soundguard.c pools.c scriptext.c memwatch.c plugins.c partcull.c overlay.c menuver.c passtime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c build\rslink.o build\dinput8_res.o dinput8.def %LIBS% -lgdi32 || exit /b 1
+"%CC%" -O2 -Wall -Wextra -shared -static -I..\shared -Wl,-Xlink=-timestamp:1793660000 -o build\dinput8_6.10.5_B.dll heapfix.c pool.c sortfix.c fps.c batchfix.c campfix.c x87fix.c heightcache.c memfast.c loopfetch.c diag.c update.c fileio.c attrcache.c texfix.c logtrim.c uikeep.c uicache.c soundguard.c pools.c scriptext.c memwatch.c plugins.c partcull.c overlay.c menuver.c launcher_hook.c passtime.c bridgeprobe.c fgbridge.c fgmotion.c fgpanel.c build\rslink.o build\dinput8_res.o dinput8.def %LIBS% -lgdi32 || exit /b 1
 copy /y build\dinput8_6.10.5_B.dll build\dinput8.dll >nul
 echo built build\dinput8.dll
 
@@ -27,24 +27,28 @@ if "%~2"=="" (
     exit /b 1
 )
 for %%T in (pool sort batchfix campfix x87fix heightcache memfast loopfetch diag selfupd fileio attrcache texfix) do (
-    "%CC%" -O2 -Wall -static -o build\%%T_test.exe tests\%%T_test.c %LIBS% || exit /b 1
+    "%CC%" -O2 -Wall -static -I..\shared -o build\%%T_test.exe tests\%%T_test.c %LIBS% || exit /b 1
 )
-"%CC%" -O2 -Wall -static -o build\heapfix_test.exe tests\heapfix_test.c pools.c %LIBS% || exit /b 1
+"%CC%" -O2 -Wall -static -I..\shared -o build\heapfix_test.exe tests\heapfix_test.c pools.c %LIBS% || exit /b 1
 for %%T in (heapfix pool sort batchfix campfix x87fix heightcache memfast loopfetch diag selfupd fileio attrcache texfix) do (
     echo == %%T
     build\%%T_test.exe "%~2" || (echo %%T test FAILED & exit /b 1)
 )
-"%CC%" -O2 -Wall -static -o build\lateload_test.exe tests\lateload_test.c %LIBS% || exit /b 1
+"%CC%" -O2 -Wall -static -I..\shared -o build\lateload_test.exe tests\lateload_test.c %LIBS% || exit /b 1
 echo == lateload
 build\lateload_test.exe "%~dp0build\dinput8.dll" "%~2" || (echo lateload test FAILED & exit /b 1)
-"%CC%" -O2 -Wall -static -o build\logtrim_test.exe tests\logtrim_test.c logtrim.c %LIBS% || exit /b 1
+"%CC%" -O2 -Wall -static -I..\shared -o build\logtrim_test.exe tests\logtrim_test.c logtrim.c %LIBS% || exit /b 1
 echo == logtrim
 build\logtrim_test.exe || (echo logtrim test FAILED & exit /b 1)
-"%CC%" -O2 -Wall -static -o build\uikeep_test.exe tests\uikeep_test.c %LIBS% || exit /b 1
+"%CC%" -O2 -Wall -static -I..\shared -o build\uikeep_test.exe tests\uikeep_test.c %LIBS% || exit /b 1
 echo == uikeep
 build\uikeep_test.exe || (echo uikeep test FAILED & exit /b 1)
+rem overlay.c's Present hook against the loop in a player's 7.5 crash dumps (Present called again inside itself)
+"%CC%" -O2 -Wall -static -I..\shared -o build\overlay_nest_test.exe tests\overlay_nest_test.c %LIBS% || exit /b 1
+echo == overlay_nest
+build\overlay_nest_test.exe || (echo overlay_nest test FAILED & exit /b 1)
 rem the small-block heap's checks: a block freed twice or written past its end stops the program (exit 3 or 4)
-"%CC%" -O2 -Wall -static -o build\pools_check_test.exe tests\pools_check_test.c pools.c %LIBS% || exit /b 1
+"%CC%" -O2 -Wall -static -I..\shared -o build\pools_check_test.exe tests\pools_check_test.c pools.c %LIBS% || exit /b 1
 for %%C in (double overrun) do (
     echo == pools_check %%C
     build\pools_check_test.exe %%C >nul

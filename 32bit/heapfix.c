@@ -402,6 +402,8 @@ static const char INI_DEFAULTS[] =
     "sound_crash_guard=1\r\n"
     "\r\n"
     "[mod]\r\n"
+    "; which launcher Steam's Play button opens: 1 = Total War Mod Manager, 2 = CA's launcher\r\n"
+    "launcher=1\r\n"
     "; copy a newer version from the Steam Workshop into the game folder at startup\r\n"
     "self_update=1\r\n"
     "; record crashes in heapfix.log (EXCEPTION lines)\r\n"
@@ -505,6 +507,10 @@ static void install_all(HMODULE m) {
         update_check(g_self, wlog);     // a newer Workshop copy replaces this DLL for the next launch
     else
         wlog("self-update off (self_update=0 in heapfix.ini)");
+    {   // Steam's Play button opens Total War Mod Manager (launcher_hook.c); launcher=2 in heapfix.ini: CA's, left alone
+        void attila_launcher_check(HMODULE self, void (*log)(const char *fmt, ...));
+        attila_launcher_check(g_self, wlog);
+    }
     wchar_t off[MAX_PATH];
     wcscpy(off, g_log_path);
     wchar_t *sl = wcsrchr(off, L'\\');

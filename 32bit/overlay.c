@@ -62,10 +62,24 @@ static void draw(IDXGISwapChain *sc) {
     ID3D11Texture2D_Release(bb);
 }
 
+// A Present of the swapchain this thread is already presenting is skipped. A player's crash dumps (7.5, 2026-11-26):
+// ours -> the Steam overlay -> DXGI's Present -> back into ours for the same swapchain, thousands deep until the stack
+// overflowed. Passing it on only goes round again; returning ends the loop wherever it comes from. Another swapchain's
+// Present inside ours still goes through (not drawn on).
 static HRESULT STDMETHODCALLTYPE w_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
-    static __thread int depth;   // a Present inside a Present (an overlay's window message): drawn once, not again
-    if (!depth && !(flags & DXGI_PRESENT_TEST)) { depth = 1; draw(sc); depth = 0; }
-    return r_present(sc, sync, flags);
+    static __thread IDXGISwapChain *presenting;
+    static LONG skipped;
+    if (sc == presenting) {
+        if (InterlockedIncrement(&skipped) == 1)
+            o_log("F8 panel: the game's Present was called again inside itself (another program's hook) - skipped (only logged once)");
+        return S_OK;
+    }
+    IDXGISwapChain *outer = presenting;
+    presenting = sc;
+    if (!outer && !(flags & DXGI_PRESENT_TEST)) draw(sc);
+    HRESULT hr = r_present(sc, sync, flags);
+    presenting = outer;
+    return hr;
 }
 static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) {
     HRESULT hr = r_create_sc(f, dev, d, out);

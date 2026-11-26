@@ -116,10 +116,32 @@ Uninstall: delete attila64\plugins\perffix64.dll.
 
 It doesn't show up in the launcher's mod list
 ---------------------------------------------
-That's normal. This mod is a DLL in the game folder, not a .pack mod, so the
-launcher and mod managers don't know about it. It's active as long as
+That's normal. This mod is a DLL in the game folder, not a .pack mod, so
+CA's launcher doesn't know about it (Total War Mod Manager lists it under
+Add-ons). It's active as long as
 dinput8.dll is in the game folder. To check, start the game and open
 heapfix.log in the game folder: the STATUS block lists which fixes are on.
+
+
+Total War Mod Manager (new in 7.6)
+----------------------------------
+On Steam, install.bat sets it up, and players who already have this mod get
+it with the update. Steam's Play button then opens it instead of CA's
+launcher.
+- Normal and 64-bit Attila in one window: a mod list for each, or one list
+  for both.
+- Presets, search and drag to reorder, with a note when two mods change the
+  same files.
+- Export copies your mod list with Workshop links; Import subscribes to the
+  mods you don't have yet.
+- The list code: friends with the same code have the same mods, order and
+  versions.
+- Game files: your preferences file, scripts folder and save folder.
+- 64-bit Attila not installed: it offers to subscribe and run its installer.
+- CA's launcher is one click away, for one start or from now on. To switch
+  back, hold Shift while pressing Play, or set launcher=1 in heapfix.ini
+  ([mod]; launcher=2 = CA's launcher).
+- uninstall.bat removes it and puts CA's launcher back.
 
 
 Recommended settings
@@ -200,6 +222,15 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 7.6:
+-New: Total War Mod Manager. Steam's Play button opens it: normal and 64-bit
+ Attila in one window.
+-Mod lists for each version, presets, and sharing with Workshop links. Import
+ subscribes to the mods you don't have.
+-The list code shows when friends have the same mods, order and versions.
+-CA's launcher stays one click away.
+-Fixed a 32-bit crash with the Steam overlay on.
+
 Version 7.5:
 -64-bit: waving banners work when the Upscaling and Framegen add-on is
  loaded. They stood still before.
