@@ -21,14 +21,23 @@ With [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) 20261006 (UCRT, x86_64
 ./build.sh
 ```
 
-The exe lands in `build/TotalWarModManager.exe`. The build is reproducible. The 7.6 release's exe
-(`TotalWarModManager.exe.sha256`) was built against version 7.5's `version.h` (`MOD_VERSION_NUM 750`; the number only
-sets a marker string inside the exe, the update check reads the installed DLL's own version). To get exactly that file,
-build with a `version.h` that says 750:
+The exe lands in `build/TotalWarModManager.exe`, with `build/TotalWarModManager_syms.exe` beside it: the same build with
+debug info (the exe is that file without it). The build is reproducible: `TotalWarModManager.exe.sha256` is the 1.01
+release's exe (engine fix 7.6.1), built with this repository's `shared/version.h` (the number there only sets a marker
+string inside the exe; the update check reads the installed DLL's own version). The 7.6 release's exe (1.00) was built
+against version 7.5's `version.h` (`VERSION_DIR=/path/to/folder_with_750_version.h ./build.sh`).
+
+## Crash log (1.01)
+A crash writes one `CRASH` line into `TotalWarModManager\launcher.log` in the game folder (`crashlog.inc`): the
+exception, the module and offset, what each thread was doing (with the picture or pack being read), the Windows
+version, and this exe's return addresses on the stack. With the `_syms.exe` of the same build:
 
 ```
-VERSION_DIR=/path/to/folder_with_750_version.h ./build.sh
+llvm-addr2line -f -i -e build/TotalWarModManager_syms.exe 0x<0x400000 + offset>
 ```
+
+After two starts in a row that ended by themselves in their first 10 seconds, the next start asks whether to go back to
+CA's launcher (yes: `launcher=2` and CA's `launcher.exe` back where Steam looks, as `--uninstall` does).
 
 ## License
 Covered by the [LICENSE](../LICENSE) at the top of this repository, except the portions listed in

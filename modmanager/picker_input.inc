@@ -239,6 +239,7 @@ static void host_play(int go);   // host_ui.inc
 static void play(void) { host_play(GO_GAME); }
 
 #include "host_ui.inc"
+static void set_ui_size(int pct);
 static void menu_choose(int i) {
     if (i < 0 || i >= g_menu.n || g_menu.value[i] < -100) return;
     int v = g_menu.value[i], owner = g_menu.owner;
@@ -256,7 +257,7 @@ static void menu_choose(int i) {
         else open_import(read_text_file("used_mods.txt"), "Normal Attila's mod list");   // the working folder is the game's
         break;
     case M_EXPORT: export_list(v); break;
-    case M_THEME: set_theme(v); break;
+    case M_THEME: if (v >= 1000) set_ui_size(v - 1000); else set_theme(v); break;   // the Settings menu
     case M_LOG: if (v) show_log_file(g_win); else copy_last_log(g_win); break;
     case M_FILES: game_files(v); break;
     case M_SET0: g_set_size = v; break;
@@ -498,6 +499,11 @@ static LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ---- results from the background threads
+static void thumb_dropped(const char *name, int size) {   // io_thumb's queue was full: this ask is gone, ask again later
+    if (size == g_big.size && !_stricmp(name, g_big.name) && g_big.state == 1) g_big.name[0] = 0;
+    Mod *m = find_mod(name);
+    if (m && m->thumb_state == 1) m->thumb_state = 0;
+}
 static void on_thumb(ThumbDone *d) {
     if (d->size == g_big.size && !_stricmp(d->name, g_big.name)) {
         if (g_big.img) gp.dispose(g_big.img);
@@ -667,9 +673,22 @@ static void make_back_buffer(void) {
     g_bb_old = (HBITMAP)SelectObject(g_bb, g_bb_bmp);
     ReleaseDC(g_win, dc);
 }
+// The biggest scale whose whole layout (940 x 640 at 100%, plus the frame) fits on this monitor.
+static float ui_fit(int dpi, HMONITOR mon) {
+    MONITORINFO mi = {sizeof mi};
+    if (!mon || !GetMonitorInfoA(mon, &mi)) return 100.0f;
+    float fw = (mi.rcWork.right - mi.rcWork.left - 16 * dpi / 96.0f) / 940.0f, fh = (mi.rcWork.bottom - mi.rcWork.top - 40 * dpi / 96.0f) / 640.0f;
+    return fw < fh ? fw : fh;
+}
+static float ui_scale(int dpi, HMONITOR mon) {   // Windows' scaling x the interface size, never bigger than the screen
+    if (g_force_scale > 0) return g_force_scale;
+    float s = dpi / 96.0f * g_ui_pct / 100.0f, fit = ui_fit(dpi, mon), win = dpi / 96.0f;
+    if (s > fit) s = fit > win ? fit : win;   // a smaller screen than when it was chosen: as big as fits (not below Windows' own)
+    return s;
+}
 static void set_scale_from_dpi(int dpi) {
     g_dpi = dpi ? dpi : 96;
-    g_scale = g_force_scale > 0 ? g_force_scale : g_dpi / 96.0f;
+    g_scale = ui_scale(g_dpi, g_win ? MonitorFromWindow(g_win, MONITOR_DEFAULTTONEAREST) : NULL);
     fonts_make();
     if (g_search) SendMessageW(g_search, WM_SETFONT, (WPARAM)g_font[F_BODY], TRUE);
     if (g_name_edit) SendMessageW(g_name_edit, WM_SETFONT, (WPARAM)g_font[F_BODY], TRUE);
@@ -688,6 +707,32 @@ static void min_window_size(SIZE *out) {   // never smaller than this layout nee
     out->cx = r.right - r.left;
     out->cy = r.bottom - r.top;
 }
+static void set_ui_size(int pct) {   // Settings > Interface size: everything bigger or smaller, the window with it (kept on the screen)
+    RECT c;
+    GetClientRect(g_win, &c);
+    float dw = c.right / g_scale, dh = c.bottom / g_scale;
+    char v[8];
+    g_ui_pct = pct;
+    snprintf(v, sizeof v, "%d", pct);
+    settings_put("ui_size", v);
+    set_scale_from_dpi(g_dpi);
+    if (IsZoomed(g_win)) { layout(); clamp_scroll(); InvalidateRect(g_win, NULL, FALSE); return; }
+    MONITORINFO mi = {sizeof mi};
+    RECT w = {0, 0, S(dw), S(dh)}, now;
+    adjust_rect(&w);
+    GetWindowRect(g_win, &now);
+    GetMonitorInfoA(MonitorFromWindow(g_win, MONITOR_DEFAULTTONEAREST), &mi);
+    int ww = w.right - w.left, wh = w.bottom - w.top, aw = mi.rcWork.right - mi.rcWork.left, ah = mi.rcWork.bottom - mi.rcWork.top;
+    if (ww > aw) ww = aw;
+    if (wh > ah) wh = ah;
+    int x = (now.left + now.right - ww) / 2, y = (now.top + now.bottom - wh) / 2;   // the same middle
+    if (x + ww > mi.rcWork.right) x = mi.rcWork.right - ww;
+    if (y + wh > mi.rcWork.bottom) y = mi.rcWork.bottom - wh;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;
+    SetWindowPos(g_win, NULL, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+    InvalidateRect(g_win, NULL, FALSE);
+}
 
 static void test_step(void);   // picker_test.inc
 
@@ -695,6 +740,7 @@ static LRESULT CALLBACK picker_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     static int scripted = -1;   // ATTILA_PICKER_TEST: the script moves the mouse, the person's own mouse is left out
     if (scripted < 0) scripted = getenv("ATTILA_PICKER_TEST") != NULL;
     if (scripted && ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) || msg == WM_MOUSELEAVE)) return 0;
+    g_step_msg = msg;   // for the crash line
     switch (msg) {
     case WM_CREATE: {
         g_win = w;
@@ -817,6 +863,7 @@ static LRESULT CALLBACK picker_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             drag_to(p.y);
             InvalidateRect(w, NULL, FALSE);
         } else if (wp == T_SCRIPT) test_step();
+        else if (wp == T_QUICK) { KillTimer(w, T_QUICK); crash_test_late(); quick_done(); }   // up for 10 seconds: this start went well
         return 0;
     case WM_ACTIVATE: if (LOWORD(wp) == WA_INACTIVE && g_menu.owner) menu_close(); break;
     case WM_SETFOCUS: InvalidateRect(w, NULL, FALSE); return 0;
@@ -837,6 +884,8 @@ static LRESULT CALLBACK picker_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_P_INFO: g_perf_version = (int)lp; InvalidateRect(w, NULL, FALSE); return 0;
     case WM_CLOSE: DestroyWindow(w); return 0;
     case WM_DESTROY: {
+        quick_done();   // closed or Play: a normal end
+        g_step = "closing the window";
         settings_put("theme", g_theme_keys[g_theme]);
         settings_put("preset", g_preset);
         WINDOWPLACEMENT wpl = {sizeof wpl};

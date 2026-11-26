@@ -11,7 +11,7 @@ enum {   // what was clicked; arg tells which one
 };
 enum { WM_P_AUTO = WM_APP + 30, WM_P_INST64 };
 #define DISCORD_URL "https://discord.gg/cSAJeNUWZ3"   // JGdaCaesar's Discord: bug reports
-enum { T_TOAST = 1, T_DRAG, T_TIP, T_SCRIPT, T_STEAM_POLL };
+enum { T_TOAST = 1, T_DRAG, T_TIP, T_SCRIPT, T_STEAM_POLL, T_QUICK };
 
 typedef struct { RECT r; int id, arg, focus; const char *tip; } Hit;
 static Hit g_hits[1200];
@@ -33,6 +33,10 @@ static const char *pool(const char *fmt, ...) {
 static int g_w, g_h;                    // client size, pixels
 static int g_dpi = 96;
 static float g_force_scale;             // ATTILA_PICKER_SCALE (tests)
+static int g_ui_pct = 100;              // Settings > Interface size, on top of Windows' scaling (launcher.ini ui_size)
+static const int g_ui_sizes[] = {80, 90, 100, 110, 125, 150, 175, 200};
+#define N_UI_SIZES ((int)(sizeof g_ui_sizes / sizeof g_ui_sizes[0]))
+static float ui_fit(int dpi, HMONITOR mon);   // picker_input.inc
 static HDC g_bb;                        // back buffer
 static HBITMAP g_bb_bmp, g_bb_old;
 static HDC g_art;                       // the theme's picture at the window's size
@@ -72,7 +76,7 @@ static int g_nview, g_view_h, g_nmatch_t, g_nmatch_r;
 
 // menus
 enum { M_PRESET = 1, M_IMPORT, M_EXPORT, M_THEME, M_LOG, M_SET0, M_SET1, M_SET2, M_FILES };
-static struct { int owner, n, hover, check; RECT anchor; char text[MAX_PRESETS + 8][96]; int value[MAX_PRESETS + 8], line[MAX_PRESETS + 8]; } g_menu;
+static struct { int owner, n, hover, check, check2; RECT anchor; char text[MAX_PRESETS + 8][96]; int value[MAX_PRESETS + 8], line[MAX_PRESETS + 8]; } g_menu;
 
 // sheets
 enum { SH_NONE, SH_IMPORT, SH_NAME, SH_CONFIRM, SH_ASK };
@@ -869,8 +873,8 @@ static void draw_footer(void) {
         fill_rr(0, (float)(g_h - S(62)), (float)g_w, (float)S(62), 0, argb(PAL->panel, PAL->panel_alpha - 30));
         fill_rect(0, g_h - S(62), g_w, S(1), PAL->line);
     }
-    const char *tl = pool("Theme: %s", g_theme_names[g_theme]);
-    x += dropdown(x, y + S(4), text_w(tl, F_BOLD) + S(52), S(32), tl, NULL, W_THEME, 0, "The look of this window") + S(8);
+    const char *tl = "Settings";   // W_THEME opens it (the id the tests know)
+    x += dropdown(x, y + S(4), text_w(tl, F_BOLD) + S(52), S(32), tl, NULL, W_THEME, 0, "Interface size and theme of this window") + S(8);
     x += button(x, y + S(4), 0, S(32), "Log", IC_DOWN, W_LOG, 0, B_GHOST | B_ICON_RIGHT, "The last game's log, to send with a bug report") + S(6);
     x += button(x, y + S(4), 0, S(32), "Game files", IC_DOWN, W_FILES, 0, B_GHOST | B_ICON_RIGHT,
                 g_mode ? "64-bit Attila's preferences, scripts and saves" : "Attila's preferences, scripts and saves") + S(6);
@@ -908,14 +912,14 @@ static void menu_draw(void) {
         if (g_menu.line[i]) { fill_rect(x + S(10), cy + S(4), iw - S(20), S(1), PAL->line); cy += S(9); }
         int hov = g_menu.hover == i;
         if (hov) fill_rr((float)x + S(4), (float)cy, (float)iw - S(8), (float)ih, (float)S(5), argb(PAL->sel, 255));
-        if (g_menu.value[i] == g_menu.check && g_menu.check >= 0) icon(x + S(8), cy, S(22), ih, IC_CHECK, F_ICON_S, PAL->accent_text);
+        if ((g_menu.value[i] == g_menu.check && g_menu.check >= 0) || (g_menu.value[i] == g_menu.check2 && g_menu.check2 >= 0)) icon(x + S(8), cy, S(22), ih, IC_CHECK, F_ICON_S, PAL->accent_text);
         text(x + S(34), cy, iw - S(44), ih, g_menu.text[i], F_BODY, g_menu.value[i] < -100 ? PAL->faint : PAL->text, DT_LEFT);
         if (g_menu.value[i] >= -100) hit(x, cy, iw, ih, W_MENU, i, 0, NULL);
         cy += ih;
     }
 }
 static void menu_open(int owner, int x, int y, int w, int h) {
-    g_menu.owner = owner; g_menu.n = 0; g_menu.hover = -1; g_menu.check = -1;
+    g_menu.owner = owner; g_menu.n = 0; g_menu.hover = -1; g_menu.check = g_menu.check2 = -1;
     SetRect(&g_menu.anchor, x, y, x + w, y + h);
 #define ITEM(t, v, ln) do { if (g_menu.n < (int)(sizeof g_menu.value / sizeof g_menu.value[0])) { snprintf(g_menu.text[g_menu.n], 96, "%s", t); g_menu.value[g_menu.n] = v; g_menu.line[g_menu.n++] = ln; } } while (0)
     if (owner == M_PRESET) {
@@ -933,9 +937,17 @@ static void menu_open(int owner, int x, int y, int w, int h) {
         ITEM("Copy the list to the clipboard   Ctrl+C", 0, 0);
         ITEM("Save the list to a file\xE2\x80\xA6", 1, 0);
         ITEM("Copy only the list code", 2, 1);
-    } else if (owner == M_THEME) {
+    } else if (owner == M_THEME) {   // the Settings menu: interface size (1000 + percent), theme (its number)
+        float fit = ui_fit(g_dpi, MonitorFromWindow(g_win, MONITOR_DEFAULTTONEAREST));
+        ITEM("Interface size (text, buttons, pictures)", -201, 0);
+        for (int i = 0; i < N_UI_SIZES; i++) {
+            int p = g_ui_sizes[i], fits = p <= 100 || g_dpi / 96.0f * p / 100.0f <= fit + 0.001f;
+            ITEM(pool(fits ? "%d%%%s" : "%d%%  (bigger than this screen)", p, p == 100 ? "  (normal)" : ""), fits ? 1000 + p : -300 - p, 0);
+        }
+        g_menu.check = 1000 + g_ui_pct;
+        ITEM("Theme", -202, 1);
         for (int i = 0; i <= TH_DARK; i++) ITEM(g_theme_names[i], i, 0);
-        g_menu.check = g_theme;
+        g_menu.check2 = g_theme;
     } else if (owner == M_LOG) {
         ITEM("Copy last log", 0, 0);
         ITEM("Show log file", 1, 0);

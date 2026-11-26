@@ -142,6 +142,12 @@ launcher.
   back, hold Shift while pressing Play, or set launcher=1 in heapfix.ini
   ([mod]; launcher=2 = CA's launcher).
 - uninstall.bat removes it and puts CA's launcher back.
+- Settings (bottom left): interface size, for bigger text and buttons, and
+  the theme.
+- If it closes by itself twice in a row, the next start asks whether to go
+  back to CA's launcher.
+- use_CA_launcher.bat (in this mod's folder) puts CA's launcher back on
+  Steam's Play button without starting the game.
 
 
 Recommended settings
@@ -197,6 +203,9 @@ start, so it stays small enough to post.
 The log only records; it never changes how the game handles a crash. It shows
 your Windows user name in folder paths, so blank that out before posting it
 publicly if you like.
+If Total War Mod Manager closes by itself, please also send
+TotalWarModManager\launcher.log from the game folder: it notes where it
+crashed.
 
 
 Compatibility and notes
@@ -222,6 +231,16 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 7.6.1:
+-Total War Mod Manager: if it closes by itself twice in a row, the next start
+ asks whether to go back to CA's launcher.
+-New use_CA_launcher.bat in this mod's folder: puts CA's launcher back on
+ Steam's Play button without starting the game.
+-The Mod Manager notes in its log where a crash happened.
+-New Settings menu: interface size (bigger text and buttons) and theme.
+-Fixed mod pictures that could stay empty after scrolling through a long
+ list.
+
 Version 7.6:
 -New: Total War Mod Manager. Steam's Play button opens it: normal and 64-bit
  Attila in one window.
