@@ -592,6 +592,9 @@ dlmalloc by Doug Lea, released to the public domain (CC0 1.0).
 The ReShade link (in dinput8.dll) is built with ReShade's add-on API headers,
 Copyright (C) 2021 Patrick Mours, used under the MIT licence (the same text as
 below, with his name in place of AMD's).
+Parts of Total War Mod Manager (TotalWarModManager.exe) come from Sol Invictus's
+64-bit Attila, Copyright (c) 2026 Sol Invictus, used under the MIT licence (the
+same text as below, with his name in place of AMD's).
 
 The DLSS add-on's sharpening (in dinput8.dll) follows AMD FidelityFX Robust
 Contrast Adaptive Sharpening (RCAS), used under the MIT licence:
