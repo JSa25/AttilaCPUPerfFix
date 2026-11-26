@@ -17,6 +17,7 @@ The mod ships as **one release with one version number** for both of these:
 | [`32bit/`](32bit) | `dinput8.dll` | the normal 32-bit game, which loads it at startup |
 | [`64bit/`](64bit) | `perffix64_plugin.dll` | [Sol Invictus's 64-bit Attila](https://github.com/Sol-Invictus2/64-bit-Attila), as a plugin |
 | [`shared/`](shared) | — | the files both sides build |
+| [`modmanager/`](modmanager) | `TotalWarModManager.exe` | Total War Mod Manager (from 7.6): Steam's Play button opens it, for both versions |
 
 `shared/version.h` is that one version number: `64bit/src/version64.h` is nothing but an `#include` of it, so a
 release can never go out with the two halves numbered differently. The rest of `shared/` is the cloth-banner code
@@ -157,5 +158,5 @@ See [LICENSE](LICENSE). `32bit/dlmalloc/malloc-2.8.6.c` is dlmalloc by Doug Lea,
 ([CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)), unchanged. `32bit/reshade/*.hpp` are ReShade's add-on API
 headers by Patrick Mours (BSD-3-Clause OR MIT, as stated in each file), unchanged. mimalloc (MIT) is not in this
 repository; the 64-bit build downloads it. Sol Invictus's
-[64-bit Attila](https://github.com/Sol-Invictus2/64-bit-Attila) is MIT; no file of his is included here, and anything
-of it that is used later will carry his copyright and permission notice as that licence asks.
+[64-bit Attila](https://github.com/Sol-Invictus2/64-bit-Attila) is MIT; no file of his is included here. Portions of `modmanager/` come from it and keep its MIT license: see
+[modmanager/SOL_INVICTUS_MIT.txt](modmanager/SOL_INVICTUS_MIT.txt).
